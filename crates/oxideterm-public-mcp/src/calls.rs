@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt};
+use std::{collections::BTreeMap, fmt, path::PathBuf};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -995,6 +995,11 @@ pub struct StageArtifactArgs {
     pub bytes: Zeroizing<Vec<u8>>,
     pub media_type: String,
     pub name: Option<String>,
+    /// When set, the artifact contents should be read directly from this
+    /// local filesystem path (streamed) instead of from `bytes`. This is
+    /// populated by the `file_path` tool argument and avoids loading the
+    /// whole file into memory.
+    pub source_path: Option<PathBuf>,
 }
 
 impl fmt::Debug for StageArtifactArgs {
@@ -1007,6 +1012,7 @@ impl fmt::Debug for StageArtifactArgs {
             )
             .field("media_type", &self.media_type)
             .field("name", &self.name)
+            .field("source_path", &self.source_path)
             .finish()
     }
 }

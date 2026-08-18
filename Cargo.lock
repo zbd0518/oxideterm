@@ -8242,6 +8242,7 @@ version = "2.0.21"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "dirs 5.0.1",
  "http",
  "http-body-util",
  "hyper",

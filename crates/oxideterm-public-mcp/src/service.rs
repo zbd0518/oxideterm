@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, sync::Arc};
+use std::{collections::BTreeSet, fs, sync::Arc};
 
 use base64::Engine;
 use http::{header::AUTHORIZATION, request::Parts};
@@ -280,6 +280,11 @@ struct StageArtifactSchema {
     content: Option<String>,
     #[serde(default)]
     bytes_base64: Option<String>,
+    /// Local filesystem path to read artifact contents from. Bypasses the
+    /// inline size limit, so it is suitable for large uploads (multi-MB to
+    /// hundreds of MB) that would be impractical to base64-encode inline.
+    #[serde(default)]
+    file_path: Option<String>,
     #[serde(default)]
     media_type: Option<String>,
     #[serde(default)]
@@ -2304,17 +2309,41 @@ fn desktop_clipboard_payload_is_valid(payload: &DesktopClipboardPayload) -> bool
     }
 }
 
+/// Expand a leading `~` to the user's home directory. On Windows, also
+/// accept `~` as a synonym for `%USERPROFILE%`. Paths without a leading
+/// `~` are returned unchanged.
+fn expand_tilde(path: &str) -> String {
+    if !path.starts_with('~') {
+        return path.to_owned();
+    }
+    let home = dirs::home_dir();
+    match home {
+        Some(home) => {
+            let rest = path.trim_start_matches('~');
+            let rest = rest.strip_prefix(['/', '\\']).unwrap_or(rest);
+            home.join(rest).to_string_lossy().into_owned()
+        }
+        None => path.to_owned(),
+    }
+}
+
 fn parse_stage_artifact(
     mut arguments: JsonObject,
 ) -> Result<StageArtifactArgs, Box<CallToolResult>> {
     let content = arguments.remove("content");
     let bytes_base64 = arguments.remove("bytes_base64");
-    let (bytes, default_media_type) = match (content, bytes_base64) {
-        (Some(Value::String(content)), None) if content.len() <= ARTIFACT_STAGE_LIMIT_BYTES => (
-            Zeroizing::new(content.into_bytes()),
-            "text/plain; charset=utf-8",
-        ),
-        (None, Some(Value::String(encoded))) => {
+    let file_path = arguments.remove("file_path");
+    let (bytes, default_media_type, source_path) = match (content, bytes_base64, file_path) {
+        (Some(Value::String(content)), None, None)
+            if content.len() <= ARTIFACT_STAGE_LIMIT_BYTES =>
+        {
+            (
+                Zeroizing::new(content.into_bytes()),
+                "text/plain; charset=utf-8",
+                None,
+            )
+        }
+        (None, Some(Value::String(encoded)), None) => {
             let encoded = Zeroizing::new(encoded);
             let decoded = base64::engine::general_purpose::STANDARD
                 .decode(encoded.as_bytes())
@@ -2330,12 +2359,41 @@ fn parse_stage_artifact(
                     "The decoded artifact exceeds the supported staging limit",
                 )));
             }
-            (Zeroizing::new(decoded), "application/octet-stream")
+            (Zeroizing::new(decoded), "application/octet-stream", None)
+        }
+        (None, None, Some(Value::String(path))) => {
+            let path = path.trim();
+            if path.is_empty() {
+                return Err(Box::new(tool_error(
+                    "invalid_arguments",
+                    "file_path must not be empty",
+                )));
+            }
+            let path = expand_tilde(path);
+            let path = std::path::PathBuf::from(path);
+            let metadata = fs::metadata(&path).map_err(|error| {
+                Box::new(tool_error(
+                    "invalid_arguments",
+                    format!("Failed to stat file_path {path:?}: {error}"),
+                ))
+            })?;
+            if !metadata.is_file() {
+                return Err(Box::new(tool_error(
+                    "invalid_arguments",
+                    format!("file_path {path:?} is not a regular file"),
+                )));
+            }
+            // Note: we intentionally do NOT enforce a size cap here. The
+            // file is streamed by `ArtifactStore::stage_from_path`, so
+            // memory usage is bounded by the copy buffer, not by file
+            // size. The store's own per-client / global capacity guard
+            // (`enforce_capacity`) still applies.
+            (Zeroizing::new(Vec::new()), "application/octet-stream", Some(path))
         }
         _ => {
             return Err(Box::new(tool_error(
                 "invalid_arguments",
-                "Provide exactly one bounded content or bytes_base64 value",
+                "Provide exactly one of content, bytes_base64, or file_path",
             )));
         }
     };
@@ -2346,6 +2404,7 @@ fn parse_stage_artifact(
             .media_type
             .unwrap_or_else(|| default_media_type.to_owned()),
         name: metadata.name,
+        source_path,
     })
 }
 

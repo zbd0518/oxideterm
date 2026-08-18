@@ -2485,12 +2485,21 @@ impl WorkspaceApp {
         let PublicToolCall::StageArtifact(args) = &request.call else {
             return;
         };
-        match self.public_mcp.state.artifacts.stage(
-            request.client_ref.clone(),
-            &args.bytes,
-            args.media_type.clone(),
-            args.name.clone(),
-        ) {
+        let result = match args.source_path.as_ref() {
+            Some(path) => self.public_mcp.state.artifacts.stage_from_path(
+                request.client_ref.clone(),
+                path,
+                args.media_type.clone(),
+                args.name.clone(),
+            ),
+            None => self.public_mcp.state.artifacts.stage(
+                request.client_ref.clone(),
+                &args.bytes,
+                args.media_type.clone(),
+                args.name.clone(),
+            ),
+        };
+        match result {
             Ok(artifact) => finish_serialized(request, json!({ "artifact": artifact })),
             Err(error) => request.finish(ToolEnvelope::failed(error.to_string())),
         }

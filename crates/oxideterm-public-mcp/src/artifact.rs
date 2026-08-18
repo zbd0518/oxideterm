@@ -17,8 +17,8 @@ use crate::handles::{ArtifactRef, ClientRef};
 const ARTIFACT_TTL: Duration = Duration::from_secs(15 * 60);
 const ARTIFACT_CAPACITY: usize = 256;
 const ARTIFACT_CAPACITY_PER_CLIENT: usize = 64;
-const ARTIFACT_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
-const ARTIFACT_BYTES_PER_CLIENT: u64 = 64 * 1024 * 1024;
+const ARTIFACT_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const ARTIFACT_BYTES_PER_CLIENT: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ArtifactProjection {
@@ -133,6 +133,113 @@ impl ArtifactStore {
             return Err(ArtifactError::Write(error));
         }
         let digest = hex_digest(bytes);
+        let expires_at = Instant::now() + ARTIFACT_TTL;
+        let projection = ArtifactProjection {
+            artifact_ref: artifact_ref.clone(),
+            size,
+            digest,
+            media_type,
+            name,
+            expires_at_ms: unix_time_ms() + ARTIFACT_TTL.as_millis(),
+        };
+        state.total_bytes = state.total_bytes.saturating_add(size);
+        state.records.insert(
+            artifact_ref,
+            ArtifactRecord {
+                client_ref,
+                projection: projection.clone(),
+                private_path,
+                expires_at,
+            },
+        );
+        Ok(projection)
+    }
+
+    /// Stream a local file into artifact storage without loading the entire
+    /// file into memory. The file size is determined via `fs::metadata`
+    /// before the copy, so the capacity guard still applies. The SHA-256
+    /// digest is computed incrementally during the copy.
+    pub fn stage_from_path(
+        &self,
+        client_ref: ClientRef,
+        source_path: &std::path::Path,
+        media_type: String,
+        name: Option<String>,
+    ) -> Result<ArtifactProjection, ArtifactError> {
+        validate_media_type(&media_type)?;
+        if let Some(name) = name.as_deref() {
+            validate_name(name)?;
+        }
+
+        let file_metadata = fs::metadata(source_path).map_err(|error| {
+            ArtifactError::Write(std::io::Error::other(format!(
+                "Failed to stat source file {source_path:?}: {error}"
+            )))
+        })?;
+        let size = file_metadata.len();
+        if !file_metadata.is_file() {
+            return Err(ArtifactError::Write(std::io::Error::other(format!(
+                "Source path {source_path:?} is not a regular file"
+            ))));
+        }
+
+        let mut state = self.state.lock();
+        cleanup_expired(&mut state);
+        let root_path = state
+            .root
+            .as_ref()
+            .map(|root| root.path().to_owned())
+            .ok_or(ArtifactError::Unavailable)?;
+        enforce_capacity(&state, &client_ref, size)?;
+
+        let artifact_ref = ArtifactRef::new();
+        let private_path = root_path.join(artifact_ref.as_str());
+
+        // Stream copy: open source file, create destination, copy through
+        // a bounded buffer, and compute the SHA-256 digest in the same pass.
+        let mut source = fs::File::open(source_path).map_err(|error| {
+            let _ = fs::remove_file(&private_path);
+            ArtifactError::Write(error)
+        })?;
+        let mut dest = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&private_path)
+            .map_err(|error| {
+                let _ = fs::remove_file(&private_path);
+                ArtifactError::Write(error)
+            })?;
+
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        let mut copied: u64 = 0;
+        loop {
+            let n = source.read(&mut buffer).map_err(|error| {
+                let _ = fs::remove_file(&private_path);
+                ArtifactError::Write(error)
+            })?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buffer[..n]);
+            dest.write_all(&buffer[..n]).map_err(|error| {
+                let _ = fs::remove_file(&private_path);
+                ArtifactError::Write(error)
+            })?;
+            copied = copied.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+        }
+        // Sanity check: copied bytes should match the stat'd size.
+        if copied != size {
+            let _ = fs::remove_file(&private_path);
+            return Err(ArtifactError::Write(std::io::Error::other(format!(
+                "Size mismatch while streaming artifact: expected {size}, copied {copied}"
+            ))));
+        }
+        let digest: String = hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         let expires_at = Instant::now() + ARTIFACT_TTL;
         let projection = ArtifactProjection {
             artifact_ref: artifact_ref.clone(),
