@@ -2067,10 +2067,20 @@ fn define_explicit_approval_tool<T: JsonSchema>(
 }
 
 fn schema_object<T: JsonSchema>() -> JsonObject {
-    serde_json::to_value(schema_for!(T))
+    let mut object = serde_json::to_value(schema_for!(T))
         .ok()
         .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // MCP spec requires tool inputSchema to be an object-typed schema.
+    // schemars emits internally-tagged enums (e.g. RecordingsControlArgs,
+    // StartTransferArgs) as a top-level `oneOf` without a `type` field,
+    // which strict MCP clients (Claude Code) reject, failing the whole
+    // tools/list. Backfill `type: object` so tagged-enum tool args still
+    // validate as objects.
+    object
+        .entry("type".to_string())
+        .or_insert_with(|| serde_json::Value::String("object".to_string()));
+    object
 }
 
 fn parse_arguments<T: DeserializeOwned>(arguments: JsonObject) -> Result<T, Box<CallToolResult>> {
