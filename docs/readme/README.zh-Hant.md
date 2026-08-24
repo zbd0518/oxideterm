@@ -3,7 +3,7 @@
 <p align="center">
   <strong>面向遠端伺服器、具備 AI 能力的原生維運工作區 —— 純 Rust 原生應用</strong>
   <br>
-  SSH、Telnet、序列埠、RDP/VNC、SFTP、連接埠轉發 和輕量編輯，集中在一個原生工作區。
+  SSH、Mosh、Telnet、序列埠、RDP/VNC、SFTP、連接埠轉發 和輕量編輯，集中在一個原生工作區。
   <br>
   GPU 直接渲染。免費，無需註冊。
   <br>
@@ -39,7 +39,7 @@ OxideTerm 是面向 SSH 與遠端維運的開源工作區。終端、檔案、�
 
 **你可以做什麼：**
 
-- 在同一個工作區中管理 SSH、Telnet、序列埠、RDP/VNC、SFTP、連接埠轉發、本機 Shell 與輕量編輯
+- 在同一個工作區中管理 SSH、Mosh、Telnet、序列埠、RDP/VNC、SFTP、連接埠轉發、本機 Shell 與輕量編輯
 - 透過 Grace Period 重連機制，應對短暫網路中斷並維持遠端工作
 - 使用你自己的 AI 服務商，讓 OxideSens 檢查作用中的工作階段並執行經過核准的工作區操作
 
@@ -97,7 +97,7 @@ OxideTerm 將連線、檔案、轉發、主機工具、自動化與 AI 上下文
 
 | 類別 | 功能 |
 |---|---|
-| **終端與連線** | 本機 Shell、SSH、Telnet、序列埠、分割窗格、自由輸入模式、高階多目標命令傳送、多跳路由與穩定重連 |
+| **終端與連線** | 本機 Shell、SSH、Mosh、Telnet、序列埠、分割窗格、自由輸入模式、可設定的工作階段日誌、具窗格版面與可拖曳分隔線的原生 tmux -CC 控制模式、具名稱的廣播群組、高階多目標命令傳送、多跳路由與穩定重連 |
 | **檔案與遠端編輯** | SFTP、傳輸佇列、收藏夾、安全寫入、專案樹與多分頁編輯 |
 | **轉發與網路** | 本機、遠端與動態 SOCKS5 轉發、已儲存規則與 Socket 除錯 |
 | **主機維運與遠端桌面** | 監控、行程、服務、日誌、連接埠、工作、磁碟、套件、容器、tmux、RDP 與 VNC |
@@ -115,6 +115,19 @@ OxideTerm 將連線、檔案、轉發、主機工具、自動化與 AI 上下文
 *觀看 OxideSens 依照使用者請求，在 OxideTerm 中開啟一個終端。*
 
 </div>
+
+---
+
+## 安裝
+
+[下載最新版本](https://github.com/AnalyseDeCircuit/oxideterm/releases/latest)
+
+- macOS：選擇適合 Apple Silicon 或 Intel 的 `.dmg`。
+- Windows：選擇 x64 或 ARM64 安裝程式。
+- Linux：選擇 AppImage、`.deb` 或 `.rpm`。
+- 可使用發布頁中的 `sha256sums.txt` 驗證下載檔案。
+
+需要從原始碼建置？請繼續閱讀下方的「從原始碼執行」章節。
 
 ---
 
