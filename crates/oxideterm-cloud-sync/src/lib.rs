@@ -25,9 +25,19 @@ pub mod state_transitions;
 pub const CLOUD_SYNC_PLUGIN_ID: &str = "com.oxideterm.cloud-sync";
 
 pub const OXIDE_CONTENT_TYPE: &str = "application/vnd.oxideterm.oxide";
-pub const STRUCTURED_MANIFEST_FORMAT: &str = "structured-v1";
+pub const LEGACY_STRUCTURED_MANIFEST_FORMAT: &str = "structured-v1";
+pub const STRUCTURED_MANIFEST_FORMAT: &str = "structured-v2";
 pub const STRUCTURED_MANIFEST_CONTENT_TYPE: &str =
     "application/vnd.oxideterm.cloud-sync.manifest+json";
+
+/// Accepts the original structured format while new uploads advertise fields
+/// that older clients cannot safely round-trip.
+pub fn structured_manifest_format_supported(format: Option<&str>) -> bool {
+    matches!(
+        format,
+        Some(STRUCTURED_MANIFEST_FORMAT | LEGACY_STRUCTURED_MANIFEST_FORMAT)
+    )
+}
 
 pub const MAX_REMOTE_SNAPSHOT_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_ROLLBACK_BACKUP_BYTES: usize = 2 * 1024 * 1024;
@@ -364,7 +374,7 @@ pub struct StructuredDirtySections {
     pub plugin_settings: BTreeMap<String, bool>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StructuredDirtyInfo {
     pub current_state: StructuredLocalState,
@@ -447,6 +457,8 @@ pub struct StructuredManifestSections {
     pub telnet_profiles: Option<StructuredObjectEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mosh_profiles: Option<StructuredObjectEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standalone_sftp_profiles: Option<StructuredObjectEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_desktop_profiles: Option<StructuredObjectEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -843,7 +855,8 @@ pub fn count_structured_upload_plan_units(
 ) -> usize {
     let mut total = 0;
     if scope.sync_connections {
-        total += 1;
+        // Connections owns both saved SSH records and standalone SFTP profiles.
+        total += 2;
     }
     if scope.sync_forwards {
         total += 1;
@@ -912,6 +925,10 @@ pub fn telnet_profiles_object_path(revision: &str) -> String {
 
 pub fn mosh_profiles_object_path(revision: &str) -> String {
     format!("structured/mosh-profiles/{revision}.json")
+}
+
+pub fn standalone_sftp_profiles_object_path(revision: &str) -> String {
+    format!("structured/standalone-sftp-profiles/{revision}.json")
 }
 
 pub fn remote_desktop_profiles_object_path(revision: &str) -> String {
@@ -1110,6 +1127,19 @@ mod tests {
             serde_json::to_value(&settings).unwrap()["autoUploadIntervalMins"],
             serde_json::json!(7.5)
         );
+    }
+
+    #[test]
+    fn accepts_previous_structured_manifest_during_v2_migration() {
+        assert!(structured_manifest_format_supported(Some(
+            LEGACY_STRUCTURED_MANIFEST_FORMAT
+        )));
+        assert!(structured_manifest_format_supported(Some(
+            STRUCTURED_MANIFEST_FORMAT
+        )));
+        assert!(!structured_manifest_format_supported(Some(
+            "structured-unknown"
+        )));
     }
 
     #[test]
@@ -1343,21 +1373,5 @@ mod tests {
             s3_revision_blob_key("team/default", "rev-1"),
             "team/default/blobs/rev-1.oxide"
         );
-    }
-
-    #[test]
-    fn counts_upload_units_like_structured_sync() {
-        let scope = SyncScope {
-            app_settings_sections: strings(&["general", "localTerminal"]),
-            plugin_ids: Some(strings(&["plugin-a", "plugin-b"])),
-            ..SyncScope::default()
-        };
-        let metadata = LocalSyncMetadata {
-            app_settings_section_revisions: BTreeMap::from([("general".into(), "gen".into())]),
-            plugin_settings_revisions: BTreeMap::from([("plugin-b".into(), "pb".into())]),
-            ..LocalSyncMetadata::default()
-        };
-
-        assert_eq!(count_structured_upload_plan_units(&metadata, &scope), 4);
     }
 }

@@ -1,3 +1,23 @@
+const SSH_OUTPUT_PARSE_SLICE_BYTES: usize = 4 * 1024;
+
+struct PendingSshOutput {
+    chunk: SshOutputChunk,
+    consumed_bytes: usize,
+}
+
+impl PendingSshOutput {
+    fn new(chunk: SshOutputChunk) -> Self {
+        Self {
+            chunk,
+            consumed_bytes: 0,
+        }
+    }
+
+    fn remaining_len(&self) -> usize {
+        self.chunk.len().saturating_sub(self.consumed_bytes)
+    }
+}
+
 pub struct SshPtySession {
     config: SshSessionConfig,
     term: Arc<FairMutex<Term<LocalEventListener>>>,
@@ -16,13 +36,14 @@ pub struct SshPtySession {
     graphics_ingress: GraphicsIngress,
     graphics: TerminalGraphicsState,
     graphics_alt_screen_active: bool,
-    output_queue: VecDeque<SshOutputChunk>,
+    output_queue: VecDeque<PendingSshOutput>,
     output_queue_bytes: usize,
     magic_scan: MagicScanWindow,
     encoding: TerminalEncoding,
     output_decoder: TerminalOutputDecoder,
     output_processor: Option<TerminalOutputProcessor>,
     output_events_enabled: bool,
+    trigger_stream: Option<oxideterm_terminal_triggers::TerminalTriggerStream>,
     privilege_prompt: TerminalPrivilegePromptStream,
     input_encoder: TerminalInputEncoder,
     encoding_detector: EncodingMismatchDetector,
@@ -33,12 +54,53 @@ pub struct SshPtySession {
 
 impl SshPtySession {
     pub fn new(
+        config: SshSessionConfig,
+        cols: usize,
+        rows: usize,
+        graphics_options: GraphicsOptions,
+        encoding: TerminalEncoding,
+        scrollback_lines: usize,
+    ) -> Self {
+        Self::new_inner(
+            config,
+            cols,
+            rows,
+            graphics_options,
+            encoding,
+            scrollback_lines,
+            true,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_disconnected_for_test(
+        config: SshSessionConfig,
+        cols: usize,
+        rows: usize,
+        graphics_options: GraphicsOptions,
+        encoding: TerminalEncoding,
+        scrollback_lines: usize,
+    ) -> Self {
+        // State-only tests must not create a runtime or attempt a network connection.
+        Self::new_inner(
+            config,
+            cols,
+            rows,
+            graphics_options,
+            encoding,
+            scrollback_lines,
+            false,
+        )
+    }
+
+    fn new_inner(
         mut config: SshSessionConfig,
         cols: usize,
         rows: usize,
         graphics_options: GraphicsOptions,
         encoding: TerminalEncoding,
         scrollback_lines: usize,
+        start_connection: bool,
     ) -> Self {
         let resize = TerminalResize::new(cols, rows, 0, 0);
         let size = TerminalSize {
@@ -55,15 +117,19 @@ impl SshPtySession {
 
         // GPUI owns a backend runtime for SSH-adjacent work; standalone
         // terminal sessions keep this fallback runtime alive for compatibility.
-        let runtime = if config.runtime_handle.is_some() {
+        let runtime = if !start_connection || config.runtime_handle.is_some() {
             None
         } else {
             Runtime::new().ok()
         };
-        let runtime_handle = config
-            .runtime_handle
-            .take()
-            .or_else(|| runtime.as_ref().map(|runtime| runtime.handle().clone()));
+        let runtime_handle = if start_connection {
+            config
+                .runtime_handle
+                .take()
+                .or_else(|| runtime.as_ref().map(|runtime| runtime.handle().clone()))
+        } else {
+            None
+        };
         let (connect_tx, connect_rx) = unbounded();
         if let Some(runtime_handle) = runtime_handle {
             let connection = config.connection.take();
@@ -165,7 +231,7 @@ impl SshPtySession {
                 let _ = connect_tx.send(result);
                 connect_activity.notify();
             });
-        } else {
+        } else if start_connection {
             let _ = connect_tx.send(Err("failed to initialize SSH runtime".to_string()));
             activity.notify();
         }
@@ -196,6 +262,7 @@ impl SshPtySession {
             output_decoder: TerminalOutputDecoder::new(encoding),
             output_processor: None,
             output_events_enabled: false,
+            trigger_stream: None,
             privilege_prompt: TerminalPrivilegePromptStream::default(),
             input_encoder: TerminalInputEncoder::new(encoding),
             encoding_detector: EncodingMismatchDetector::new(encoding),
@@ -289,8 +356,7 @@ impl SshPtySession {
 
     fn push_output_event(&mut self, bytes: &[u8]) {
         if self.output_events_enabled && !bytes.is_empty() {
-            // Terminal recording is the only consumer of raw display-output events;
-            // keep this allocation off the normal rendering path.
+            // File consumers are opt-in, so keep this allocation off the normal rendering path.
             self.pending_events.push(TerminalEvent::Output(bytes.to_vec()));
         }
     }
@@ -325,6 +391,12 @@ impl SshPtySession {
                         self.pending_events.push(TerminalEvent::EncodingHint(hint));
                     }
                     let decoded = self.output_decoder.decode_to_utf8_bytes(&terminal_bytes);
+                    if let Some(stream) = self.trigger_stream.as_mut() {
+                        stream.observe_bytes(decoded.as_ref(), |matched| {
+                            self.pending_events
+                                .push(TerminalEvent::TriggerMatched(matched));
+                        });
+                    }
                     for event in self.privilege_prompt.observe(decoded.as_ref()) {
                         self.pending_events
                             .push(TerminalEvent::PrivilegePrompt(event));
@@ -500,11 +572,27 @@ impl SshPtySession {
                 break;
             }
 
-            if let Some(bytes) = self.output_queue.pop_front() {
-                self.output_queue_bytes = self.output_queue_bytes.saturating_sub(bytes.len());
-                report.drained_bytes = report.drained_bytes.saturating_add(bytes.len());
+            if let Some(mut output) = self.output_queue.pop_front() {
+                let remaining_budget = budget.max_bytes.saturating_sub(report.drained_bytes);
+                let slice_len = output
+                    .remaining_len()
+                    .min(SSH_OUTPUT_PARSE_SLICE_BYTES)
+                    .min(remaining_budget);
+                let slice_end = output.consumed_bytes.saturating_add(slice_len);
                 report.events_drained += 1;
-                self.feed_transport_output(&bytes);
+                let processing_started = budget.collect_performance_metrics.then(Instant::now);
+                self.feed_transport_output(&output.chunk[output.consumed_bytes..slice_end]);
+                report.record_data_chunk(
+                    slice_len,
+                    processing_started.map_or(Duration::ZERO, |started| started.elapsed()),
+                );
+                output.consumed_bytes = slice_end;
+                self.output_queue_bytes = self.output_queue_bytes.saturating_sub(slice_len);
+                if output.remaining_len() > 0 {
+                    // Keep the transport permit and the unconsumed suffix together so
+                    // backpressure and byte ordering remain unchanged across UI yields.
+                    self.output_queue.push_front(output);
+                }
                 report.mark_changed();
                 continue;
             }
@@ -518,19 +606,8 @@ impl SshPtySession {
 
             match result {
                 Ok(bytes) => {
-                    if report.drained_bytes > 0
-                        && report.drained_bytes.saturating_add(bytes.len()) > budget.max_bytes
-                    {
-                        self.output_queue_bytes =
-                            self.output_queue_bytes.saturating_add(bytes.len());
-                        self.output_queue.push_back(bytes);
-                        report.budget_exhausted = true;
-                        break;
-                    }
-                    report.drained_bytes = report.drained_bytes.saturating_add(bytes.len());
-                    report.events_drained += 1;
-                    self.feed_transport_output(&bytes);
-                    report.mark_changed();
+                    self.output_queue_bytes = self.output_queue_bytes.saturating_add(bytes.len());
+                    self.output_queue.push_back(PendingSshOutput::new(bytes));
                 }
                 Err(TryRecvError::Disconnected) => {
                     if self.lifecycle.is_running() {
@@ -737,6 +814,13 @@ impl TerminalSessionBackend for SshPtySession {
         self.output_events_enabled = enabled;
     }
 
+    fn set_trigger_rules(
+        &mut self,
+        rules: Option<Arc<oxideterm_terminal_triggers::CompiledTriggerSet>>,
+    ) {
+        self.trigger_stream = rules.map(oxideterm_terminal_triggers::TerminalTriggerStream::new);
+    }
+
     fn set_trzsz_policy(&mut self, policy: Option<TrzszTransferPolicy>) {
         // Tauri's terminal controller applies in-band transfer settings to an
         // existing terminal controller, not only to future panes. Native keeps
@@ -838,6 +922,26 @@ impl TerminalSessionBackend for SshPtySession {
         if delta != 0 {
             self.term.lock().scroll_display(Scroll::Delta(delta));
         }
+    }
+
+    fn scroll_lines_snapshot_incremental(
+        &mut self,
+        delta: i32,
+        previous: &TerminalSnapshot,
+    ) -> TerminalSnapshot {
+        let mut term = self.term.lock();
+        scroll_snapshot_from_term(
+            &mut term,
+            TerminalSize {
+                cols: self.resize.cols,
+                rows: self.resize.rows,
+                cell_width: self.resize.cell_width,
+                cell_height: self.resize.cell_height,
+            },
+            &self.graphics,
+            delta,
+            previous,
+        )
     }
 
     fn page_up(&mut self) {

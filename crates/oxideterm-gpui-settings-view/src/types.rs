@@ -69,10 +69,22 @@ impl SettingsSelectAnchorExt for SettingsSelect {
             Self::TerminalEncoding => SelectAnchorId::SettingsTerminalEncoding,
             Self::TerminalBackspaceSequence => SelectAnchorId::SettingsTerminalBackspaceSequence,
             Self::TerminalDeleteSequence => SelectAnchorId::SettingsTerminalDeleteSequence,
+            Self::TerminalSessionLogFileMode => SelectAnchorId::SettingsTerminalSessionLogFileMode,
             Self::TerminalCursorStyle => SelectAnchorId::SettingsTerminalCursorStyle,
             Self::RemoteShellIntegrationMode => SelectAnchorId::SettingsRemoteShellIntegrationMode,
+            Self::TerminalTriggerMatchMode => SelectAnchorId::SettingsTerminalTriggerMatchMode,
+            Self::TerminalTriggerAction => SelectAnchorId::SettingsTerminalTriggerAction,
+            Self::TerminalTriggerProcessMode => SelectAnchorId::SettingsTerminalTriggerProcessMode,
+            Self::TerminalTriggerQuickCommand => {
+                SelectAnchorId::SettingsTerminalTriggerQuickCommand
+            }
+            Self::TerminalTriggerTiming => SelectAnchorId::SettingsTerminalTriggerTiming,
+            Self::TerminalTriggerScope => SelectAnchorId::SettingsTerminalTriggerScope,
             Self::IdeAgentMode => SelectAnchorId::SettingsIdeAgentMode,
             Self::LocalShell => SelectAnchorId::SettingsLocalShell,
+            Self::LocalShellSemanticScheme(index) => {
+                SelectAnchorId::SettingsLocalShellSemanticScheme(index)
+            }
             Self::LocalPrivilegeKind => SelectAnchorId::SettingsLocalPrivilegeKind,
             Self::ConnectionIdleTimeout => SelectAnchorId::SettingsConnectionIdleTimeout,
             Self::ReconnectMaxAttempts => SelectAnchorId::SettingsReconnectMaxAttempts,
@@ -96,6 +108,14 @@ impl SettingsSelectAnchorExt for SettingsSelect {
             Self::SftpConcurrent => SelectAnchorId::SettingsSftpConcurrent,
             Self::SftpDirectoryParallelism => SelectAnchorId::SettingsSftpDirectoryParallelism,
             Self::SftpConflict => SelectAnchorId::SettingsSftpConflict,
+            Self::TerminalSemanticScheme => SelectAnchorId::SettingsTerminalSemanticScheme,
+            Self::SemanticSchemeRuleClass(index) => {
+                SelectAnchorId::SettingsSemanticSchemeRuleClass(index)
+            }
+            Self::SemanticSchemeRuleContext(index) => {
+                SelectAnchorId::SettingsSemanticSchemeRuleContext(index)
+            }
+            Self::HighlightRuleSet => SelectAnchorId::SettingsHighlightRuleSet,
             Self::HighlightPreset => SelectAnchorId::SettingsHighlightPreset,
             Self::HighlightRenderMode(index) => SelectAnchorId::SettingsHighlightRenderMode(index),
             Self::HighlightMatchScope(index) => SelectAnchorId::SettingsHighlightMatchScope(index),

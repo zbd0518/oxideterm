@@ -63,6 +63,7 @@ mod terminal_cwd;
 mod terminal_entity;
 mod terminal_git;
 mod terminal_project;
+mod terminal_triggers_runtime;
 mod version_migration;
 mod virtual_list;
 mod window_intent;
@@ -150,8 +151,10 @@ use oxideterm_connection_monitor::{
     visible_tmux_session_rows,
 };
 use oxideterm_connections::{
-    ConnectionStore, ConnectionTerminalOptions, PrivilegeCredentialKind, SaveConnectionRequest,
-    SavedPrivilegeCredential, SshConfigSyncService,
+    ConnectionStore, ConnectionTerminalOptions, ConnectionTerminalSessionLogPolicy,
+    MoshIpFamily as SavedMoshIpFamily, MoshPredictionMode,
+    MoshUdpPortSelection as SavedMoshUdpPortSelection, PrivilegeCredentialKind,
+    SaveConnectionRequest, SavedPrivilegeCredential, SshConfigSyncService,
 };
 use oxideterm_forwarding::{
     ForwardEventDeliverySender, ForwardStatus, ForwardingRegistry, SavedForwardStore,
@@ -162,16 +165,19 @@ use oxideterm_gpui_platform::{
     window_opacity::{apply_window_opacity, normalized_window_opacity},
 };
 use oxideterm_gpui_terminal::{
-    BackgroundImageRenderCache, PrivilegePromptMatch, SharedTerminalSession, TerminalBackgroundFit,
-    TerminalBackgroundPreferences, TerminalBroadcastInputKind, TerminalCommandSelectionLabels,
-    TerminalContextAction, TerminalHighlightMatchScope, TerminalHighlightRenderMode,
-    TerminalHighlightRule as UiHighlightRule, TerminalInputBroadcaster, TerminalInputInterceptor,
+    BackgroundImageRenderCache, PrivilegePromptMatch, SemanticShellDialect, SharedTerminalSession,
+    TerminalBackgroundFit, TerminalBackgroundPreferences, TerminalBroadcastInputKind,
+    TerminalCommandSelectionLabels, TerminalContextAction, TerminalHighlightMatchScope,
+    TerminalHighlightRenderMode, TerminalHighlightRule as UiHighlightRule,
+    TerminalHighlightRuleSetOverride, TerminalInputBroadcaster, TerminalInputInterceptor,
     TerminalInputInterceptorResult, TerminalModemLabels, TerminalNotice, TerminalNoticeVariant,
     TerminalOutputProcessor, TerminalPane, TerminalPaneEvent, TerminalPasteLabels,
     TerminalRecordingState, TerminalRecordingStatus, TerminalSearchStatus,
-    TerminalSerialControlLabels, TerminalTrzszLabels, TerminalUiPreferenceOverrides,
-    TerminalUiPreferences, TerminalUiTheme, TerminalWorkingDirectorySource,
-    detect_custom_privilege_prompt,
+    TerminalSerialControlLabels, TerminalSessionLogContext, TerminalSessionLogLabels,
+    TerminalSessionLogOptions, TerminalSessionLogState, TerminalSessionLogStatus,
+    TerminalTrzszLabels, TerminalUiPreferenceOverrides, TerminalUiPreferences, TerminalUiTheme,
+    TerminalWorkingDirectorySource, detect_custom_privilege_prompt, prune_terminal_session_logs,
+    resolved_terminal_semantic_scheme,
 };
 use oxideterm_gpui_ui::scroll::ScrollableElement;
 use oxideterm_gpui_ui::{
@@ -210,34 +216,36 @@ use oxideterm_session_adapter::{
 };
 use oxideterm_settings::{
     AI_SIDEBAR_ABSOLUTE_MAX_WIDTH, AI_SIDEBAR_ABSOLUTE_MIN_WIDTH, BackgroundFit, BackgroundScope,
-    CursorStyle as SettingsCursorStyle, FontFamily, FrostedGlassMode, HighlightRuleMatchScope,
-    HighlightRuleRenderMode, Language, MAX_TERMINAL_BACKGROUND_OPACITY, MAX_WINDOW_OPACITY,
-    MIN_TERMINAL_BACKGROUND_OPACITY, MIN_WINDOW_OPACITY, PersistedSettings, SettingsStore,
-    background_images_directory, default_settings_path, ensure_bundled_background_image,
-    list_background_images,
+    CursorStyle as SettingsCursorStyle, FontFamily, FrostedGlassMode, GLOBAL_HIGHLIGHT_RULE_SET_ID,
+    HighlightRule, HighlightRuleMatchScope, HighlightRuleRenderMode, Language,
+    MAX_TERMINAL_BACKGROUND_OPACITY, MAX_WINDOW_OPACITY, MIN_TERMINAL_BACKGROUND_OPACITY,
+    MIN_WINDOW_OPACITY, PersistedSettings, SettingsStore, background_images_directory,
+    default_settings_path, ensure_bundled_background_image, list_background_images,
 };
 use oxideterm_settings_model::{
     AiMcpServerDraft, AiProviderKeyStatusDelivery, SettingsNavigationLayout,
 };
 use oxideterm_sftp::{
     BackgroundTransferDirection, BackgroundTransferKind, BackgroundTransferSnapshot,
-    BackgroundTransferState, LazyProgressStore, ProgressStore, SftpTransferGuard,
-    SftpTransferManager, StoredTransferProgress, TransferStrategy, tar_download_directory,
-    tar_upload_directory,
+    BackgroundTransferState, LazyProgressStore, ProgressStore, RemoteRelayDisposition,
+    SftpTransferGuard, SftpTransferManager, StoredTransferProgress, TarTransferOptions,
+    TransferStrategy, profile_local_directory, tar_download_directory, tar_upload_directory,
 };
 use oxideterm_ssh::{
-    AuthMethod, ConnectionConsumer, ConnectionPoolConfig, ConnectionState, ConnectionTraceEvent,
-    ConnectionTraceMode, ConnectionTracePlan, ConnectionTraceStage, ConnectionTraceState,
-    ConnectionTraceStatus, MAX_RETAINED_RECONNECT_JOBS, NodeEventReceiver, NodeEventSubscription,
-    NodeId, NodeOrigin, NodeReadiness, NodeRouter, NodeRuntimeStore, NodeState, NodeStateEvent,
-    NodeTreeExpansion, NodeTreePersistenceSnapshot, NodeTreeSnapshot, NodeTreeSnapshotNode,
-    PhaseResult, ProbeConnectionStatus, ProxyHopConfig, ReconnectForwardRuleSnapshot,
-    ReconnectNodeConnectionSnapshot, ReconnectNodeTerminalSnapshot, ReconnectNodeTransferSnapshot,
-    ReconnectOrchestratorStore, ReconnectPhase, ReconnectProgress, ReconnectSnapshot,
-    SshAlgorithmDiagnosticKind, SshConfig, SshConnectionRegistry, SshTransportClient,
-    TerminalEndpoint,
+    AuthMethod, ConnectionConsumer, ConnectionPoolConfig, ConnectionProgressReporter,
+    ConnectionState, ConnectionTraceEvent, ConnectionTraceMode, ConnectionTracePlan,
+    ConnectionTraceStage, ConnectionTraceState, ConnectionTraceStatus, MAX_RETAINED_RECONNECT_JOBS,
+    NodeEventReceiver, NodeEventSubscription, NodeId, NodeOrigin, NodeReadiness, NodeRouter,
+    NodeRuntimeStore, NodeState, NodeStateEvent, NodeTreeExpansion, NodeTreePersistenceSnapshot,
+    NodeTreeSnapshot, NodeTreeSnapshotNode, PhaseResult, ProbeConnectionStatus, ProxyHopConfig,
+    ReconnectForwardRuleSnapshot, ReconnectNodeConnectionSnapshot, ReconnectNodeTerminalSnapshot,
+    ReconnectNodeTransferSnapshot, ReconnectOrchestratorStore, ReconnectPhase, ReconnectProgress,
+    ReconnectSnapshot, SshAlgorithmDiagnosticKind, SshConfig, SshConnectionHandle,
+    SshConnectionRegistry, SshTransportClient, TerminalEndpoint,
 };
-use oxideterm_ssh_launch::TemporarySshLaunch;
+use oxideterm_ssh_launch::{
+    NativeConnectionLaunch, TemporaryMoshLaunch, TemporarySshLaunch, TemporaryTelnetLaunch,
+};
 use oxideterm_terminal::{
     LocalPtyConfig, MoshTerminalConfig, RemoteShellIntegrationStatus, SerialSessionConfig,
     ShellInfo, SshSessionConfig, TelnetSessionConfig, TerminalCommandMarkDetectionSource,
@@ -281,13 +289,13 @@ use self::root::state::{ReconnectWorkerResult, WorkspaceSshNode, WorkspaceSshNod
 use self::root::{background::*, helpers::*};
 use self::session_manager::{SessionManagerState, SessionManagerWorkspaceEvent};
 use self::sidebar::AiInlinePanelState;
+#[cfg(test)]
+use self::sidebar::AiStreamDeliveryEvent;
 use self::sidebar::{ActiveSessionSidebarViewMode, SidebarSection};
 use self::sidebar::{
     AiCompactionDelivery, AiCompactionDeliverySender, AiStreamDelivery, AiStreamDeliverySender,
     ai_now_ms,
 };
-#[cfg(test)]
-use self::sidebar::{AiCompactionDeliveryKind, AiStreamDeliveryEvent};
 use self::tabs::{TabRemovalTransition, TerminalLocation};
 use self::terminal_entity::{WorkspaceTerminalEntity, WorkspaceTerminalEvent};
 use self::window_intent::WorkspaceWindowIntentEntity;
@@ -736,11 +744,26 @@ pub(crate) struct WorkspaceApp {
     tab_host: Entity<tabs::WorkspaceTabHostEntity>,
     _tab_host_subscription: Subscription,
     search: SearchBarState,
+    terminal_recording_menu_open: bool,
+    terminal_highlight_popover_open: bool,
+    // Settings keep the source pane stable while editing session-only trigger overrides.
+    terminal_trigger_settings_pane: Option<PaneId>,
+    terminal_trigger_shell_confirmation_pending: bool,
+    terminal_triggers: settings::TerminalTriggersSettingsState,
+    terminal_trigger_runtime: terminal_triggers_runtime::TerminalTriggerRuntimeState,
+    // Runtime panes share one stable saved-profile identity index across triggers and broadcasts.
+    terminal_saved_connection_refs:
+        HashMap<TerminalSessionId, oxideterm_terminal_triggers::SavedConnectionRef>,
+    terminal_semantic_highlight_section_expanded: bool,
+    terminal_rule_highlight_section_expanded: bool,
+    terminal_command_context_highlight_section_expanded: bool,
     terminal_command_sender: Entity<terminal_command_sender::TerminalCommandSenderEntity>,
     _terminal_command_sender_observation: Subscription,
     detached_local_terminals: HashMap<TerminalSessionId, DetachedLocalTerminalSession>,
     detached_local_terminal_order: Vec<TerminalSessionId>,
     serial_terminal_configs: HashMap<TerminalSessionId, SerialSessionConfig>,
+    // A Telnet pane keeps only the stable profile owner needed for toolbar persistence.
+    telnet_terminal_profile_ids: HashMap<TerminalSessionId, String>,
     detached_local_terminals_popover_open: bool,
     command_palette: Entity<command_palette::CommandPaletteEntity>,
     _command_palette_observation: Subscription,
@@ -854,6 +877,10 @@ pub(crate) struct WorkspaceApp {
     _file_manager_observation: Subscription,
     _file_manager_subscription: Subscription,
     sftp_tab_nodes: HashMap<TabId, NodeId>,
+    standalone_sftp_tabs: HashMap<TabId, sftp::StandaloneSftpTabBinding>,
+    standalone_sftp_sessions: HashMap<String, sftp::StandaloneSftpRuntime>,
+    pending_standalone_sftp_pair_launches:
+        HashMap<String, new_connection::PendingStandaloneSftpPairLaunch>,
     embedded_sftp_node_id: Option<NodeId>,
     sftp_presentation_request: Option<sftp::SftpPresentationRequest>,
     ide_workspace: Entity<ide::IdeWorkspaceEntity>,

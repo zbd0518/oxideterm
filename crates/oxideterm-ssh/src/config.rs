@@ -3,6 +3,7 @@
 
 use std::fmt;
 
+use oxideterm_connections::SshAlgorithmPreferences;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -38,6 +39,45 @@ fn agent_forwarding_endpoint_key_suffix(
     format!(":{label}={digest:x}")
 }
 
+fn authentication_key_suffix(auth: &AuthMethod) -> String {
+    let (server_identity, delegate_credentials) = match auth {
+        AuthMethod::KerberosPreferred {
+            server_identity,
+            delegate_credentials,
+            ..
+        } => (server_identity, delegate_credentials),
+        _ => return String::new(),
+    };
+    let identity = server_identity.as_deref().unwrap_or_default();
+    // The configured service identity can reveal internal host naming, so the
+    // registry key retains only a digest while still separating GSS contexts.
+    let digest = Sha256::digest(identity.as_bytes());
+    format!(":gssapi={digest:x}:delegate={delegate_credentials}")
+}
+
+fn algorithm_preferences_key_suffix(preferences: &SshAlgorithmPreferences) -> String {
+    if preferences.is_default() {
+        return String::new();
+    }
+    let mut hasher = Sha256::new();
+    for (category, algorithms) in [
+        (b'k', preferences.kex.as_slice()),
+        (b'h', preferences.host_key.as_slice()),
+        (b'c', preferences.cipher.as_slice()),
+        (b'm', preferences.mac.as_slice()),
+        (b'z', preferences.compression.as_slice()),
+    ] {
+        hasher.update([category]);
+        for algorithm in algorithms {
+            hasher.update(algorithm.as_bytes());
+            hasher.update([0]);
+        }
+    }
+    // Pool identity must separate physical connections with different offers,
+    // while keeping arbitrary persisted names out of registry keys.
+    format!(":algorithms={:x}", hasher.finalize())
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SshConfig {
     pub host: String,
@@ -71,6 +111,8 @@ pub struct SshConfig {
     pub agent_forwarding_socket: Option<String>,
     #[serde(default)]
     pub legacy_ssh_compatibility: bool,
+    #[serde(default, skip_serializing_if = "SshAlgorithmPreferences::is_default")]
+    pub ssh_algorithms: SshAlgorithmPreferences,
     /// X11 stores only non-secret policy; DISPLAY and cookies are resolved per shell.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub x11_forwarding: Option<X11ForwardPolicy>,
@@ -105,8 +147,24 @@ impl fmt::Debug for SshConfig {
                 &self.agent_forwarding_socket.is_some(),
             )
             .field("legacy_ssh_compatibility", &self.legacy_ssh_compatibility)
+            .field(
+                "ssh_algorithm_categories_customized",
+                &[
+                    !self.ssh_algorithms.kex.is_empty(),
+                    !self.ssh_algorithms.host_key.is_empty(),
+                    !self.ssh_algorithms.cipher.is_empty(),
+                    !self.ssh_algorithms.mac.is_empty(),
+                    !self.ssh_algorithms.compression.is_empty(),
+                ]
+                .into_iter()
+                .filter(|customized| *customized)
+                .count(),
+            )
             .field("x11_forwarding", &self.x11_forwarding)
-            .field("post_connect_command", &self.post_connect_command)
+            .field(
+                "post_connect_command_configured",
+                &self.post_connect_command.is_some(),
+            )
             .finish()
     }
 }
@@ -210,15 +268,19 @@ impl SshConfig {
                     } else {
                         String::new()
                     };
+                    let authentication_suffix = authentication_key_suffix(&hop.auth);
+                    let algorithm_suffix = algorithm_preferences_key_suffix(&hop.ssh_algorithms);
                     format!(
-                        "{}@{}:{}{}{}{}{}",
+                        "{}@{}:{}{}{}{}{}{}{}",
                         hop.username,
                         hop.host,
                         hop.port,
                         legacy_suffix,
                         agent_forwarding_suffix,
                         identity_agent_suffix,
-                        forwarding_socket_suffix
+                        forwarding_socket_suffix,
+                        authentication_suffix,
+                        algorithm_suffix
                     )
                 })
                 .collect::<Vec<_>>()
@@ -262,8 +324,10 @@ impl SshConfig {
             .proxy_command
             .as_ref()
             .map_or_else(String::new, ProxyCommandConfig::connection_key_suffix);
+        let authentication_key = authentication_key_suffix(&self.auth);
+        let algorithm_key = algorithm_preferences_key_suffix(&self.ssh_algorithms);
         format!(
-            "{}@{}:{}|{}{}{}{}{}{}{}",
+            "{}@{}:{}|{}{}{}{}{}{}{}{}{}",
             self.username,
             self.host,
             self.port,
@@ -273,7 +337,9 @@ impl SshConfig {
             agent_forwarding_key,
             identity_agent_key,
             agent_forwarding_socket_key,
-            proxy_command_key
+            proxy_command_key,
+            authentication_key,
+            algorithm_key
         )
     }
 
@@ -302,6 +368,8 @@ pub struct ProxyHopConfig {
     pub agent_forwarding_socket: Option<String>,
     #[serde(default)]
     pub legacy_ssh_compatibility: bool,
+    #[serde(default, skip_serializing_if = "SshAlgorithmPreferences::is_default")]
+    pub ssh_algorithms: SshAlgorithmPreferences,
     #[serde(default = "default_proxy_strict_host_key_checking")]
     pub strict_host_key_checking: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -331,6 +399,13 @@ pub enum AuthMethod {
         passphrase: Option<Zeroizing<String>>,
     },
     KeyboardInteractive,
+    KerberosPreferred {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server_identity: Option<String>,
+        #[serde(default)]
+        delegate_credentials: bool,
+        fallback: Box<AuthMethod>,
+    },
 }
 
 impl fmt::Debug for AuthMethod {
@@ -374,6 +449,16 @@ impl fmt::Debug for AuthMethod {
                 )
                 .finish(),
             Self::KeyboardInteractive => formatter.write_str("KeyboardInteractive"),
+            Self::KerberosPreferred {
+                server_identity,
+                delegate_credentials,
+                fallback,
+            } => formatter
+                .debug_struct("KerberosPreferred")
+                .field("server_identity_configured", &server_identity.is_some())
+                .field("delegate_credentials", delegate_credentials)
+                .field("fallback", fallback)
+                .finish(),
         }
     }
 }
@@ -386,6 +471,7 @@ impl AuthMethod {
             Self::Key { passphrase, .. }
             | Self::ManagedKey { passphrase, .. }
             | Self::Certificate { passphrase, .. } => passphrase.is_some(),
+            Self::KerberosPreferred { fallback, .. } => fallback.has_runtime_secret(),
             Self::Agent | Self::KeyboardInteractive => false,
         }
     }
@@ -454,6 +540,21 @@ impl AuthMethod {
             passphrase,
         }
     }
+
+    pub fn kerberos_preferred(
+        fallback: AuthMethod,
+        server_identity: Option<String>,
+        delegate_credentials: bool,
+    ) -> Self {
+        Self::KerberosPreferred {
+            server_identity,
+            delegate_credentials,
+            fallback: Box::new(match fallback {
+                Self::KerberosPreferred { fallback, .. } => *fallback,
+                fallback => fallback,
+            }),
+        }
+    }
 }
 
 impl Default for SshConfig {
@@ -476,6 +577,7 @@ impl Default for SshConfig {
             identity_agent: None,
             agent_forwarding_socket: None,
             legacy_ssh_compatibility: false,
+            ssh_algorithms: SshAlgorithmPreferences::default(),
             x11_forwarding: None,
             post_connect_command: None,
         }
@@ -513,6 +615,15 @@ mod tests {
     }
 
     #[test]
+    fn algorithm_preferences_separate_physical_connection_pool_identity() {
+        let mut config = SshConfig::password("host", 22, "operator", "pw");
+        let default_key = config.connection_key();
+        config.ssh_algorithms.cipher = vec!["aes256-gcm@openssh.com".to_string()];
+
+        assert_ne!(default_key, config.connection_key());
+    }
+
+    #[test]
     fn x11_policy_does_not_split_physical_connection_pool_identity() {
         let mut config = SshConfig::password("192.168.1.10", 22, "root", "pw");
         let without_x11 = config.connection_key();
@@ -541,6 +652,40 @@ mod tests {
     }
 
     #[test]
+    fn gssapi_policy_separates_pool_identity_without_exposing_server_name() {
+        let server_name = "kerberos.internal.example";
+        let mut config = SshConfig {
+            host: "target".to_string(),
+            username: "operator".to_string(),
+            auth: AuthMethod::kerberos_preferred(
+                AuthMethod::Agent,
+                Some(server_name.to_string()),
+                false,
+            ),
+            ..SshConfig::default()
+        };
+        let non_delegated = config.connection_key();
+        config.auth =
+            AuthMethod::kerberos_preferred(AuthMethod::Agent, Some(server_name.to_string()), true);
+        let delegated = config.connection_key();
+
+        assert_ne!(non_delegated, delegated);
+        assert!(!non_delegated.contains(server_name));
+        assert!(!delegated.contains(server_name));
+    }
+
+    #[test]
+    fn post_connect_command_is_redacted_from_runtime_debug_output() {
+        let mut config = SshConfig::password("target", 22, "operator", "pw");
+        config.post_connect_command = Some("command-with-private-token".to_string());
+
+        let debug = format!("{config:?}");
+
+        assert!(!debug.contains("command-with-private-token"));
+        assert!(debug.contains("post_connect_command_configured: true"));
+    }
+
+    #[test]
     fn connection_key_includes_proxy_chain_order() {
         let mut config = SshConfig::password("target", 22, "app", "pw");
         config.proxy_chain = Some(vec![
@@ -553,6 +698,7 @@ mod tests {
                 identity_agent: None,
                 agent_forwarding_socket: None,
                 legacy_ssh_compatibility: false,
+                ssh_algorithms: SshAlgorithmPreferences::default(),
                 strict_host_key_checking: true,
                 trust_host_key: None,
                 expected_host_key_fingerprint: None,
@@ -566,6 +712,7 @@ mod tests {
                 identity_agent: None,
                 agent_forwarding_socket: None,
                 legacy_ssh_compatibility: true,
+                ssh_algorithms: SshAlgorithmPreferences::default(),
                 strict_host_key_checking: true,
                 trust_host_key: None,
                 expected_host_key_fingerprint: None,
@@ -600,6 +747,7 @@ mod tests {
             identity_agent: None,
             agent_forwarding_socket: None,
             legacy_ssh_compatibility: false,
+            ssh_algorithms: SshAlgorithmPreferences::default(),
             strict_host_key_checking: true,
             trust_host_key: None,
             expected_host_key_fingerprint: None,
@@ -630,11 +778,6 @@ mod tests {
     }
 
     #[test]
-    fn proxy_hop_default_matches_tauri_non_strict_proxy_default() {
-        assert!(!default_proxy_strict_host_key_checking());
-    }
-
-    #[test]
     fn runtime_auth_secret_detection_includes_target_and_proxy_hops() {
         let mut config = SshConfig {
             auth: AuthMethod::Agent,
@@ -655,6 +798,7 @@ mod tests {
             identity_agent: None,
             agent_forwarding_socket: None,
             legacy_ssh_compatibility: false,
+            ssh_algorithms: SshAlgorithmPreferences::default(),
             strict_host_key_checking: false,
             trust_host_key: None,
             expected_host_key_fingerprint: None,

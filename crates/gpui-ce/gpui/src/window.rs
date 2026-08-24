@@ -4,8 +4,8 @@ use crate::Inspector;
 
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AvailableSpace, BackdropFilter, Background, BorderStyle, Bounds, BoxShadow,
-    Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
+    AsyncWindowContext, AtlasTile, AvailableSpace, BackdropFilter, Background, BorderStyle, Bounds,
+    BoxShadow, Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, DynamicTexture,
     DynamicTextureParams, Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, Filter,
     FilterBoundary, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero,
@@ -991,6 +991,26 @@ enum InputModality {
     Keyboard,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct PreparedGlyphBatch {
+    pub(crate) monochrome: Vec<PreparedMonochromeGlyph>,
+    pub(crate) subpixel: Vec<PreparedMonochromeGlyph>,
+    pub(crate) polychrome: Vec<PreparedPolychromeGlyph>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PreparedMonochromeGlyph {
+    pub(crate) bounds: Bounds<ScaledPixels>,
+    pub(crate) color: Hsla,
+    pub(crate) tile: AtlasTile,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PreparedPolychromeGlyph {
+    pub(crate) bounds: Bounds<ScaledPixels>,
+    pub(crate) tile: AtlasTile,
+}
+
 /// Holds the state for a specific window.
 pub struct Window {
     pub(crate) handle: AnyWindowHandle,
@@ -999,6 +1019,8 @@ pub struct Window {
     pub(crate) platform_window: Box<dyn PlatformWindow>,
     display_id: Option<DisplayId>,
     sprite_atlas: Arc<dyn PlatformAtlas>,
+    // A rendered scene may reference atlas tiles only from this resource generation.
+    rendered_resource_generation: u64,
     text_system: Arc<WindowTextSystem>,
     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
     rem_size: Pixels,
@@ -1400,6 +1422,7 @@ impl Window {
 
         let display_id = platform_window.display().map(|display| display.id());
         let sprite_atlas = platform_window.sprite_atlas();
+        let rendered_resource_generation = sprite_atlas.resource_generation();
         let mouse_position = platform_window.mouse_position();
         let modifiers = platform_window.modifiers();
         let capslock = platform_window.capslock();
@@ -1774,6 +1797,7 @@ impl Window {
             platform_window,
             display_id,
             sprite_atlas,
+            rendered_resource_generation,
             text_system,
             text_rendering_mode: cx.text_rendering_mode.clone(),
             rem_size: px(16.),
@@ -2770,6 +2794,12 @@ impl Window {
         // Set up the per-App arena for element allocation during this draw.
         // This ensures that multiple test Apps have isolated arenas.
         let arena_scope = ElementArenaScope::enter(&cx.element_arena);
+        let frame_resource_generation = self.sprite_atlas.resource_generation();
+        if frame_resource_generation != self.rendered_resource_generation {
+            // Atlas reset invalidates every tile stored in the cached scene. Force all views to
+            // repaint even when the platform recovery message arrived after ordinary invalidation.
+            self.refreshing = true;
+        }
 
         self.invalidate_entities();
         cx.entities.clear_accessed();
@@ -2824,6 +2854,9 @@ impl Window {
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.next_frame.clear();
+        // The scene was built against the generation observed before drawing. If recovery races
+        // this draw, `present` rejects it and schedules a clean frame for the newer generation.
+        self.rendered_resource_generation = frame_resource_generation;
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
 
@@ -2887,6 +2920,18 @@ impl Window {
 
     #[profiling::function]
     fn present(&mut self) {
+        let current_resource_generation = self.sprite_atlas.resource_generation();
+        if current_resource_generation != self.rendered_resource_generation {
+            // Never replay tile coordinates after a device recovery. A dirty full redraw is safer
+            // than presenting a scene whose slots may now contain unrelated glyphs or images.
+            log::debug!(
+                "skipping stale renderer frame at resource generation {}; current generation is {}",
+                self.rendered_resource_generation,
+                current_resource_generation
+            );
+            self.refresh();
+            return;
+        }
         self.platform_window.draw(&self.rendered_frame.scene);
         #[cfg(feature = "input-latency-histogram")]
         self.input_latency_tracker.record_frame_presented();
@@ -4098,6 +4143,142 @@ impl Window {
         });
     }
 
+    #[inline]
+    pub(crate) fn glyph_dilation_for_color(&self, color: Hsla) -> u8 {
+        self.text_system().glyph_dilation_for_color(color)
+    }
+
+    /// Resolve a monochrome glyph to an atlas tile and cache its bounds relative to the line.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_glyph_for_batch(
+        &mut self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        color: Hsla,
+        subpixel_rendering: bool,
+        dilation: u8,
+        batch_origin: Point<ScaledPixels>,
+        batch: &mut PreparedGlyphBatch,
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let glyph_origin = origin.scale(scale_factor);
+        let quantized_origin = Point::new(
+            round_half_toward_zero(glyph_origin.x.0 * SUBPIXEL_VARIANTS_X as f32)
+                / SUBPIXEL_VARIANTS_X as f32,
+            round_half_toward_zero(glyph_origin.y.0 * SUBPIXEL_VARIANTS_Y as f32)
+                / SUBPIXEL_VARIANTS_Y as f32,
+        );
+        let subpixel_variant = Point::new(
+            (quantized_origin.x.fract() * SUBPIXEL_VARIANTS_X as f32) as u8,
+            (quantized_origin.y.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
+        );
+        let integer_origin = quantized_origin.map(|coordinate| ScaledPixels(coordinate.trunc()));
+        let params = RenderGlyphParams {
+            font_id,
+            glyph_id,
+            font_size,
+            subpixel_variant,
+            scale_factor,
+            is_emoji: false,
+            subpixel_rendering,
+            dilation,
+        };
+
+        let raster_bounds = self.text_system().raster_bounds(&params)?;
+        if raster_bounds.is_zero() {
+            return Ok(());
+        }
+        let tile = self
+            .sprite_atlas
+            .get_or_insert_with(&params.clone().into(), &mut || {
+                let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
+                Ok(Some((size, Cow::Owned(bytes))))
+            })?
+            .expect("glyph rasterization returns an atlas tile");
+        let bounds = Bounds {
+            origin: integer_origin + raster_bounds.origin.map(Into::into),
+            size: tile.bounds.size.map(Into::into),
+        } - batch_origin;
+        let glyph = PreparedMonochromeGlyph {
+            bounds,
+            color,
+            tile,
+        };
+        if subpixel_rendering {
+            batch.subpixel.push(glyph);
+        } else {
+            batch.monochrome.push(glyph);
+        }
+        Ok(())
+    }
+
+    /// Resolve an emoji glyph to an atlas tile and cache its bounds relative to the line.
+    pub(crate) fn prepare_emoji_for_batch(
+        &mut self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        batch_origin: Point<ScaledPixels>,
+        batch: &mut PreparedGlyphBatch,
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let glyph_origin = origin.scale(scale_factor);
+        let integer_origin =
+            glyph_origin.map(|coordinate| ScaledPixels(round_half_toward_zero(coordinate.0)));
+        let params = RenderGlyphParams {
+            font_id,
+            glyph_id,
+            font_size,
+            subpixel_variant: Default::default(),
+            scale_factor,
+            is_emoji: true,
+            subpixel_rendering: false,
+            dilation: 0,
+        };
+
+        let raster_bounds = self.text_system().raster_bounds(&params)?;
+        if raster_bounds.is_zero() {
+            return Ok(());
+        }
+        let tile = self
+            .sprite_atlas
+            .get_or_insert_with(&params.clone().into(), &mut || {
+                let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
+                Ok(Some((size, Cow::Owned(bytes))))
+            })?
+            .expect("emoji rasterization returns an atlas tile");
+        let bounds = Bounds {
+            origin: integer_origin + raster_bounds.origin.map(Into::into),
+            size: tile.bounds.size.map(Into::into),
+        } - batch_origin;
+        batch
+            .polychrome
+            .push(PreparedPolychromeGlyph { bounds, tile });
+        Ok(())
+    }
+
+    /// Append a prepared line to the scene without repeating glyph or atlas cache lookups.
+    pub(crate) fn paint_prepared_glyph_batch(
+        &mut self,
+        origin: Point<ScaledPixels>,
+        batch: Arc<PreparedGlyphBatch>,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        let content_mask = self.snapped_content_mask();
+        let opacity = self.element_opacity();
+        self.next_frame
+            .scene
+            .insert_prepared_glyph_batch(batch, origin, content_mask, opacity);
+    }
+
     /// Paints a monochrome (non-emoji) glyph into the scene for the next frame at the current z-index.
     ///
     /// The y component of the origin is the baseline of the glyph.
@@ -4184,7 +4365,7 @@ impl Window {
         Ok(())
     }
 
-    fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
+    pub(crate) fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
         if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque {
             return false;
         }

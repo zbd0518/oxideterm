@@ -78,6 +78,12 @@ pub enum PublicConnectionAuth {
     },
     KeyboardInteractive,
     Agent,
+    KerberosPreferred {
+        server_identity: Option<String>,
+        #[serde(default)]
+        delegate_credentials: bool,
+        fallback: Box<PublicConnectionAuth>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]
@@ -109,6 +115,20 @@ pub enum PublicTerminalDeleteSequence {
     ControlH,
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicTerminalSessionLogPolicy {
+    #[default]
+    /// Use the application-wide automatic logging choice.
+    Inherit,
+    /// Start a log whenever this connection opens.
+    Automatic,
+    /// Allow logging from the terminal menu without starting it automatically.
+    Manual,
+    /// Prevent this connection from creating a session log.
+    Disabled,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PublicTerminalOptions {
@@ -118,6 +138,8 @@ pub struct PublicTerminalOptions {
     pub backspace_sequence: Option<PublicTerminalBackspaceSequence>,
     #[serde(default)]
     pub delete_sequence: Option<PublicTerminalDeleteSequence>,
+    #[serde(default)]
+    pub session_log_policy: PublicTerminalSessionLogPolicy,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]
@@ -189,6 +211,8 @@ pub struct PublicSshProfile {
     pub name: String,
     #[serde(default)]
     pub group: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
     pub host: String,
     #[serde(default = "default_ssh_port")]
     pub port: u16,
@@ -248,6 +272,8 @@ pub struct PublicSerialProfile {
     pub name: String,
     #[serde(default)]
     pub group: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
     pub port_path: String,
     #[serde(default)]
     pub baud_rate: Option<u32>,
@@ -259,6 +285,8 @@ pub struct PublicSerialProfile {
     pub parity: Option<PublicSerialParity>,
     #[serde(default)]
     pub flow_control: Option<PublicSerialFlowControl>,
+    #[serde(default)]
+    pub terminal: PublicTerminalOptions,
     #[serde(default)]
     pub connect_on_open: bool,
     #[serde(default)]
@@ -275,6 +303,8 @@ pub struct PublicTelnetProfile {
     pub name: String,
     #[serde(default)]
     pub group: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
     pub host: String,
     #[serde(default = "default_telnet_port")]
     pub port: u16,
@@ -328,11 +358,15 @@ pub struct PublicMoshProfile {
     pub name: String,
     #[serde(default)]
     pub group: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
     pub host: String,
     #[serde(default = "default_ssh_port")]
     pub ssh_port: u16,
     pub username: String,
     pub auth: PublicConnectionAuth,
+    #[serde(default)]
+    pub proxy_chain: Vec<PublicProxyHopProfile>,
     #[serde(default = "default_mosh_server")]
     pub server_executable: String,
     #[serde(default)]
@@ -345,6 +379,8 @@ pub struct PublicMoshProfile {
     pub prediction: PublicMoshPredictionMode,
     #[serde(default)]
     pub locale: Option<String>,
+    #[serde(default)]
+    pub terminal: PublicTerminalOptions,
     #[serde(default)]
     pub identity_agent: Option<String>,
     #[serde(default)]
@@ -407,6 +443,9 @@ pub struct PublicRemoteDesktopOptions {
     pub audio_capture: bool,
     #[serde(default)]
     pub use_all_monitors: bool,
+    /// Disables the RDP Graphics Pipeline for hosts affected by EGFX rendering corruption.
+    #[serde(default)]
+    pub disable_rdp_graphics_pipeline: bool,
     #[serde(default)]
     pub vnc_security_policy: PublicVncSecurityPolicy,
     #[serde(default)]
@@ -426,6 +465,7 @@ impl Default for PublicRemoteDesktopOptions {
             audio_playback: true,
             audio_capture: false,
             use_all_monitors: false,
+            disable_rdp_graphics_pipeline: false,
             vnc_security_policy: PublicVncSecurityPolicy::default(),
             vnc_session_mode: PublicVncSessionMode::default(),
             vnc_image_quality: PublicVncImageQuality::default(),
@@ -440,6 +480,8 @@ pub struct PublicRemoteDesktopProfile {
     pub name: String,
     #[serde(default)]
     pub group: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
     pub host: String,
     pub port: u16,
     #[serde(default)]

@@ -153,6 +153,12 @@ impl ConnectionStore {
         build_mosh_profiles_sync_snapshot(&self.data)
     }
 
+    pub fn export_standalone_sftp_profiles_snapshot(
+        &self,
+    ) -> Result<StandaloneSftpProfilesSyncSnapshot> {
+        build_standalone_sftp_profiles_sync_snapshot(&self.data)
+    }
+
     pub fn export_remote_desktop_profiles_snapshot(
         &self,
     ) -> Result<RemoteDesktopProfilesSyncSnapshot> {
@@ -557,14 +563,51 @@ impl ConnectionStore {
                 .find(|existing| existing.id == profile.id)
             {
                 if profile.updated_at >= existing.updated_at {
-                    if mosh_auth_target_matches(&profile.auth, &existing.auth) {
-                        profile.auth = existing.auth.clone();
-                    }
+                    preserve_local_auth_secret(&mut profile.auth, &existing.auth);
+                    preserve_proxy_chain_local_secrets(
+                        &mut profile.proxy_chain,
+                        &existing.proxy_chain,
+                    );
                     *existing = profile;
                     applied += 1;
                 }
             } else {
                 self.data.mosh_profiles.push(profile);
+                applied += 1;
+            }
+        }
+        if applied > 0 {
+            self.normalize();
+            self.save()?;
+        }
+        Ok(applied)
+    }
+
+    pub fn apply_standalone_sftp_profiles_snapshot(
+        &mut self,
+        snapshot: StandaloneSftpProfilesSyncSnapshot,
+    ) -> Result<usize> {
+        // Treat every incoming snapshot as portable metadata, even when it came from a .oxide file.
+        let mut applied = 0usize;
+        for mut profile in snapshot.records {
+            if profile.transfer_mode == StandaloneSftpTransferMode::LocalRemote {
+                profile.secondary_endpoint = None;
+            }
+            make_standalone_sftp_profile_portable(&mut profile);
+            profile.validate()?;
+            if let Some(existing) = self
+                .data
+                .standalone_sftp_profiles
+                .iter_mut()
+                .find(|existing| existing.id == profile.id)
+            {
+                if profile.updated_at >= existing.updated_at {
+                    preserve_standalone_sftp_local_secrets(&mut profile, existing);
+                    *existing = profile;
+                    applied += 1;
+                }
+            } else {
+                self.data.standalone_sftp_profiles.push(profile);
                 applied += 1;
             }
         }
@@ -584,20 +627,33 @@ fn build_saved_connection_from_sync_payload(
     existing: Option<&SavedConnection>,
     preserve_auth: bool,
 ) -> Result<SavedConnection> {
-    let auth = if preserve_auth {
-        existing
-            .map(|connection| connection.auth.clone())
-            .unwrap_or_else(|| saved_auth_from_connection_info(payload))
-    } else {
-        saved_auth_from_connection_info(payload)
-    };
+    let mut auth = saved_auth_from_connection_info(payload);
+    if preserve_auth && let Some(existing) = existing {
+        preserve_local_auth_secret(&mut auth, &existing.auth);
+    }
     let proxy_chain = build_synced_proxy_chain(&payload.proxy_chain, existing, preserve_auth);
+    for hop in &proxy_chain {
+        hop.ssh_algorithms.validate()?;
+    }
+    let options = synced_options
+        .cloned()
+        .unwrap_or_else(|| ConnectionOptions {
+            // Older snapshots exposed only these option fields through
+            // ConnectionInfo, so retain that wire-compatible fallback.
+            agent_forwarding: payload.agent_forwarding,
+            legacy_ssh_compatibility: payload.legacy_ssh_compatibility,
+            ssh_algorithms: payload.ssh_algorithms.clone(),
+            post_connect_command: payload.post_connect_command.clone(),
+            ..Default::default()
+        });
+    options.ssh_algorithms.validate()?;
 
     Ok(SavedConnection {
         id: payload.id.clone(),
         version: CONFIG_VERSION,
         name: non_empty(payload.name.trim(), "Connection name")?.to_string(),
         group: normalize_optional_group_name(payload.group.as_deref())?,
+        notes: payload.notes.clone(),
         host: non_empty(payload.host.trim(), "Host")?.to_string(),
         port: payload.port.max(1),
         username: non_empty(payload.username.trim(), "Username")?.to_string(),
@@ -608,16 +664,9 @@ fn build_saved_connection_from_sync_payload(
             existing,
             preserve_auth,
         ),
-        options: synced_options
-            .cloned()
-            .unwrap_or_else(|| ConnectionOptions {
-                // Older snapshots exposed only these three option fields through
-                // ConnectionInfo, so retain that wire-compatible fallback.
-                agent_forwarding: payload.agent_forwarding,
-                legacy_ssh_compatibility: payload.legacy_ssh_compatibility,
-                post_connect_command: payload.post_connect_command.clone(),
-                ..Default::default()
-            }),
+        // ProxyCommand text is device-local protected data and never enters cloud snapshots.
+        proxy_command: existing.and_then(|connection| connection.proxy_command.clone()),
+        options,
         created_at: parse_connection_sync_timestamp(&payload.created_at, "connection created_at")?,
         last_used_at: payload
             .last_used_at
@@ -718,6 +767,9 @@ fn build_mosh_profiles_sync_snapshot(
     let mut records = data.mosh_profiles.clone();
     for profile in &mut records {
         profile.auth = portable_mosh_auth(&profile.auth);
+        for hop in &mut profile.proxy_chain {
+            hop.auth = portable_mosh_auth(&hop.auth);
+        }
     }
     records.sort_by(|left, right| left.id.cmp(&right.id));
     let revision = sha256_hex(
@@ -731,6 +783,58 @@ fn build_mosh_profiles_sync_snapshot(
         exported_at: Utc::now().to_rfc3339(),
         records,
     })
+}
+
+fn build_standalone_sftp_profiles_sync_snapshot(
+    data: &ConnectionStoreData,
+) -> Result<StandaloneSftpProfilesSyncSnapshot> {
+    let mut records = data.standalone_sftp_profiles.clone();
+    for profile in &mut records {
+        make_standalone_sftp_profile_portable(profile);
+    }
+    records.sort_by(|left, right| left.id.cmp(&right.id));
+    let revision = sha256_hex(
+        &records
+            .iter()
+            .map(|profile| (&profile.id, profile.updated_at.to_rfc3339()))
+            .collect::<Vec<_>>(),
+    )?;
+    Ok(StandaloneSftpProfilesSyncSnapshot {
+        revision,
+        exported_at: Utc::now().to_rfc3339(),
+        records,
+    })
+}
+
+pub(crate) fn make_standalone_sftp_profile_portable(profile: &mut StandaloneSftpProfile) {
+    profile.auth = portable_mosh_auth(&profile.auth);
+    for hop in &mut profile.proxy_chain {
+        hop.auth = portable_mosh_auth(&hop.auth);
+    }
+    profile.upstream_proxy = portable_upstream_proxy(&profile.upstream_proxy);
+    if profile.proxy_command.is_some() {
+        profile.proxy_command = Some(SavedProxyCommand {
+            keychain_id: None,
+            plaintext_command: None,
+        });
+    }
+    if let Some(endpoint) = &mut profile.secondary_endpoint {
+        make_standalone_sftp_endpoint_portable(endpoint);
+    }
+}
+
+fn make_standalone_sftp_endpoint_portable(endpoint: &mut StandaloneSftpEndpoint) {
+    endpoint.auth = portable_mosh_auth(&endpoint.auth);
+    for hop in &mut endpoint.proxy_chain {
+        hop.auth = portable_mosh_auth(&hop.auth);
+    }
+    endpoint.upstream_proxy = portable_upstream_proxy(&endpoint.upstream_proxy);
+    if endpoint.proxy_command.is_some() {
+        endpoint.proxy_command = Some(SavedProxyCommand {
+            keychain_id: None,
+            plaintext_command: None,
+        });
+    }
 }
 
 fn portable_mosh_auth(auth: &SavedAuth) -> SavedAuth {
@@ -761,10 +865,21 @@ fn portable_mosh_auth(auth: &SavedAuth) -> SavedAuth {
         },
         SavedAuth::KeyboardInteractive => SavedAuth::KeyboardInteractive,
         SavedAuth::Agent => SavedAuth::Agent,
+        SavedAuth::KerberosPreferred {
+            server_identity,
+            delegate_credentials,
+            fallback,
+        } => SavedAuth::with_kerberos_preferred(
+            portable_mosh_auth(fallback),
+            server_identity.clone(),
+            *delegate_credentials,
+        ),
     }
 }
 
-fn mosh_auth_target_matches(left: &SavedAuth, right: &SavedAuth) -> bool {
+fn conventional_auth_target_matches(left: &SavedAuth, right: &SavedAuth) -> bool {
+    let left = left.conventional_fallback();
+    let right = right.conventional_fallback();
     match (left, right) {
         (SavedAuth::Password { .. }, SavedAuth::Password { .. })
         | (SavedAuth::KeyboardInteractive, SavedAuth::KeyboardInteractive)
@@ -790,6 +905,193 @@ fn mosh_auth_target_matches(left: &SavedAuth, right: &SavedAuth) -> bool {
             },
         ) => left_key == right_key && left_cert == right_cert,
         _ => false,
+    }
+}
+
+fn conventional_fallback_mut(auth: &mut SavedAuth) -> &mut SavedAuth {
+    match auth {
+        SavedAuth::KerberosPreferred { fallback, .. } => conventional_fallback_mut(fallback),
+        auth => auth,
+    }
+}
+
+fn preserve_local_auth_secret(incoming: &mut SavedAuth, existing: &SavedAuth) {
+    if !conventional_auth_target_matches(incoming, existing) {
+        return;
+    }
+    let incoming = conventional_fallback_mut(incoming);
+    let existing = existing.conventional_fallback();
+    // Only device-local protected references and zeroizing legacy owners cross this boundary.
+    match (incoming, existing) {
+        (
+            SavedAuth::Password {
+                keychain_id: incoming_keychain_id,
+                plaintext_password: incoming_plaintext,
+            },
+            SavedAuth::Password {
+                keychain_id: existing_keychain_id,
+                plaintext_password: existing_plaintext,
+            },
+        ) => {
+            *incoming_keychain_id = existing_keychain_id.clone();
+            *incoming_plaintext = existing_plaintext.clone();
+        }
+        (
+            SavedAuth::Key {
+                has_passphrase: incoming_has_passphrase,
+                passphrase_keychain_id: incoming_keychain_id,
+                plaintext_passphrase: incoming_plaintext,
+                ..
+            },
+            SavedAuth::Key {
+                has_passphrase: existing_has_passphrase,
+                passphrase_keychain_id: existing_keychain_id,
+                plaintext_passphrase: existing_plaintext,
+                ..
+            },
+        )
+        | (
+            SavedAuth::Certificate {
+                has_passphrase: incoming_has_passphrase,
+                passphrase_keychain_id: incoming_keychain_id,
+                plaintext_passphrase: incoming_plaintext,
+                ..
+            },
+            SavedAuth::Certificate {
+                has_passphrase: existing_has_passphrase,
+                passphrase_keychain_id: existing_keychain_id,
+                plaintext_passphrase: existing_plaintext,
+                ..
+            },
+        ) => {
+            *incoming_has_passphrase = *existing_has_passphrase;
+            *incoming_keychain_id = existing_keychain_id.clone();
+            *incoming_plaintext = existing_plaintext.clone();
+        }
+        (
+            SavedAuth::ManagedKey {
+                passphrase_keychain_id: incoming_keychain_id,
+                plaintext_passphrase: incoming_plaintext,
+                ..
+            },
+            SavedAuth::ManagedKey {
+                passphrase_keychain_id: existing_keychain_id,
+                plaintext_passphrase: existing_plaintext,
+                ..
+            },
+        ) => {
+            *incoming_keychain_id = existing_keychain_id.clone();
+            *incoming_plaintext = existing_plaintext.clone();
+        }
+        _ => {}
+    }
+}
+
+fn preserve_proxy_chain_local_secrets(
+    incoming_proxy_chain: &mut [SavedProxyHop],
+    existing_proxy_chain: &[SavedProxyHop],
+) {
+    for hop in incoming_proxy_chain {
+        if let Some(existing_hop) = existing_proxy_chain.iter().find(|candidate| {
+            candidate.host == hop.host
+                && candidate.port == hop.port
+                && candidate.username == hop.username
+                && conventional_auth_target_matches(&candidate.auth, &hop.auth)
+        }) {
+            preserve_local_auth_secret(&mut hop.auth, &existing_hop.auth);
+        }
+    }
+}
+
+fn preserve_standalone_sftp_local_secrets(
+    incoming: &mut StandaloneSftpProfile,
+    existing: &StandaloneSftpProfile,
+) {
+    preserve_standalone_sftp_endpoint_local_secrets(
+        &mut incoming.auth,
+        &mut incoming.proxy_chain,
+        &mut incoming.upstream_proxy,
+        &mut incoming.proxy_command,
+        &existing.auth,
+        &existing.proxy_chain,
+        &existing.upstream_proxy,
+        existing.proxy_command.as_ref(),
+    );
+    if let (Some(incoming_endpoint), Some(existing_endpoint)) = (
+        &mut incoming.secondary_endpoint,
+        &existing.secondary_endpoint,
+    ) {
+        preserve_standalone_sftp_endpoint_local_secrets(
+            &mut incoming_endpoint.auth,
+            &mut incoming_endpoint.proxy_chain,
+            &mut incoming_endpoint.upstream_proxy,
+            &mut incoming_endpoint.proxy_command,
+            &existing_endpoint.auth,
+            &existing_endpoint.proxy_chain,
+            &existing_endpoint.upstream_proxy,
+            existing_endpoint.proxy_command.as_ref(),
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn preserve_standalone_sftp_endpoint_local_secrets(
+    incoming_auth: &mut SavedAuth,
+    incoming_proxy_chain: &mut [SavedProxyHop],
+    incoming_upstream_proxy: &mut SavedUpstreamProxyPolicy,
+    incoming_proxy_command: &mut Option<SavedProxyCommand>,
+    existing_auth: &SavedAuth,
+    existing_proxy_chain: &[SavedProxyHop],
+    existing_upstream_proxy: &SavedUpstreamProxyPolicy,
+    existing_proxy_command: Option<&SavedProxyCommand>,
+) {
+    preserve_local_auth_secret(incoming_auth, existing_auth);
+    for hop in incoming_proxy_chain {
+        if let Some(existing_hop) = existing_proxy_chain.iter().find(|candidate| {
+            candidate.host == hop.host
+                && candidate.port == hop.port
+                && candidate.username == hop.username
+                && conventional_auth_target_matches(&candidate.auth, &hop.auth)
+        }) {
+            preserve_local_auth_secret(&mut hop.auth, &existing_hop.auth);
+        }
+    }
+    preserve_standalone_sftp_upstream_proxy_secret(
+        incoming_upstream_proxy,
+        existing_upstream_proxy,
+    );
+    if incoming_proxy_command.is_some() && existing_proxy_command.is_some() {
+        *incoming_proxy_command = existing_proxy_command.cloned();
+    }
+}
+
+fn preserve_standalone_sftp_upstream_proxy_secret(
+    incoming: &mut SavedUpstreamProxyPolicy,
+    existing: &SavedUpstreamProxyPolicy,
+) {
+    let (
+        SavedUpstreamProxyPolicy::Custom {
+            proxy: incoming_proxy,
+        },
+        SavedUpstreamProxyPolicy::Custom {
+            proxy: existing_proxy,
+        },
+    ) = (incoming, existing)
+    else {
+        return;
+    };
+    if incoming_proxy.protocol == existing_proxy.protocol
+        && incoming_proxy.host == existing_proxy.host
+        && incoming_proxy.port == existing_proxy.port
+        && matches!(
+            (&incoming_proxy.auth, &existing_proxy.auth),
+            (
+                SavedUpstreamProxyAuth::Password { username: left, .. },
+                SavedUpstreamProxyAuth::Password { username: right, .. }
+            ) if left == right
+        )
+    {
+        incoming_proxy.auth = existing_proxy.auth.clone();
     }
 }
 
@@ -864,7 +1166,7 @@ fn parse_connection_sync_timestamp(value: &str, field_name: &str) -> Result<Date
 }
 
 fn saved_auth_from_connection_info(payload: &ConnectionInfo) -> SavedAuth {
-    match payload.auth_type {
+    let fallback = match payload.auth_type {
         AuthType::Password => SavedAuth::Password {
             keychain_id: None,
             plaintext_password: None,
@@ -889,11 +1191,20 @@ fn saved_auth_from_connection_info(payload: &ConnectionInfo) -> SavedAuth {
         },
         AuthType::KeyboardInteractive => SavedAuth::KeyboardInteractive,
         AuthType::Agent => SavedAuth::Agent,
+    };
+    if payload.gssapi_authentication {
+        SavedAuth::with_kerberos_preferred(
+            fallback,
+            payload.gssapi_server_identity.clone(),
+            payload.gssapi_delegate_credentials,
+        )
+    } else {
+        fallback
     }
 }
 
 fn saved_auth_from_proxy_hop_info(hop: &ProxyHopInfo) -> SavedAuth {
-    match hop.auth_type {
+    let fallback = match hop.auth_type {
         AuthType::Password => SavedAuth::Password {
             keychain_id: None,
             plaintext_password: None,
@@ -918,6 +1229,15 @@ fn saved_auth_from_proxy_hop_info(hop: &ProxyHopInfo) -> SavedAuth {
         },
         AuthType::KeyboardInteractive => SavedAuth::KeyboardInteractive,
         AuthType::Agent => SavedAuth::Agent,
+    };
+    if hop.gssapi_authentication {
+        SavedAuth::with_kerberos_preferred(
+            fallback,
+            hop.gssapi_server_identity.clone(),
+            hop.gssapi_delegate_credentials,
+        )
+    } else {
+        fallback
     }
 }
 
@@ -929,8 +1249,9 @@ fn build_synced_proxy_chain(
     proxy_chain
         .iter()
         .map(|hop| {
-            let preserved_auth = preserve_auth.then(|| {
-                existing.and_then(|connection| {
+            let mut auth = saved_auth_from_proxy_hop_info(hop);
+            if preserve_auth
+                && let Some(existing_auth) = existing.and_then(|connection| {
                     connection
                         .proxy_chain
                         .iter()
@@ -939,20 +1260,21 @@ fn build_synced_proxy_chain(
                                 && candidate.port == hop.port
                                 && candidate.username == hop.username
                         })
-                        .map(|candidate| candidate.auth.clone())
+                        .map(|candidate| &candidate.auth)
                 })
-            });
+            {
+                preserve_local_auth_secret(&mut auth, existing_auth);
+            }
             SavedProxyHop {
                 host: hop.host.clone(),
                 port: hop.port,
                 username: hop.username.clone(),
-                auth: preserved_auth
-                    .flatten()
-                    .unwrap_or_else(|| saved_auth_from_proxy_hop_info(hop)),
+                auth,
                 agent_forwarding: hop.agent_forwarding,
                 identity_agent: hop.identity_agent.clone(),
                 agent_forwarding_socket: hop.agent_forwarding_socket.clone(),
                 legacy_ssh_compatibility: hop.legacy_ssh_compatibility,
+                ssh_algorithms: hop.ssh_algorithms.clone(),
             }
         })
         .collect()
@@ -1063,8 +1385,23 @@ mod mosh_tests {
 
     #[test]
     fn mosh_snapshot_strips_device_local_credential_references() {
+        let mut profile = password_profile(Some("local-keychain-entry"));
+        profile.proxy_chain.push(SavedProxyHop {
+            host: "jump.example.test".to_string(),
+            port: 22,
+            username: "jump".to_string(),
+            auth: SavedAuth::Password {
+                keychain_id: Some("local-proxy-keychain-entry".to_string()),
+                plaintext_password: None,
+            },
+            agent_forwarding: false,
+            identity_agent: None,
+            agent_forwarding_socket: None,
+            legacy_ssh_compatibility: false,
+            ssh_algorithms: SshAlgorithmPreferences::default(),
+        });
         let data = ConnectionStoreData {
-            mosh_profiles: vec![password_profile(Some("local-keychain-entry"))],
+            mosh_profiles: vec![profile],
             ..ConnectionStoreData::default()
         };
 
@@ -1080,6 +1417,7 @@ mod mosh_tests {
         ));
         let json = serde_json::to_string(&snapshot).expect("snapshot must serialize");
         assert!(!json.contains("local-keychain-entry"));
+        assert!(!json.contains("local-proxy-keychain-entry"));
     }
 
     #[test]
@@ -1089,11 +1427,36 @@ mod mosh_tests {
             uuid::Uuid::new_v4()
         ));
         let mut store = ConnectionStore::load(&path).expect("store must load");
-        let local = password_profile(Some("local-keychain-entry"));
+        let mut local = password_profile(Some("local-keychain-entry"));
+        local.proxy_chain.push(SavedProxyHop {
+            host: "jump.example.test".to_string(),
+            port: 22,
+            username: "jump".to_string(),
+            auth: SavedAuth::Password {
+                keychain_id: Some("local-proxy-keychain-entry".to_string()),
+                plaintext_password: None,
+            },
+            agent_forwarding: false,
+            identity_agent: None,
+            agent_forwarding_socket: None,
+            legacy_ssh_compatibility: false,
+            ssh_algorithms: SshAlgorithmPreferences::default(),
+        });
         let mut incoming = local.clone();
         incoming.name = "Renamed mobile shell".to_string();
         incoming.updated_at = local.updated_at + chrono::Duration::seconds(1);
-        incoming.auth = portable_mosh_auth(&incoming.auth);
+        incoming.auth = SavedAuth::with_kerberos_preferred(
+            portable_mosh_auth(&incoming.auth),
+            Some("host/mosh.example.test".to_string()),
+            true,
+        );
+        for hop in &mut incoming.proxy_chain {
+            hop.auth = SavedAuth::with_kerberos_preferred(
+                portable_mosh_auth(&hop.auth),
+                Some("host/jump.example.test".to_string()),
+                false,
+            );
+        }
         store.data.mosh_profiles.push(local);
 
         let applied = store
@@ -1109,10 +1472,33 @@ mod mosh_tests {
         assert_eq!(profile.name, "Renamed mobile shell");
         assert!(matches!(
             &profile.auth,
-            SavedAuth::Password {
-                keychain_id: Some(keychain_id),
-                plaintext_password: None
-            } if keychain_id == "local-keychain-entry"
+            SavedAuth::KerberosPreferred {
+                server_identity: Some(server_identity),
+                delegate_credentials: true,
+                fallback,
+            } if server_identity == "host/mosh.example.test"
+                && matches!(
+                    fallback.as_ref(),
+                    SavedAuth::Password {
+                        keychain_id: Some(keychain_id),
+                        plaintext_password: None,
+                    } if keychain_id == "local-keychain-entry"
+                )
+        ));
+        assert!(matches!(
+            &profile.proxy_chain[0].auth,
+            SavedAuth::KerberosPreferred {
+                server_identity: Some(server_identity),
+                delegate_credentials: false,
+                fallback,
+            } if server_identity == "host/jump.example.test"
+                && matches!(
+                    fallback.as_ref(),
+                    SavedAuth::Password {
+                        keychain_id: Some(keychain_id),
+                        plaintext_password: None,
+                    } if keychain_id == "local-proxy-keychain-entry"
+                )
         ));
         let _ = std::fs::remove_file(path);
     }
@@ -1122,10 +1508,12 @@ mod mosh_tests {
         let secret = "mosh-bootstrap-password";
         let runtime = SavedMoshProfileRuntimeSecrets {
             auth: Some(SecretString::from(secret)),
+            proxy_chain: vec![Some(SecretString::from("proxy-secret"))],
         };
 
         let debug = format!("{runtime:?}");
         assert!(!debug.contains(secret));
+        assert!(!debug.contains("proxy-secret"));
         assert!(debug.contains("redacted secret"));
     }
 }

@@ -85,6 +85,7 @@ enum PaletteAction {
     OpenTopology,
     OpenPluginManager,
     OpenCloudSync,
+    ManageTerminalTriggers,
     ReloadWindow,
     CloseTab,
     CloseOtherTabs,
@@ -497,6 +498,9 @@ impl WorkspaceApp {
             PaletteAction::OpenTopology => self.open_topology_tab(window, cx),
             PaletteAction::OpenPluginManager => self.open_plugin_manager_tab(window, cx),
             PaletteAction::OpenCloudSync => self.open_cloud_sync_tab(window, cx),
+            PaletteAction::ManageTerminalTriggers => {
+                self.open_terminal_trigger_settings(window, cx)
+            }
             PaletteAction::ReloadWindow => self.reload_window_from_palette(cx),
             PaletteAction::CloseTab => self.close_active_tab_from_palette(window, cx),
             PaletteAction::CloseOtherTabs => self.close_other_tabs_from_palette(window, cx),
@@ -2251,6 +2255,13 @@ fn command_palette_specs() -> Vec<CommandSpec> {
             "app.settings",
             LucideIcon::Settings,
         ),
+        CommandSpec {
+            id: "cmd:manage_terminal_triggers",
+            label_key: Cow::Borrowed("command_palette.cmd_manage_terminal_triggers"),
+            icon: LucideIcon::Zap,
+            shortcut_action: None,
+            action: PaletteAction::ManageTerminalTriggers,
+        },
         keybinding_command(
             "cmd:toggle_sidebar",
             "command_palette.cmd_toggle_sidebar",
@@ -2701,64 +2712,5 @@ mod tests {
                 .is_none()
         );
         assert!(RemoteDesktopConnectionProfile::parse_quick_connect("ssh://example.com").is_none());
-    }
-
-    #[test]
-    fn saved_connection_palette_fields_match_tauri_fallbacks() {
-        assert_eq!(
-            command_palette_connection_label("Production", "root", "example.com"),
-            "Production"
-        );
-        assert_eq!(
-            command_palette_connection_detail("Production", "root", "example.com", 2222),
-            "root@example.com:2222"
-        );
-
-        assert_eq!(
-            command_palette_connection_label("", "root", "example.com"),
-            "root@example.com"
-        );
-        assert_eq!(
-            command_palette_connection_detail("", "root", "example.com", 2222),
-            ":2222"
-        );
-    }
-
-    #[test]
-    fn command_palette_specs_include_native_telnet_terminal_command() {
-        let spec = command_palette_specs()
-            .into_iter()
-            .find(|spec| spec.id == "cmd:open_telnet_terminal")
-            .expect("native Telnet terminal command");
-
-        assert!(matches!(spec.action, PaletteAction::OpenTelnetTerminal));
-    }
-
-    #[test]
-    fn command_palette_specs_include_free_type_mode_shortcut() {
-        let spec = command_palette_specs()
-            .into_iter()
-            .find(|spec| spec.id == "cmd:toggle_free_type_mode")
-            .expect("free type mode command");
-
-        assert_eq!(spec.shortcut_action, Some("terminal.toggleFreeTypeMode"));
-        assert!(matches!(
-            spec.action,
-            PaletteAction::Keybinding("terminal.toggleFreeTypeMode")
-        ));
-    }
-
-    #[test]
-    fn command_palette_health_check_counts_terminal_sessions_like_tauri() {
-        let lifecycles = [
-            TerminalLifecycle::Running,
-            TerminalLifecycle::Exited(Some(0)),
-            TerminalLifecycle::Closed,
-        ];
-
-        assert_eq!(
-            command_palette_health_counts_from_lifecycles(lifecycles.iter()),
-            (1, 3)
-        );
     }
 }

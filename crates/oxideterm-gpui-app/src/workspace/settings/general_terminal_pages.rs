@@ -355,7 +355,18 @@ impl WorkspaceApp {
                 ])
             }
             3 => self.launch_at_login_settings_card(cx),
-            4 if cfg!(any(target_os = "windows", target_os = "macos")) => {
+            4 => self.settings_card(
+                "settings_view.general.connection_uri_integration",
+                "settings_view.general.connection_uri_integration_hint",
+                vec![self.general_checkbox_row(
+                    "settings_view.general.external_connection_uris",
+                    "settings_view.general.external_connection_uris_hint",
+                    settings.general.external_connection_uris_enabled,
+                    |settings, enabled| settings.general.external_connection_uris_enabled = enabled,
+                    cx,
+                )],
+            ),
+            5 if cfg!(any(target_os = "windows", target_os = "macos")) => {
                 let (label_key, hint_key) = close_to_background_label_keys();
                 self.settings_card(
                     "settings_view.general.window_behavior",
@@ -369,10 +380,10 @@ impl WorkspaceApp {
                     )],
                 )
             }
-            5 if cfg!(any(target_os = "windows", target_os = "macos")) => {
+            6 if cfg!(any(target_os = "windows", target_os = "macos")) => {
                 self.render_app_lock_settings_card(cx)
             }
-            4 => self.render_app_lock_settings_card(cx),
+            5 => self.render_app_lock_settings_card(cx),
             _ => div().into_any_element(),
         }
     }
@@ -1111,6 +1122,7 @@ impl WorkspaceApp {
                 ],
             ),
             (TerminalSettingsPage::Awareness, 1) => self.remote_shell_integration_card(cx),
+            (TerminalSettingsPage::Awareness, 2) => self.terminal_triggers_settings_card(cx),
             (TerminalSettingsPage::Transfer, 0) => self.settings_card(
                 "settings_view.terminal.in_band_transfer.title",
                 "settings_view.terminal.in_band_transfer.runtime_note",
@@ -1160,6 +1172,102 @@ impl WorkspaceApp {
                     self.in_band_transfer_runtime_note(),
                 ],
             ),
+            (TerminalSettingsPage::Logging, 0) => {
+                let directory = self
+                    .settings_store
+                    .path()
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join("logs")
+                    .join("terminal");
+                self.settings_card(
+                    "settings_view.terminal.session_log_title",
+                    "settings_view.terminal.session_log_description",
+                    vec![
+                        self.checkbox_row(
+                            "settings_view.terminal.session_log_automatic",
+                            "settings_view.terminal.session_log_automatic_hint",
+                            settings.terminal.session_log.automatic,
+                            set_terminal_session_log_automatic,
+                            cx,
+                        ),
+                        self.card_separator(),
+                        self.setting_row(
+                            "settings_view.terminal.session_log_file_name_template",
+                            "settings_view.terminal.session_log_file_name_template_hint",
+                            self.settings_text_input_control(
+                                SettingsInput::TerminalSessionLogFileNameTemplate,
+                                &settings.terminal.session_log.file_name_template,
+                                "{date}_{time}_{protocol}_{session}.log".to_string(),
+                                420.0,
+                                cx,
+                            ),
+                            cx,
+                        ),
+                        self.card_separator(),
+                        self.select_setting_row(
+                            "settings_view.terminal.session_log_file_mode",
+                            "settings_view.terminal.session_log_file_mode_hint",
+                            SettingsSelect::TerminalSessionLogFileMode,
+                            terminal_session_log_file_mode_label(
+                                settings.terminal.session_log.file_mode,
+                                &self.i18n,
+                            ),
+                            self.tokens.metrics.settings_select_width,
+                            cx,
+                        ),
+                        self.card_separator(),
+                        self.setting_row(
+                            "settings_view.terminal.session_log_content_template",
+                            "settings_view.terminal.session_log_content_template_hint",
+                            self.settings_text_input_control(
+                                SettingsInput::TerminalSessionLogContentTemplate,
+                                &settings.terminal.session_log.content_template,
+                                "[{timestamp}] {text}".to_string(),
+                                420.0,
+                                cx,
+                            ),
+                            cx,
+                        ),
+                        self.card_separator(),
+                        self.checkbox_row(
+                            "settings_view.terminal.session_log_control_sequences",
+                            "settings_view.terminal.session_log_control_sequences_hint",
+                            settings.terminal.session_log.include_control_sequences,
+                            set_terminal_session_log_include_control_sequences,
+                            cx,
+                        ),
+                        self.card_separator(),
+                        self.number_row(
+                            "settings_view.terminal.session_log_retention_days",
+                            "settings_view.terminal.session_log_retention_days_hint",
+                            SettingsInput::TerminalSessionLogRetentionDays,
+                            settings.terminal.session_log.retention_days,
+                            cx,
+                        ),
+                        self.card_separator(),
+                        self.number_row(
+                            "settings_view.terminal.session_log_max_file_size",
+                            "settings_view.terminal.session_log_max_file_size_hint",
+                            SettingsInput::TerminalSessionLogMaxFileSizeMib,
+                            settings.terminal.session_log.max_file_size_mib,
+                            cx,
+                        ),
+                        self.card_separator(),
+                        self.setting_row(
+                            "settings_view.terminal.session_log_directory",
+                            "settings_view.terminal.session_log_directory_hint",
+                            div()
+                                .max_w(px(420.0))
+                                .text_size(px(self.tokens.metrics.ui_text_xs))
+                                .text_color(rgb(self.tokens.ui.text_muted))
+                                .child(directory.to_string_lossy().to_string())
+                                .into_any_element(),
+                            cx,
+                        ),
+                    ],
+                )
+            }
             (TerminalSettingsPage::Highlight, 0) => self.highlight_rules_card(settings, cx),
             _ => div().into_any_element(),
         }

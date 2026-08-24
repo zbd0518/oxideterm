@@ -2,28 +2,28 @@ use chrono::SecondsFormat;
 use oxideterm_connections::{
     ConnectionCredentialSlot, ConnectionTerminalBackspaceSequence,
     ConnectionTerminalDeleteSequence, ConnectionTerminalEncoding, ConnectionTerminalOptions,
-    ConnectionX11ForwardingMode, ConnectionX11ForwardingOptions,
-    DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS, DEFAULT_X11_UNTRUSTED_TIMEOUT_SECONDS, MoshIpFamily,
-    MoshPredictionMode, MoshUdpPortSelection, SaveConnectionRequest, SaveMoshProfileRequest,
-    SaveRemoteDesktopProfileRequest, SaveSerialProfileRequest, SaveTelnetProfileRequest, SavedAuth,
-    SavedConnection, SavedProxyHop, SavedUpstreamProxyAuth, SavedUpstreamProxyConfig,
-    SavedUpstreamProxyPolicy, SavedUpstreamProxyProtocol, SecretString, SerialFlowControl,
-    SerialParity,
+    ConnectionTerminalSessionLogPolicy, ConnectionX11ForwardingMode,
+    ConnectionX11ForwardingOptions, DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS,
+    DEFAULT_X11_UNTRUSTED_TIMEOUT_SECONDS, MoshIpFamily, MoshPredictionMode, MoshUdpPortSelection,
+    SaveConnectionRequest, SaveMoshProfileRequest, SaveRemoteDesktopProfileRequest,
+    SaveSerialProfileRequest, SaveTelnetProfileRequest, SavedAuth, SavedConnection, SavedProxyHop,
+    SavedUpstreamProxyAuth, SavedUpstreamProxyConfig, SavedUpstreamProxyPolicy,
+    SavedUpstreamProxyProtocol, SecretString, SerialFlowControl, SerialParity,
 };
 use oxideterm_public_mcp::{
     ClientRef, ConnectionRef, DomainRequest, PublicConnectionAuth, PublicCredentialSlot,
     PublicMoshIpFamily, PublicMoshPredictionMode, PublicMoshUdpPortSelection,
     PublicRemoteDesktopOptions, PublicSavedConnectionProfile, PublicSerialFlowControl,
     PublicSerialParity, PublicTerminalBackspaceSequence, PublicTerminalDeleteSequence,
-    PublicTerminalEncoding, PublicTerminalOptions, PublicToolCall, PublicUpstreamProxy,
-    PublicUpstreamProxyProtocol, PublicVncCompression, PublicVncImageQuality,
+    PublicTerminalEncoding, PublicTerminalOptions, PublicTerminalSessionLogPolicy, PublicToolCall,
+    PublicUpstreamProxy, PublicUpstreamProxyProtocol, PublicVncCompression, PublicVncImageQuality,
     PublicVncSecurityPolicy, PublicVncSessionMode, PublicX11ForwardingMode, ToolEnvelope,
 };
 use oxideterm_remote_desktop::{
     RemoteDesktopAudioOptions, RemoteDesktopClipboardOptions, RemoteDesktopDisplayOptions,
-    RemoteDesktopProtocol, RemoteDesktopSessionOptions, RemoteDesktopVncCompression,
-    RemoteDesktopVncImageQuality, RemoteDesktopVncOptions, RemoteDesktopVncSecurityPolicy,
-    RemoteDesktopVncSessionMode,
+    RemoteDesktopProtocol, RemoteDesktopRdpOptions, RemoteDesktopSessionOptions,
+    RemoteDesktopVncCompression, RemoteDesktopVncImageQuality, RemoteDesktopVncOptions,
+    RemoteDesktopVncSecurityPolicy, RemoteDesktopVncSessionMode,
 };
 use serde_json::{Value, json};
 
@@ -306,6 +306,9 @@ fn save_profile(
                         identity_agent: hop.identity_agent.clone(),
                         agent_forwarding_socket: hop.agent_forwarding_socket.clone(),
                         legacy_ssh_compatibility: hop.legacy_ssh_compatibility,
+                        ssh_algorithms: matching_hop
+                            .map(|hop| hop.ssh_algorithms.clone())
+                            .unwrap_or_default(),
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?;
@@ -313,6 +316,7 @@ fn save_profile(
                 id: existing_id.map(ToOwned::to_owned),
                 name: profile.name.clone(),
                 group: profile.group.clone(),
+                notes: profile.notes.clone(),
                 host: profile.host.clone(),
                 port: profile.port,
                 username: profile.username.clone(),
@@ -322,6 +326,8 @@ fn save_profile(
                     &profile.upstream_proxy,
                     existing.map(|connection| &connection.upstream_proxy),
                 ),
+                // Public MCP edits cannot read ProxyCommand text, so retain its local reference.
+                proxy_command: existing.and_then(|connection| connection.proxy_command.clone()),
                 color: profile.color.clone(),
                 icon_background_color: profile.icon_background_color.clone(),
                 icon: profile.icon.clone(),
@@ -333,6 +339,9 @@ fn save_profile(
                 identity_agent: profile.identity_agent.clone(),
                 agent_forwarding_socket: profile.agent_forwarding_socket.clone(),
                 legacy_ssh_compatibility: profile.legacy_ssh_compatibility,
+                ssh_algorithms: existing
+                    .map(|connection| connection.options.ssh_algorithms.clone())
+                    .unwrap_or_default(),
                 dedicated_new_terminal_connection: profile.dedicated_new_terminal_connection,
                 x11_forwarding: ConnectionX11ForwardingOptions {
                     enabled: profile.x11_forwarding.enabled,
@@ -361,6 +370,7 @@ fn save_profile(
                     id: existing_id.map(ToOwned::to_owned),
                     name: profile.name.clone(),
                     group: profile.group.clone(),
+                    notes: profile.notes.clone(),
                     icon: profile.icon.clone(),
                     color: profile.color.clone(),
                     icon_background_color: profile.icon_background_color.clone(),
@@ -378,6 +388,7 @@ fn save_profile(
                         PublicSerialFlowControl::Software => SerialFlowControl::Software,
                         PublicSerialFlowControl::Hardware => SerialFlowControl::Hardware,
                     }),
+                    terminal: terminal_options(&profile.terminal),
                     connect_on_open: Some(profile.connect_on_open),
                 })
                 .map_err(public_store_error)?;
@@ -391,6 +402,7 @@ fn save_profile(
                     id: existing_id.map(ToOwned::to_owned),
                     name: profile.name.clone(),
                     group: profile.group.clone(),
+                    notes: profile.notes.clone(),
                     icon: profile.icon.clone(),
                     color: profile.color.clone(),
                     icon_background_color: profile.icon_background_color.clone(),
@@ -405,11 +417,39 @@ fn save_profile(
         PublicSavedConnectionProfile::Mosh(profile) => {
             let existing_id = typed_existing_id(existing_key, CONNECTION_KEY_MOSH_PREFIX, "mosh")?;
             let existing = existing_id.and_then(|id| store.get_mosh_profile(id));
+            let proxy_chain = profile
+                .proxy_chain
+                .iter()
+                .enumerate()
+                .map(|(index, hop)| {
+                    let matching_hop = existing
+                        .and_then(|profile| profile.proxy_chain.get(index))
+                        .filter(|existing_hop| {
+                            existing_hop.host == hop.host.trim()
+                                && existing_hop.port == hop.port
+                                && existing_hop.username == hop.username.trim()
+                        });
+                    Ok(SavedProxyHop {
+                        host: hop.host.clone(),
+                        port: hop.port,
+                        username: hop.username.clone(),
+                        auth: saved_auth(&hop.auth, matching_hop.map(|hop| &hop.auth))?,
+                        agent_forwarding: hop.agent_forwarding,
+                        identity_agent: hop.identity_agent.clone(),
+                        agent_forwarding_socket: hop.agent_forwarding_socket.clone(),
+                        legacy_ssh_compatibility: hop.legacy_ssh_compatibility,
+                        ssh_algorithms: matching_hop
+                            .map(|hop| hop.ssh_algorithms.clone())
+                            .unwrap_or_default(),
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
             let saved = store
                 .upsert_mosh_profile(SaveMoshProfileRequest {
                     id: existing_id.map(ToOwned::to_owned),
                     name: profile.name.clone(),
                     group: profile.group.clone(),
+                    notes: profile.notes.clone(),
                     icon: profile.icon.clone(),
                     color: profile.color.clone(),
                     icon_background_color: profile.icon_background_color.clone(),
@@ -417,6 +457,7 @@ fn save_profile(
                     ssh_port: profile.ssh_port,
                     username: profile.username.clone(),
                     auth: saved_auth(&profile.auth, existing.map(|profile| &profile.auth))?,
+                    proxy_chain,
                     server_executable: profile.server_executable.clone(),
                     udp_host_override: profile.udp_host_override.clone(),
                     udp_port: match profile.udp_port {
@@ -441,6 +482,10 @@ fn save_profile(
                     locale: profile.locale.clone(),
                     identity_agent: profile.identity_agent.clone(),
                     legacy_ssh_compatibility: profile.legacy_ssh_compatibility,
+                    ssh_algorithms: existing
+                        .map(|profile| profile.ssh_algorithms.clone())
+                        .unwrap_or_default(),
+                    terminal: terminal_options(&profile.terminal),
                 })
                 .map_err(public_store_error)?;
             Ok(format!("{CONNECTION_KEY_MOSH_PREFIX}{}", saved.id))
@@ -476,6 +521,7 @@ fn save_remote_desktop_profile(
             id: existing_id.map(ToOwned::to_owned),
             name: profile.name.clone(),
             group: profile.group.clone(),
+            notes: profile.notes.clone(),
             icon: profile.icon.clone(),
             color: profile.color.clone(),
             icon_background_color: profile.icon_background_color.clone(),
@@ -582,6 +628,19 @@ fn saved_auth(
         }
         PublicConnectionAuth::KeyboardInteractive => Ok(SavedAuth::KeyboardInteractive),
         PublicConnectionAuth::Agent => Ok(SavedAuth::Agent),
+        PublicConnectionAuth::KerberosPreferred {
+            server_identity,
+            delegate_credentials,
+            fallback,
+        } => Ok(SavedAuth::with_kerberos_preferred(
+            saved_auth(fallback, existing.map(SavedAuth::conventional_fallback))?,
+            server_identity
+                .as_deref()
+                .map(str::trim)
+                .filter(|identity| !identity.is_empty())
+                .map(ToOwned::to_owned),
+            *delegate_credentials,
+        )),
     }
 }
 
@@ -670,6 +729,18 @@ fn terminal_options(options: &PublicTerminalOptions) -> ConnectionTerminalOption
             PublicTerminalDeleteSequence::Delete => ConnectionTerminalDeleteSequence::Delete,
             PublicTerminalDeleteSequence::ControlH => ConnectionTerminalDeleteSequence::ControlH,
         }),
+        semantic_scheme: None,
+        highlight_rule_set: None,
+        session_log_policy: match options.session_log_policy {
+            PublicTerminalSessionLogPolicy::Inherit => ConnectionTerminalSessionLogPolicy::Inherit,
+            PublicTerminalSessionLogPolicy::Automatic => {
+                ConnectionTerminalSessionLogPolicy::Automatic
+            }
+            PublicTerminalSessionLogPolicy::Manual => ConnectionTerminalSessionLogPolicy::Manual,
+            PublicTerminalSessionLogPolicy::Disabled => {
+                ConnectionTerminalSessionLogPolicy::Disabled
+            }
+        },
     }
 }
 
@@ -686,6 +757,9 @@ fn remote_desktop_options(options: &PublicRemoteDesktopOptions) -> RemoteDesktop
         },
         display: RemoteDesktopDisplayOptions {
             use_all_monitors: options.use_all_monitors,
+        },
+        rdp: RemoteDesktopRdpOptions {
+            disable_graphics_pipeline: options.disable_rdp_graphics_pipeline,
         },
         vnc: RemoteDesktopVncOptions {
             security_policy: match options.vnc_security_policy {
@@ -751,12 +825,19 @@ fn store_credential(
             .map_err(public_store_error);
     }
     if let Some(id) = key.strip_prefix(CONNECTION_KEY_MOSH_PREFIX) {
-        if !matches!(slot, PublicCredentialSlot::Primary) {
-            return Err("Mosh exposes only its primary credential slot".to_owned());
+        return match slot {
+            PublicCredentialSlot::Primary => store.store_mosh_profile_credential(id, secret),
+            PublicCredentialSlot::ProxyHop { index } => store.store_mosh_proxy_hop_credential(
+                id,
+                usize::try_from(index)
+                    .map_err(|_| "The proxy hop index is outside the supported range")?,
+                secret,
+            ),
+            PublicCredentialSlot::UpstreamProxy => {
+                return Err("Mosh does not expose an upstream proxy credential slot".to_owned());
+            }
         }
-        return store
-            .store_mosh_profile_credential(id, secret)
-            .map_err(public_store_error);
+        .map_err(public_store_error);
     }
     if let Some(id) = key.strip_prefix(CONNECTION_KEY_DESKTOP_PREFIX) {
         if !matches!(slot, PublicCredentialSlot::Primary) {
@@ -781,12 +862,18 @@ fn forget_credential(
             .map_err(public_store_error);
     }
     if let Some(id) = key.strip_prefix(CONNECTION_KEY_MOSH_PREFIX) {
-        if !matches!(slot, PublicCredentialSlot::Primary) {
-            return Err("Mosh exposes only its primary credential slot".to_owned());
+        return match slot {
+            PublicCredentialSlot::Primary => store.forget_mosh_profile_credential(id),
+            PublicCredentialSlot::ProxyHop { index } => store.forget_mosh_proxy_hop_credential(
+                id,
+                usize::try_from(index)
+                    .map_err(|_| "The proxy hop index is outside the supported range")?,
+            ),
+            PublicCredentialSlot::UpstreamProxy => {
+                return Err("Mosh does not expose an upstream proxy credential slot".to_owned());
+            }
         }
-        return store
-            .forget_mosh_profile_credential(id)
-            .map_err(public_store_error);
+        .map_err(public_store_error);
     }
     if let Some(id) = key.strip_prefix(CONNECTION_KEY_DESKTOP_PREFIX) {
         if !matches!(slot, PublicCredentialSlot::Primary) {
@@ -839,7 +926,15 @@ fn credential_status(store: &oxideterm_connections::ConnectionStore, key: &str) 
     if let Some(id) = key.strip_prefix(CONNECTION_KEY_MOSH_PREFIX)
         && let Some(profile) = store.get_mosh_profile(id)
     {
-        return vec![auth_status("primary", None, &profile.auth)];
+        let mut slots = vec![auth_status("primary", None, &profile.auth)];
+        slots.extend(
+            profile
+                .proxy_chain
+                .iter()
+                .enumerate()
+                .map(|(index, hop)| auth_status("proxy_hop", u32::try_from(index).ok(), &hop.auth)),
+        );
+        return slots;
     }
     if let Some(id) = key.strip_prefix(CONNECTION_KEY_DESKTOP_PREFIX)
         && let Some(profile) = store.get_remote_desktop_profile(id)
@@ -856,7 +951,7 @@ fn credential_status(store: &oxideterm_connections::ConnectionStore, key: &str) 
 }
 
 fn auth_status(slot_kind: &str, index: Option<u32>, auth: &SavedAuth) -> Value {
-    let (credential_kind, configured, writable) = match auth {
+    let (credential_kind, configured, writable) = match auth.conventional_fallback() {
         SavedAuth::Password { keychain_id, .. } => ("password", keychain_id.is_some(), true),
         SavedAuth::Key {
             passphrase_keychain_id,
@@ -872,6 +967,7 @@ fn auth_status(slot_kind: &str, index: Option<u32>, auth: &SavedAuth) -> Value {
         } => ("passphrase", passphrase_keychain_id.is_some(), true),
         SavedAuth::KeyboardInteractive => ("interactive", false, false),
         SavedAuth::Agent => ("agent", false, false),
+        SavedAuth::KerberosPreferred { .. } => unreachable!("fallback auth is conventional"),
     };
     let slot = index.map_or_else(
         || json!({ "kind": slot_kind }),
@@ -951,6 +1047,7 @@ pub(super) fn ssh_connection_projection(
         "type": "ssh",
         "name": connection.name,
         "group": connection.group,
+        "notes": connection.notes,
         "host": connection.host,
         "port": connection.port,
         "username": connection.username,
@@ -982,6 +1079,19 @@ pub(super) fn ssh_connection_projection(
 }
 
 pub(super) fn auth_projection(auth: &SavedAuth) -> Value {
+    if let SavedAuth::KerberosPreferred {
+        server_identity,
+        delegate_credentials,
+        fallback,
+    } = auth
+    {
+        return json!({
+            "kind": "kerberos_preferred",
+            "server_identity": server_identity,
+            "delegate_credentials": delegate_credentials,
+            "fallback": auth_projection(fallback),
+        });
+    }
     match auth {
         SavedAuth::Password { keychain_id, .. } => json!({
             "kind": "password",
@@ -1024,6 +1134,7 @@ pub(super) fn auth_projection(auth: &SavedAuth) -> Value {
             "kind": "agent",
             "credential_configured": false,
         }),
+        SavedAuth::KerberosPreferred { .. } => unreachable!("handled above"),
     }
 }
 
@@ -1035,6 +1146,7 @@ pub(super) fn remote_desktop_options_projection(options: &RemoteDesktopSessionOp
         "audio_playback": options.audio.playback,
         "audio_capture": options.audio.capture,
         "use_all_monitors": options.display.use_all_monitors,
+        "disable_rdp_graphics_pipeline": options.rdp.disable_graphics_pipeline,
         "vnc_security_policy": match options.vnc.security_policy {
             RemoteDesktopVncSecurityPolicy::RequireVerifiedEncryption => "require_verified_encryption",
             RemoteDesktopVncSecurityPolicy::AllowUnverifiedEncryption => "allow_unverified_encryption",
@@ -1108,6 +1220,7 @@ pub(super) fn terminal_options_projection(options: &ConnectionTerminalOptions) -
             ConnectionTerminalDeleteSequence::Delete => "delete",
             ConnectionTerminalDeleteSequence::ControlH => "control_h",
         }),
+        "semantic_scheme": options.semantic_scheme,
     })
 }
 

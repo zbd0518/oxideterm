@@ -10,6 +10,7 @@ dashmap.workspace = true
 dirs.workspace = true
 oxideterm-backend-classification = { path = "../oxideterm-backend-classification" }
 oxideterm-connection-monitor = { path = "../oxideterm-connection-monitor" }
+oxideterm-connections = { path = "../oxideterm-connections" }
 oxideterm-portable-runtime = { path = "../oxideterm-portable-runtime" }
 oxideterm-sftp = { path = "../oxideterm-sftp" }
 oxideterm-topology = { path = "../oxideterm-topology" }
@@ -25,6 +26,9 @@ tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libgssapi.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true

@@ -7,6 +7,7 @@ use std::{
     thread::JoinHandle,
 };
 
+use alacritty_terminal::term::cell::Cell as AlacrittyCell;
 use alacritty_terminal::{
     event::{Event as AlacEvent, EventListener, Notify, OnResize, WindowSize},
     grid::{Dimensions, Scroll},
@@ -51,7 +52,7 @@ pub use data::{
     GraphicsOptions, TerminalAttrs, TerminalCell, TerminalColor, TerminalCursorShape,
     TerminalImageAnimationState, TerminalImageData, TerminalImageFrame, TerminalImageId,
     TerminalImageProtocol, TerminalImageSnapshot, TerminalRow, TerminalSearchMatch,
-    TerminalSearchRange, TerminalSnapshot,
+    TerminalSearchRange, TerminalSnapshot, TerminalStyleOrigin,
 };
 pub use editor_integration::{
     EMACS_FREE_TYPE_INTEGRATION_SOURCE, TerminalEditorApplication, TerminalEditorCapabilities,
@@ -85,9 +86,9 @@ pub use session::{
     SerialControlState, SerialDisplayMode, SerialError, SerialErrorCode, SerialFlowControl,
     SerialLineEnding, SerialParity, SerialPortInfo, SerialRuntimeOptions, SerialSendMode,
     SerialSessionConfig, SshPtySession, SshSessionConfig, TelnetControlCommand,
-    TelnetSessionConfig, TerminalDrainBudget, TerminalDrainReport, TerminalMagicKind,
-    TerminalOutputProcessor, TerminalResize, TerminalSession, TerminalSessionBackend,
-    TerminalSessionKind, TerminalSessionStatus, serial_list_ports,
+    TelnetLoginCredentials, TelnetSessionConfig, TerminalDrainBudget, TerminalDrainReport,
+    TerminalMagicKind, TerminalOutputProcessor, TerminalResize, TerminalSession,
+    TerminalSessionBackend, TerminalSessionKind, TerminalSessionStatus, serial_list_ports,
 };
 pub use shell_completion::{
     TerminalShellParseResult, TerminalShellToken, escape_terminal_path_for_shell,
@@ -104,7 +105,7 @@ pub use shell_integration::{
 
 use color::{
     OXIDETERM_DARK_THEME, attrs_from_flags, color_for_alacritty_request_with_override,
-    style_colors_for_cell,
+    style_colors_for_cell, style_origin_for_cell,
 };
 use local_graphics_event_loop::{
     LocalGraphicsEventLoop, LocalGraphicsMsg, LocalGraphicsNotifier, LocalPtyReadReport,

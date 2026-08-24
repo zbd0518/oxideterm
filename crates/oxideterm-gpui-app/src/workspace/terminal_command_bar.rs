@@ -32,10 +32,12 @@ pub(in crate::workspace) mod completion;
 mod bar;
 mod context;
 mod git;
+mod highlight;
 mod privilege;
 mod sender;
 
-const TERMINAL_BROADCAST_MENU_WIDTH: f32 = 260.0;
+const TERMINAL_BROADCAST_MENU_WIDTH: f32 = 340.0;
+const TERMINAL_BROADCAST_MENU_MAX_HEIGHT: f32 = 520.0;
 const TERMINAL_CWD_MENU_WIDTH: f32 = 520.0;
 const TERMINAL_CWD_MENU_MAX_HEIGHT: f32 = 420.0;
 const TERMINAL_CWD_MENU_MARGIN: f32 = 12.0;

@@ -7,6 +7,11 @@ pub struct GeneralSettings {
         default = "default_minimize_to_tray_on_close"
     )]
     pub minimize_to_tray_on_close: bool,
+    #[serde(
+        rename = "externalConnectionUrisEnabled",
+        default = "default_external_connection_uris_enabled"
+    )]
+    pub external_connection_uris_enabled: bool,
     #[serde(default)]
     pub update_proxy: UpdateProxySettings,
     #[serde(flatten)]
@@ -19,6 +24,7 @@ impl Default for GeneralSettings {
             language: Language::ZhCn,
             update_channel: UpdateChannel::default(),
             minimize_to_tray_on_close: default_minimize_to_tray_on_close(),
+            external_connection_uris_enabled: default_external_connection_uris_enabled(),
             update_proxy: UpdateProxySettings::default(),
             extra: ExtraFields::new(),
         }
@@ -27,6 +33,11 @@ impl Default for GeneralSettings {
 
 fn default_minimize_to_tray_on_close() -> bool {
     true
+}
+
+fn default_external_connection_uris_enabled() -> bool {
+    // External applications should not open connections until the user opts in.
+    false
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -41,6 +52,25 @@ impl Default for TerminalAutosuggestSettings {
     fn default() -> Self {
         Self {
             local_shell_history: true,
+            extra: ExtraFields::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalTriggerSettings {
+    // Shell execution is a separate trust decision from enabling ordinary terminal triggers.
+    #[serde(default)]
+    pub explicit_shell_enabled: bool,
+    #[serde(flatten)]
+    pub extra: ExtraFields,
+}
+
+impl Default for TerminalTriggerSettings {
+    fn default() -> Self {
+        Self {
+            explicit_shell_enabled: false,
             extra: ExtraFields::new(),
         }
     }
@@ -245,8 +275,84 @@ fn default_detect_file_paths_as_links() -> bool {
     true
 }
 
+fn default_terminal_semantic_coloring() -> bool {
+    // Semantic coloring is opt-in because it changes application-provided terminal output.
+    false
+}
+
 fn default_confirm_before_closing_ssh() -> bool {
     true
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TerminalSemanticScheme {
+    #[default]
+    Balanced,
+    Conservative,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TerminalBroadcastTargetKind {
+    Ssh,
+    Mosh,
+    Telnet,
+    Serial,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalBroadcastTargetRef {
+    // Pane IDs are runtime-only; the saved profile ID keeps membership stable across launches.
+    pub kind: TerminalBroadcastTargetKind,
+    pub saved_connection_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalBroadcastGroup {
+    // The UUID keeps documents and the interactive broadcaster bound across renames.
+    pub id: uuid::Uuid,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<TerminalBroadcastTargetRef>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TerminalSessionLogFileMode {
+    #[default]
+    Unique,
+    Append,
+    Overwrite,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TerminalSessionLogSettings {
+    // Automatic logging remains opt-in because terminal output may contain sensitive data.
+    pub automatic: bool,
+    pub include_control_sequences: bool,
+    pub retention_days: i64,
+    pub max_file_size_mib: i64,
+    pub file_name_template: String,
+    pub content_template: String,
+    pub file_mode: TerminalSessionLogFileMode,
+}
+
+impl Default for TerminalSessionLogSettings {
+    fn default() -> Self {
+        Self {
+            automatic: false,
+            include_control_sequences: false,
+            retention_days: 30,
+            max_file_size_mib: 100,
+            file_name_template: "{date}_{time}_{protocol}_{session}.log".to_string(),
+            content_template: "[{timestamp}] {text}".to_string(),
+            file_mode: TerminalSessionLogFileMode::Unique,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -305,6 +411,12 @@ pub struct TerminalSettings {
     pub free_type_mode: bool,
     pub autosuggest: TerminalAutosuggestSettings,
     pub command_bar: TerminalCommandBarSettings,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub broadcast_groups: Vec<TerminalBroadcastGroup>,
+    #[serde(default)]
+    pub session_log: TerminalSessionLogSettings,
+    #[serde(default)]
+    pub triggers: TerminalTriggerSettings,
     #[serde(default)]
     pub remote_shell_integration_mode: RemoteShellIntegrationMode,
     pub command_marks: TerminalCommandMarksSettings,
@@ -316,7 +428,20 @@ pub struct TerminalSettings {
     #[serde(default)]
     pub background_scope: BackgroundScope,
     pub background_enabled_tabs: Vec<String>,
+    // Semantic coloring supplements only terminal cells without explicit ANSI styling.
+    #[serde(default = "default_terminal_semantic_coloring")]
+    pub semantic_coloring: bool,
+    #[serde(default)]
+    pub semantic_scheme: TerminalSemanticScheme,
+    #[serde(default)]
+    pub semantic_custom_scheme: Option<String>,
+    #[serde(default)]
+    pub custom_semantic_schemes: Vec<SemanticSchemeDocument>,
     pub highlight_rules: Vec<HighlightRule>,
+    #[serde(default)]
+    pub highlight_rule_sets: Vec<HighlightRuleSet>,
+    #[serde(default)]
+    pub default_highlight_rule_set: Option<String>,
     pub in_band_transfer: InBandTransferSettings,
     pub graphics: TerminalGraphicsSettings,
     pub unicode: TerminalUnicodeSettings,
@@ -327,6 +452,50 @@ pub struct TerminalSettings {
 pub const DEFAULT_TERMINAL_BACKGROUND_OPACITY: f64 = 0.15;
 pub const MIN_TERMINAL_BACKGROUND_OPACITY: f64 = 0.03;
 pub const MAX_TERMINAL_BACKGROUND_OPACITY: f64 = 1.0;
+pub const MAX_CUSTOM_SEMANTIC_SCHEMES: usize = 32;
+
+impl TerminalSettings {
+    pub fn active_custom_semantic_scheme(&self) -> Option<&SemanticSchemeDocument> {
+        let active_id = self.semantic_custom_scheme.as_deref()?;
+        self.custom_semantic_schemes
+            .iter()
+            .find(|scheme| scheme.id == active_id)
+    }
+
+    pub fn highlight_rule_set(&self, id: &str) -> Option<&HighlightRuleSet> {
+        self.highlight_rule_sets
+            .iter()
+            .find(|rule_set| rule_set.id == id)
+    }
+
+    pub fn effective_highlight_rules(&self) -> &[HighlightRule] {
+        self.default_highlight_rule_set
+            .as_deref()
+            .and_then(|id| self.highlight_rule_set(id))
+            .map(|rule_set| rule_set.rules.as_slice())
+            .unwrap_or(&self.highlight_rules)
+    }
+
+    pub fn effective_highlight_rules_mut(&mut self) -> &mut Vec<HighlightRule> {
+        let selected = self.default_highlight_rule_set.clone();
+        if let Some(id) = selected
+            && let Some(index) = self
+                .highlight_rule_sets
+                .iter()
+                .position(|rule_set| rule_set.id == id)
+        {
+            return &mut self.highlight_rule_sets[index].rules;
+        }
+        &mut self.highlight_rules
+    }
+
+    pub fn default_highlight_rule_set_name(&self) -> Option<&str> {
+        self.default_highlight_rule_set
+            .as_deref()
+            .and_then(|id| self.highlight_rule_set(id))
+            .map(|rule_set| rule_set.name.as_str())
+    }
+}
 
 impl Default for TerminalSettings {
     fn default() -> Self {
@@ -363,6 +532,9 @@ impl Default for TerminalSettings {
             free_type_mode: false,
             autosuggest: TerminalAutosuggestSettings::default(),
             command_bar: TerminalCommandBarSettings::default(),
+            broadcast_groups: Vec::new(),
+            session_log: TerminalSessionLogSettings::default(),
+            triggers: TerminalTriggerSettings::default(),
             remote_shell_integration_mode: RemoteShellIntegrationMode::Ask,
             command_marks: TerminalCommandMarksSettings::default(),
             background_enabled: true,
@@ -372,7 +544,13 @@ impl Default for TerminalSettings {
             background_fit: BackgroundFit::Cover,
             background_scope: BackgroundScope::Content,
             background_enabled_tabs: vec!["terminal".to_string(), "local_terminal".to_string()],
+            semantic_coloring: false,
+            semantic_scheme: TerminalSemanticScheme::default(),
+            semantic_custom_scheme: None,
+            custom_semantic_schemes: Vec::new(),
             highlight_rules: Vec::new(),
+            highlight_rule_sets: Vec::new(),
+            default_highlight_rule_set: None,
             in_band_transfer: InBandTransferSettings::default(),
             graphics: TerminalGraphicsSettings::default(),
             unicode: TerminalUnicodeSettings::default(),
@@ -398,17 +576,82 @@ mod tests {
     }
 
     #[test]
-    fn background_scope_serializes_as_lowercase_camel_case_field() {
-        let mut settings = TerminalSettings::default();
-        settings.background_scope = BackgroundScope::Window;
+    fn terminal_trigger_shell_execution_defaults_to_denied() {
+        let mut value = serde_json::to_value(TerminalSettings::default()).expect("settings value");
+        value
+            .as_object_mut()
+            .expect("terminal settings object")
+            .remove("triggers");
 
-        let value = serde_json::to_value(settings).expect("serialize terminal settings");
-        assert_eq!(value["backgroundScope"], serde_json::json!("window"));
+        let settings: TerminalSettings = serde_json::from_value(value).expect("legacy settings");
+
+        assert!(!settings.triggers.explicit_shell_enabled);
+    }
+
+    #[test]
+    fn terminal_broadcast_groups_default_empty_for_legacy_settings() {
+        let mut value = serde_json::to_value(TerminalSettings::default()).expect("settings value");
+        value
+            .as_object_mut()
+            .expect("terminal settings object")
+            .remove("broadcastGroups");
+
+        let settings: TerminalSettings = serde_json::from_value(value).expect("legacy settings");
+
+        assert!(settings.broadcast_groups.is_empty());
+    }
+
+    #[test]
+    fn terminal_session_log_uses_safe_defaults_when_section_is_absent() {
+        let mut value = serde_json::to_value(TerminalSettings::default()).expect("settings value");
+        value
+            .as_object_mut()
+            .expect("terminal settings object")
+            .remove("sessionLog");
+
+        let settings: TerminalSettings = serde_json::from_value(value).expect("terminal settings");
+
+        assert!(!settings.session_log.automatic);
+        assert!(!settings.session_log.include_control_sequences);
+        assert_eq!(settings.session_log.retention_days, 30);
+        assert_eq!(settings.session_log.max_file_size_mib, 100);
+        assert_eq!(
+            settings.session_log.file_name_template,
+            "{date}_{time}_{protocol}_{session}.log"
+        );
+        assert_eq!(
+            settings.session_log.content_template,
+            "[{timestamp}] {text}"
+        );
+        assert_eq!(
+            settings.session_log.file_mode,
+            TerminalSessionLogFileMode::Unique
+        );
+    }
+
+    #[test]
+    fn terminal_broadcast_groups_round_trip_stable_connection_ids() {
+        let group_id = uuid::Uuid::parse_str("018f5d5e-7b6c-7ef0-a765-32109abcdef0").unwrap();
+        let mut settings = TerminalSettings::default();
+        settings.broadcast_groups.push(TerminalBroadcastGroup {
+            id: group_id,
+            name: "Production".to_string(),
+            members: vec![TerminalBroadcastTargetRef {
+                kind: TerminalBroadcastTargetKind::Ssh,
+                saved_connection_id: "ssh-production-1".to_string(),
+            }],
+        });
+
+        let value = serde_json::to_value(&settings).expect("serialize terminal settings");
+        let restored: TerminalSettings =
+            serde_json::from_value(value).expect("deserialize terminal settings");
+
+        assert_eq!(restored.broadcast_groups, settings.broadcast_groups);
     }
 
     #[test]
     fn terminal_settings_restore_legacy_presentation_defaults() {
-        let defaults: [(&str, bool, fn(&TerminalSettings) -> bool); 5] = [
+        let defaults: [(&str, bool, fn(&TerminalSettings) -> bool); 6] = [
             ("smoothScroll", true, |settings| settings.smooth_scroll),
             ("highlightTabOnNewOutput", true, |settings| {
                 settings.highlight_tab_on_new_output
@@ -420,6 +663,9 @@ mod tests {
             ),
             ("fontLigatures", false, |settings| settings.font_ligatures),
             ("rightClickPaste", false, |settings| settings.right_click_paste),
+            ("semanticColoring", false, |settings| {
+                settings.semantic_coloring
+            }),
         ];
 
         for (field, expected, read) in defaults {
@@ -429,6 +675,63 @@ mod tests {
             let settings: TerminalSettings = serde_json::from_value(value).unwrap();
             assert_eq!(read(&settings), expected, "legacy {field} default");
         }
+    }
+
+    #[test]
+    fn terminal_semantic_scheme_defaults_and_serializes_stably() {
+        let mut value = serde_json::to_value(TerminalSettings::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("semanticScheme");
+
+        let legacy: TerminalSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.semantic_scheme, TerminalSemanticScheme::Balanced);
+
+        let mut conservative = TerminalSettings::default();
+        conservative.semantic_scheme = TerminalSemanticScheme::Conservative;
+        let value = serde_json::to_value(conservative).unwrap();
+        assert_eq!(value["semanticScheme"], serde_json::json!("conservative"));
+    }
+
+    #[test]
+    fn custom_semantic_schemes_round_trip_and_resolve_by_id() {
+        let mut scheme = oxideterm_terminal_semantic::built_in_scheme_document(
+            oxideterm_terminal_semantic::SemanticScheme::Balanced,
+        );
+        scheme.id = "custom:operations".to_string();
+        scheme.name = "Operations".to_string();
+
+        let mut settings = TerminalSettings::default();
+        settings.semantic_custom_scheme = Some(scheme.id.clone());
+        settings.custom_semantic_schemes.push(scheme.clone());
+        let value = serde_json::to_value(settings).unwrap();
+        let decoded: TerminalSettings = serde_json::from_value(value).unwrap();
+
+        assert_eq!(decoded.active_custom_semantic_scheme(), Some(&scheme));
+    }
+
+    #[test]
+    fn selected_highlight_rule_set_replaces_global_base_rules() {
+        let mut settings = TerminalSettings::default();
+        settings.highlight_rules.push(HighlightRule {
+            id: "base".to_string(),
+            ..HighlightRule::default()
+        });
+        settings.highlight_rule_sets.push(HighlightRuleSet {
+            id: "operations".to_string(),
+            name: "Operations".to_string(),
+            rules: vec![HighlightRule {
+                id: "override".to_string(),
+                ..HighlightRule::default()
+            }],
+        });
+
+        assert_eq!(settings.effective_highlight_rules()[0].id, "base");
+        settings.default_highlight_rule_set = Some("operations".to_string());
+        assert_eq!(settings.effective_highlight_rules()[0].id, "override");
+        settings.effective_highlight_rules_mut()[0].label = "edited".to_string();
+        assert_eq!(settings.highlight_rule_sets[0].rules[0].label, "edited");
     }
 
     #[test]

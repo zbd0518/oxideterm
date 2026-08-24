@@ -5,7 +5,10 @@ use anyhow::{Context, Result};
 use serde_json::{Map, Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::model::*;
+use crate::{
+    ParsedTerminalSessionLogTemplate, TerminalSessionLogTemplateError, model::*,
+    parse_terminal_session_log_content_template, parse_terminal_session_log_file_name_template,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SanitizedSettings {
@@ -546,6 +549,99 @@ fn clamp_terminal_scrollback(lines: i64) -> i64 {
     lines.clamp(TERMINAL_SCROLLBACK_MIN, TERMINAL_SCROLLBACK_MAX)
 }
 
+fn sanitize_custom_semantic_schemes(root: &mut Value, warnings: &mut Vec<String>) {
+    let Some(terminal) = root.get_mut("terminal").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let Some(schemes) = terminal
+        .get_mut("customSemanticSchemes")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+
+    let original_scheme_count = schemes.len();
+    let mut valid_ids = std::collections::HashSet::new();
+    let mut sanitized = Vec::new();
+    for value in schemes.drain(..).take(MAX_CUSTOM_SEMANTIC_SCHEMES) {
+        let Ok(document) = serde_json::from_value::<
+            oxideterm_terminal_semantic::SemanticSchemeDocument,
+        >(value.clone()) else {
+            warnings.push("Removed malformed custom semantic scheme".to_string());
+            continue;
+        };
+        if oxideterm_terminal_semantic::validate_scheme_document(&document).is_err()
+            || !valid_ids.insert(document.id.clone())
+        {
+            warnings.push(format!(
+                "Removed invalid or duplicate custom semantic scheme: {}",
+                document.id
+            ));
+            continue;
+        }
+        sanitized.push(value);
+    }
+    if original_scheme_count > MAX_CUSTOM_SEMANTIC_SCHEMES {
+        warnings.push(format!(
+            "Custom semantic schemes limited to {MAX_CUSTOM_SEMANTIC_SCHEMES}"
+        ));
+    }
+    *schemes = sanitized;
+
+    let active_is_valid = terminal
+        .get("semanticCustomScheme")
+        .and_then(Value::as_str)
+        .is_some_and(|id| valid_ids.contains(id));
+    if !active_is_valid {
+        terminal.insert("semanticCustomScheme".to_string(), Value::Null);
+    }
+
+    if let Some(shell_schemes) = root
+        .get_mut("localTerminal")
+        .and_then(Value::as_object_mut)
+        .and_then(|local| local.get_mut("semanticSchemeByShell"))
+        .and_then(Value::as_object_mut)
+    {
+        shell_schemes.retain(|shell_id, scheme_id| {
+            let valid_shell_id = !shell_id.trim().is_empty() && shell_id.len() <= 128;
+            let valid_scheme_id = scheme_id.as_str().is_some_and(|scheme_id| {
+                matches!(scheme_id, "balanced" | "conservative") || valid_ids.contains(scheme_id)
+            });
+            valid_shell_id && valid_scheme_id
+        });
+    }
+}
+
+fn sanitize_highlight_rule_sets(root: &mut Value, warnings: &mut Vec<String>) {
+    let Some(terminal) = root.get_mut("terminal").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let Some(value) = terminal.get_mut("highlightRuleSets") else {
+        return;
+    };
+    let original_count = value.as_array().map(Vec::len).unwrap_or_default();
+    *value = sanitize_highlight_rule_sets_value(value);
+    let valid_ids = value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|rule_set| rule_set.get("id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<std::collections::HashSet<_>>();
+    if original_count > MAX_HIGHLIGHT_RULE_SETS {
+        warnings.push(format!(
+            "Highlight rule sets limited to {MAX_HIGHLIGHT_RULE_SETS}"
+        ));
+    }
+    let default_is_valid = terminal
+        .get("defaultHighlightRuleSet")
+        .and_then(Value::as_str)
+        .is_some_and(|id| valid_ids.contains(id));
+    if !default_is_valid {
+        terminal.insert("defaultHighlightRuleSet".to_string(), Value::Null);
+    }
+}
+
 fn derive_backend_hot_lines(scrollback: i64) -> i64 {
     clamp_backend_hot_lines(clamp_terminal_scrollback(scrollback) * 2)
 }
@@ -644,10 +740,47 @@ pub fn sanitize_settings_value(raw: Value) -> Result<SanitizedSettings> {
             100 * 1024 * 1024,
             100 * 1024 * 1024 * 1024,
         ),
+        ("terminal.sessionLog.retentionDays", 30, 0, 3650),
+        ("terminal.sessionLog.maxFileSizeMib", 100, 1, 4096),
     ] {
         let segments: Vec<_> = path.split('.').collect();
         if let Some(value) = get_path_mut(&mut settings, &segments) {
             clamp_i64(value, fallback, min, max, path, &mut validation_warnings);
+        }
+    }
+
+    for (path, fallback, validator) in [
+        (
+            "terminal.sessionLog.fileNameTemplate",
+            "{date}_{time}_{protocol}_{session}.log",
+            parse_terminal_session_log_file_name_template
+                as fn(
+                    &str,
+                ) -> std::result::Result<
+                    ParsedTerminalSessionLogTemplate,
+                    TerminalSessionLogTemplateError,
+                >,
+        ),
+        (
+            "terminal.sessionLog.contentTemplate",
+            "[{timestamp}] {text}",
+            parse_terminal_session_log_content_template
+                as fn(
+                    &str,
+                ) -> std::result::Result<
+                    ParsedTerminalSessionLogTemplate,
+                    TerminalSessionLogTemplateError,
+                >,
+        ),
+    ] {
+        let segments: Vec<_> = path.split('.').collect();
+        if let Some(value) = get_path_mut(&mut settings, &segments)
+            && value
+                .as_str()
+                .is_none_or(|template| validator(template).is_err())
+        {
+            *value = json!(fallback);
+            validation_warnings.push(format!("Reset invalid {path}"));
         }
     }
 
@@ -720,6 +853,13 @@ pub fn sanitize_settings_value(raw: Value) -> Result<SanitizedSettings> {
         &["terminal", "renderer"],
         &["auto", "webgl", "canvas"],
         if cfg!(windows) { "canvas" } else { "auto" },
+        &mut validation_warnings,
+    );
+    sanitize_enum(
+        &mut settings,
+        &["terminal", "sessionLog", "fileMode"],
+        &["unique", "append", "overwrite"],
+        "unique",
         &mut validation_warnings,
     );
     sanitize_enum(
@@ -844,6 +984,8 @@ pub fn sanitize_settings_value(raw: Value) -> Result<SanitizedSettings> {
     if let Some(value) = get_path_mut(&mut settings, &["terminal", "highlightRules"]) {
         *value = sanitize_highlight_rules_value(value);
     }
+    sanitize_highlight_rule_sets(&mut settings, &mut validation_warnings);
+    sanitize_custom_semantic_schemes(&mut settings, &mut validation_warnings);
 
     let settings =
         serde_json::from_value(settings).context("sanitized settings did not match schema")?;
@@ -857,6 +999,115 @@ pub fn sanitize_settings_value(raw: Value) -> Result<SanitizedSettings> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_custom_semantic_schemes_are_removed_before_deserialization() {
+        let sanitized = sanitize_settings_value(json!({
+            "terminal": {
+                "semanticCustomScheme": "custom:invalid",
+                "customSemanticSchemes": [{
+                    "version": 1,
+                    "id": "custom:invalid",
+                    "name": "Invalid",
+                    "rules": [{
+                        "id": "bad-regex",
+                        "enabled": true,
+                        "pattern": "(",
+                        "capture": 0,
+                        "class": "error",
+                        "priority": 80,
+                        "context": "any"
+                    }]
+                }]
+            }
+        }))
+        .expect("sanitize settings");
+
+        assert!(
+            sanitized
+                .settings
+                .terminal
+                .custom_semantic_schemes
+                .is_empty()
+        );
+        assert!(sanitized.settings.terminal.semantic_custom_scheme.is_none());
+        assert!(!sanitized.validation_warnings.is_empty());
+    }
+
+    #[test]
+    fn invalid_session_log_templates_and_mode_fall_back_to_safe_defaults() {
+        let sanitized = sanitize_settings_value(json!({
+            "terminal": {
+                "sessionLog": {
+                    "fileNameTemplate": "../escape.log",
+                    "contentTemplate": "missing text variable",
+                    "fileMode": "replaceAnything"
+                }
+            }
+        }))
+        .expect("sanitize settings");
+
+        let session_log = sanitized.settings.terminal.session_log;
+        assert_eq!(
+            session_log.file_name_template,
+            "{date}_{time}_{protocol}_{session}.log"
+        );
+        assert_eq!(session_log.content_template, "[{timestamp}] {text}");
+        assert_eq!(session_log.file_mode, TerminalSessionLogFileMode::Unique);
+        assert_eq!(sanitized.validation_warnings.len(), 3);
+    }
+
+    #[test]
+    fn missing_default_highlight_rule_set_falls_back_to_global_base() {
+        let sanitized = sanitize_settings_value(json!({
+            "terminal": {
+                "defaultHighlightRuleSet": "missing",
+                "highlightRuleSets": [{
+                    "id": "operations",
+                    "name": "Operations",
+                    "rules": []
+                }]
+            }
+        }))
+        .expect("sanitize settings");
+
+        assert!(
+            sanitized
+                .settings
+                .terminal
+                .default_highlight_rule_set
+                .is_none()
+        );
+        assert_eq!(sanitized.settings.terminal.highlight_rule_sets.len(), 1);
+    }
+
+    #[test]
+    fn local_shell_scheme_bindings_keep_builtins_and_remove_missing_custom_schemes() {
+        let sanitized = sanitize_settings_value(json!({
+            "localTerminal": {
+                "semanticSchemeByShell": {
+                    "bash": "conservative",
+                    "zsh": "custom:missing"
+                }
+            }
+        }))
+        .expect("sanitize settings");
+
+        assert_eq!(
+            sanitized
+                .settings
+                .local_terminal
+                .semantic_scheme_for_shell("bash"),
+            Some("conservative")
+        );
+        assert!(
+            sanitized
+                .settings
+                .local_terminal
+                .semantic_scheme_for_shell("zsh")
+                .is_none()
+        );
+    }
 
     #[test]
     fn retired_gpui_preview_channel_migrates_to_the_build_default() {

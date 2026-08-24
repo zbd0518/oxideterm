@@ -67,6 +67,13 @@ pub enum SavedAuth {
     // Keyboard-interactive carries no persisted secret; prompts are collected during connect.
     KeyboardInteractive,
     Agent,
+    KerberosPreferred {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server_identity: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        delegate_credentials: bool,
+        fallback: Box<SavedAuth>,
+    },
 }
 
 impl SavedAuth {
@@ -78,12 +85,14 @@ impl SavedAuth {
             Self::Certificate { .. } => AuthType::Certificate,
             Self::KeyboardInteractive => AuthType::KeyboardInteractive,
             Self::Agent => AuthType::Agent,
+            Self::KerberosPreferred { fallback, .. } => fallback.auth_type(),
         }
     }
 
     pub fn key_path(&self) -> Option<&str> {
         match self {
             Self::Key { key_path, .. } | Self::Certificate { key_path, .. } => Some(key_path),
+            Self::KerberosPreferred { fallback, .. } => fallback.key_path(),
             _ => None,
         }
     }
@@ -91,6 +100,7 @@ impl SavedAuth {
     pub fn cert_path(&self) -> Option<&str> {
         match self {
             Self::Certificate { cert_path, .. } => Some(cert_path),
+            Self::KerberosPreferred { fallback, .. } => fallback.cert_path(),
             _ => None,
         }
     }
@@ -98,7 +108,41 @@ impl SavedAuth {
     pub fn managed_key_id(&self) -> Option<&str> {
         match self {
             Self::ManagedKey { key_id, .. } => Some(key_id),
+            Self::KerberosPreferred { fallback, .. } => fallback.managed_key_id(),
             _ => None,
+        }
+    }
+
+    pub fn gssapi_options(&self) -> Option<(Option<&str>, bool)> {
+        match self {
+            Self::KerberosPreferred {
+                server_identity,
+                delegate_credentials,
+                ..
+            } => Some((server_identity.as_deref(), *delegate_credentials)),
+            _ => None,
+        }
+    }
+
+    pub fn conventional_fallback(&self) -> &SavedAuth {
+        match self {
+            Self::KerberosPreferred { fallback, .. } => fallback.conventional_fallback(),
+            _ => self,
+        }
+    }
+
+    pub fn with_kerberos_preferred(
+        fallback: SavedAuth,
+        server_identity: Option<String>,
+        delegate_credentials: bool,
+    ) -> Self {
+        Self::KerberosPreferred {
+            server_identity,
+            delegate_credentials,
+            fallback: Box::new(match fallback {
+                Self::KerberosPreferred { fallback, .. } => *fallback,
+                fallback => fallback,
+            }),
         }
     }
 }
@@ -137,6 +181,23 @@ pub enum ConnectionTerminalDeleteSequence {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub enum ConnectionTerminalSessionLogPolicy {
+    #[default]
+    Inherit,
+    Automatic,
+    // Manual keeps the terminal action available without starting a log on connect.
+    Manual,
+    Disabled,
+}
+
+impl ConnectionTerminalSessionLogPolicy {
+    fn is_inherit(&self) -> bool {
+        *self == Self::Inherit
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ConnectionTerminalOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoding: Option<ConnectionTerminalEncoding>,
@@ -144,6 +205,15 @@ pub struct ConnectionTerminalOptions {
     pub backspace_sequence: Option<ConnectionTerminalBackspaceSequence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delete_sequence: Option<ConnectionTerminalDeleteSequence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_scheme: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub highlight_rule_set: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "ConnectionTerminalSessionLogPolicy::is_inherit"
+    )]
+    pub session_log_policy: ConnectionTerminalSessionLogPolicy,
 }
 
 impl ConnectionTerminalOptions {
@@ -151,6 +221,9 @@ impl ConnectionTerminalOptions {
         self.encoding.is_none()
             && self.backspace_sequence.is_none()
             && self.delete_sequence.is_none()
+            && self.semantic_scheme.is_none()
+            && self.highlight_rule_set.is_none()
+            && self.session_log_policy == ConnectionTerminalSessionLogPolicy::Inherit
     }
 }
 
@@ -195,6 +268,64 @@ fn default_x11_untrusted_timeout_seconds() -> u32 {
     DEFAULT_X11_UNTRUSTED_TIMEOUT_SECONDS
 }
 
+pub const MAX_SSH_ALGORITHMS_PER_CATEGORY: usize = 64;
+pub const MAX_SSH_ALGORITHM_NAME_BYTES: usize = 128;
+
+/// Ordered SSH algorithm overrides for one endpoint.
+///
+/// Empty categories inherit the effective OxideTerm preset. Non-empty categories
+/// replace that preset category in negotiation order.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SshAlgorithmPreferences {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kex: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_key: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cipher: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mac: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compression: Vec<String>,
+}
+
+impl SshAlgorithmPreferences {
+    pub fn is_default(&self) -> bool {
+        self.kex.is_empty()
+            && self.host_key.is_empty()
+            && self.cipher.is_empty()
+            && self.mac.is_empty()
+            && self.compression.is_empty()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        for (category, algorithms) in [
+            ("KEX", self.kex.as_slice()),
+            ("host key", self.host_key.as_slice()),
+            ("cipher", self.cipher.as_slice()),
+            ("MAC", self.mac.as_slice()),
+            ("compression", self.compression.as_slice()),
+        ] {
+            if algorithms.len() > MAX_SSH_ALGORITHMS_PER_CATEGORY {
+                bail!("Too many SSH {category} algorithms");
+            }
+            let mut unique = std::collections::HashSet::with_capacity(algorithms.len());
+            for algorithm in algorithms {
+                if algorithm.is_empty()
+                    || algorithm.len() > MAX_SSH_ALGORITHM_NAME_BYTES
+                    || algorithm.bytes().any(|byte| byte == b',' || byte.is_ascii_whitespace())
+                {
+                    bail!("Invalid SSH {category} algorithm name");
+                }
+                if !unique.insert(algorithm) {
+                    bail!("Duplicate SSH {category} algorithm");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ConnectionOptions {
     /// Overrides the SSH TCP and protocol-handshake timeout for this host.
@@ -216,6 +347,8 @@ pub struct ConnectionOptions {
     pub agent_forwarding_socket: Option<String>,
     #[serde(default)]
     pub legacy_ssh_compatibility: bool,
+    #[serde(default)]
+    pub ssh_algorithms: SshAlgorithmPreferences,
     /// Some SSH servers require a new authentication exchange for every terminal.
     #[serde(default, skip_serializing_if = "is_false")]
     pub dedicated_new_terminal_connection: bool,
@@ -259,6 +392,8 @@ pub struct SavedProxyHop {
     pub agent_forwarding_socket: Option<String>,
     #[serde(default)]
     pub legacy_ssh_compatibility: bool,
+    #[serde(default)]
+    pub ssh_algorithms: SshAlgorithmPreferences,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -321,6 +456,30 @@ impl Default for SavedUpstreamProxyPolicy {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SavedProxyCommand {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keychain_id: Option<String>,
+    #[serde(skip)]
+    pub plaintext_command: Option<SecretString>,
+}
+
+impl fmt::Debug for SavedProxyCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SavedProxyCommand")
+            .field("keychain_id", &self.keychain_id)
+            .field(
+                "plaintext_command",
+                &self
+                    .plaintext_command
+                    .as_ref()
+                    .map(|_| "[redacted secret]"),
+            )
+            .finish()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PrivilegeCredentialKind {
@@ -361,12 +520,20 @@ pub struct ProxyHopInfo {
     pub cert_path: Option<String>,
     pub managed_key_id: Option<String>,
     pub managed_key_name: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub gssapi_authentication: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gssapi_server_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub gssapi_delegate_credentials: bool,
     pub agent_forwarding: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_forwarding_socket: Option<String>,
     pub legacy_ssh_compatibility: bool,
+    #[serde(default)]
+    pub ssh_algorithms: SshAlgorithmPreferences,
 }
 
 impl From<&SavedProxyHop> for ProxyHopInfo {
@@ -380,10 +547,20 @@ impl From<&SavedProxyHop> for ProxyHopInfo {
             cert_path: hop.auth.cert_path().map(ToOwned::to_owned),
             managed_key_id: hop.auth.managed_key_id().map(ToOwned::to_owned),
             managed_key_name: None,
+            gssapi_authentication: hop.auth.gssapi_options().is_some(),
+            gssapi_server_identity: hop
+                .auth
+                .gssapi_options()
+                .and_then(|(identity, _)| identity.map(ToOwned::to_owned)),
+            gssapi_delegate_credentials: hop
+                .auth
+                .gssapi_options()
+                .is_some_and(|(_, delegate)| delegate),
             agent_forwarding: hop.agent_forwarding,
             identity_agent: hop.identity_agent.clone(),
             agent_forwarding_socket: hop.agent_forwarding_socket.clone(),
             legacy_ssh_compatibility: hop.legacy_ssh_compatibility,
+            ssh_algorithms: hop.ssh_algorithms.clone(),
         }
     }
 }
@@ -396,6 +573,9 @@ pub struct SavedConnection {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// Free-form user metadata. UI copy warns against storing credentials here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
@@ -405,6 +585,9 @@ pub struct SavedConnection {
     pub proxy_chain: Vec<SavedProxyHop>,
     #[serde(default, skip_serializing_if = "SavedUpstreamProxyPolicy::is_use_global")]
     pub upstream_proxy: SavedUpstreamProxyPolicy,
+    /// Manual ProxyCommand text stays in the protected store; metadata keeps only its reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_command: Option<SavedProxyCommand>,
     #[serde(default)]
     pub options: ConnectionOptions,
     pub created_at: DateTime<Utc>,
@@ -444,6 +627,14 @@ fn default_config_version() -> u32 {
     CONFIG_VERSION
 }
 
+fn default_ssh_connect_timeout_seconds() -> u64 {
+    DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS
+}
+
+fn is_default_ssh_connect_timeout_seconds(value: &u64) -> bool {
+    *value == DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS
+}
+
 impl SavedConnection {
     pub fn touch(&mut self) {
         let now = Utc::now();
@@ -463,6 +654,9 @@ pub struct ConnectionInfo {
     pub id: String,
     pub name: String,
     pub group: Option<String>,
+    /// Free-form user metadata. It is intentionally excluded from connection search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
     pub host: String,
     pub port: u16,
     pub username: String,
@@ -471,6 +665,12 @@ pub struct ConnectionInfo {
     pub cert_path: Option<String>,
     pub managed_key_id: Option<String>,
     pub managed_key_name: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub gssapi_authentication: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gssapi_server_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub gssapi_delegate_credentials: bool,
     pub proxy_chain: Vec<ProxyHopInfo>,
     pub upstream_proxy: SavedUpstreamProxyPolicy,
     pub created_at: String,
@@ -487,6 +687,8 @@ pub struct ConnectionInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_forwarding_socket: Option<String>,
     pub legacy_ssh_compatibility: bool,
+    #[serde(default)]
+    pub ssh_algorithms: SshAlgorithmPreferences,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_connect_command: Option<String>,
 }
@@ -569,6 +771,7 @@ impl From<&SavedConnection> for ConnectionInfo {
             id: conn.id.clone(),
             name: conn.name.clone(),
             group: conn.group.clone(),
+            notes: conn.notes.clone(),
             host: conn.host.clone(),
             port: conn.port,
             username: conn.username.clone(),
@@ -577,6 +780,15 @@ impl From<&SavedConnection> for ConnectionInfo {
             cert_path: conn.auth.cert_path().map(ToOwned::to_owned),
             managed_key_id: conn.auth.managed_key_id().map(ToOwned::to_owned),
             managed_key_name: None,
+            gssapi_authentication: conn.auth.gssapi_options().is_some(),
+            gssapi_server_identity: conn
+                .auth
+                .gssapi_options()
+                .and_then(|(identity, _)| identity.map(ToOwned::to_owned)),
+            gssapi_delegate_credentials: conn
+                .auth
+                .gssapi_options()
+                .is_some_and(|(_, delegate)| delegate),
             proxy_chain: conn.proxy_chain.iter().map(ProxyHopInfo::from).collect(),
             upstream_proxy: conn.upstream_proxy.clone(),
             created_at: conn.created_at.to_rfc3339(),
@@ -589,6 +801,7 @@ impl From<&SavedConnection> for ConnectionInfo {
             identity_agent: conn.options.identity_agent.clone(),
             agent_forwarding_socket: conn.options.agent_forwarding_socket.clone(),
             legacy_ssh_compatibility: conn.options.legacy_ssh_compatibility,
+            ssh_algorithms: conn.options.ssh_algorithms.clone(),
             post_connect_command: conn.post_connect_command().map(ToOwned::to_owned),
         }
     }
@@ -616,6 +829,9 @@ pub struct SerialProfile {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// Free-form user metadata. UI copy warns against storing credentials here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -628,6 +844,11 @@ pub struct SerialProfile {
     pub stop_bits: u8,
     pub parity: SerialParity,
     pub flow_control: SerialFlowControl,
+    #[serde(
+        default,
+        skip_serializing_if = "ConnectionTerminalOptions::inherits_application_defaults"
+    )]
+    pub terminal: ConnectionTerminalOptions,
     #[serde(default, skip_serializing_if = "is_false")]
     pub connect_on_open: bool,
     pub created_at: DateTime<Utc>,
@@ -641,6 +862,7 @@ pub struct SaveSerialProfileRequest {
     pub id: Option<String>,
     pub name: String,
     pub group: Option<String>,
+    pub notes: Option<String>,
     pub icon: Option<String>,
     pub color: Option<String>,
     pub icon_background_color: Option<String>,
@@ -650,6 +872,7 @@ pub struct SaveSerialProfileRequest {
     pub stop_bits: Option<u8>,
     pub parity: Option<SerialParity>,
     pub flow_control: Option<SerialFlowControl>,
+    pub terminal: ConnectionTerminalOptions,
     pub connect_on_open: Option<bool>,
 }
 
@@ -659,6 +882,9 @@ pub struct TelnetProfile {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// Free-form user metadata. UI copy warns against storing credentials here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -685,6 +911,7 @@ pub struct SaveTelnetProfileRequest {
     pub id: Option<String>,
     pub name: String,
     pub group: Option<String>,
+    pub notes: Option<String>,
     pub icon: Option<String>,
     pub color: Option<String>,
     pub icon_background_color: Option<String>,
@@ -727,6 +954,9 @@ pub struct MoshProfile {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// Free-form user metadata. UI copy warns against storing credentials here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -738,6 +968,9 @@ pub struct MoshProfile {
     pub ssh_port: u16,
     pub username: String,
     pub auth: SavedAuth,
+    /// The SSH bootstrap may traverse jump hosts; the Mosh UDP session remains direct.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proxy_chain: Vec<SavedProxyHop>,
     #[serde(default = "default_mosh_server_executable")]
     pub server_executable: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -754,6 +987,13 @@ pub struct MoshProfile {
     pub identity_agent: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub legacy_ssh_compatibility: bool,
+    #[serde(default)]
+    pub ssh_algorithms: SshAlgorithmPreferences,
+    #[serde(
+        default,
+        skip_serializing_if = "ConnectionTerminalOptions::inherits_application_defaults"
+    )]
+    pub terminal: ConnectionTerminalOptions,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -769,6 +1009,7 @@ pub struct SaveMoshProfileRequest {
     pub id: Option<String>,
     pub name: String,
     pub group: Option<String>,
+    pub notes: Option<String>,
     pub icon: Option<String>,
     pub color: Option<String>,
     pub icon_background_color: Option<String>,
@@ -776,6 +1017,7 @@ pub struct SaveMoshProfileRequest {
     pub ssh_port: u16,
     pub username: String,
     pub auth: SavedAuth,
+    pub proxy_chain: Vec<SavedProxyHop>,
     pub server_executable: String,
     pub udp_host_override: Option<String>,
     pub udp_port: MoshUdpPortSelection,
@@ -784,11 +1026,14 @@ pub struct SaveMoshProfileRequest {
     pub locale: Option<String>,
     pub identity_agent: Option<String>,
     pub legacy_ssh_compatibility: bool,
+    pub ssh_algorithms: SshAlgorithmPreferences,
+    pub terminal: ConnectionTerminalOptions,
 }
 
 /// Carries a newly saved Mosh auth secret directly into one bootstrap attempt.
 pub struct SavedMoshProfileRuntimeSecrets {
     pub auth: Option<SecretString>,
+    pub proxy_chain: Vec<Option<SecretString>>,
 }
 
 impl fmt::Debug for SavedMoshProfileRuntimeSecrets {
@@ -796,6 +1041,294 @@ impl fmt::Debug for SavedMoshProfileRuntimeSecrets {
         formatter
             .debug_struct("SavedMoshProfileRuntimeSecrets")
             .field("auth", &self.auth.as_ref().map(|_| "[redacted secret]"))
+            .field(
+                "proxy_chain",
+                &self
+                    .proxy_chain
+                    .iter()
+                    .map(|secret| secret.as_ref().map(|_| "[redacted secret]"))
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StandaloneSftpTransferMode {
+    #[default]
+    LocalRemote,
+    RemoteRemote,
+}
+
+impl StandaloneSftpTransferMode {
+    fn is_local_remote(value: &Self) -> bool {
+        *value == Self::LocalRemote
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct StandaloneSftpEndpoint {
+    pub host: String,
+    #[serde(default = "default_port")]
+    pub port: u16,
+    pub username: String,
+    pub auth: SavedAuth,
+    #[serde(
+        default = "default_ssh_connect_timeout_seconds",
+        skip_serializing_if = "is_default_ssh_connect_timeout_seconds"
+    )]
+    pub connect_timeout_seconds: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proxy_chain: Vec<SavedProxyHop>,
+    #[serde(default, skip_serializing_if = "SavedUpstreamProxyPolicy::is_use_global")]
+    pub upstream_proxy: SavedUpstreamProxyPolicy,
+    /// Manual ProxyCommand text stays in protected storage; metadata keeps only its reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_command: Option<SavedProxyCommand>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub legacy_ssh_compatibility: bool,
+    #[serde(default)]
+    pub ssh_algorithms: SshAlgorithmPreferences,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_remote_path: Option<String>,
+}
+
+impl fmt::Debug for StandaloneSftpEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Endpoint metadata may temporarily own plaintext credentials before keychain handoff.
+        formatter
+            .debug_struct("StandaloneSftpEndpoint")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("auth_type", &self.auth.auth_type())
+            .field("connect_timeout_seconds", &self.connect_timeout_seconds)
+            .field("proxy_chain_len", &self.proxy_chain.len())
+            .field("has_upstream_proxy", &!self.upstream_proxy.is_use_global())
+            .field("has_proxy_command", &self.proxy_command.is_some())
+            .field("identity_agent", &self.identity_agent)
+            .field("legacy_ssh_compatibility", &self.legacy_ssh_compatibility)
+            .field("initial_remote_path", &self.initial_remote_path)
+            .finish()
+    }
+}
+
+impl StandaloneSftpEndpoint {
+    pub fn new(
+        host: impl Into<String>,
+        port: u16,
+        username: impl Into<String>,
+        auth: SavedAuth,
+    ) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            username: username.into(),
+            auth,
+            connect_timeout_seconds: DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS,
+            proxy_chain: Vec::new(),
+            upstream_proxy: SavedUpstreamProxyPolicy::UseGlobal,
+            proxy_command: None,
+            identity_agent: None,
+            legacy_ssh_compatibility: false,
+            ssh_algorithms: SshAlgorithmPreferences::default(),
+            initial_remote_path: None,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.host.trim().is_empty() {
+            bail!("Standalone SFTP secondary host is required");
+        }
+        if self.port == 0 {
+            bail!("Standalone SFTP secondary port must be greater than zero");
+        }
+        if self.username.trim().is_empty() {
+            bail!("Standalone SFTP secondary username is required");
+        }
+        if self.connect_timeout_seconds == 0 {
+            bail!("Standalone SFTP secondary connect timeout must be greater than zero");
+        }
+        self.ssh_algorithms.validate()?;
+        for hop in &self.proxy_chain {
+            hop.ssh_algorithms.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StandaloneSftpProfile {
+    pub id: String,
+    #[serde(default = "default_config_version")]
+    pub version: u32,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// Free-form user metadata. UI copy warns against storing credentials here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_background_color: Option<String>,
+    pub host: String,
+    #[serde(default = "default_port")]
+    pub port: u16,
+    pub username: String,
+    pub auth: SavedAuth,
+    #[serde(
+        default = "default_ssh_connect_timeout_seconds",
+        skip_serializing_if = "is_default_ssh_connect_timeout_seconds"
+    )]
+    pub connect_timeout_seconds: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proxy_chain: Vec<SavedProxyHop>,
+    #[serde(default, skip_serializing_if = "SavedUpstreamProxyPolicy::is_use_global")]
+    pub upstream_proxy: SavedUpstreamProxyPolicy,
+    /// Manual ProxyCommand text stays in protected storage; metadata keeps only its reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_command: Option<SavedProxyCommand>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub legacy_ssh_compatibility: bool,
+    #[serde(default)]
+    pub ssh_algorithms: SshAlgorithmPreferences,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_remote_path: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "StandaloneSftpTransferMode::is_local_remote"
+    )]
+    pub transfer_mode: StandaloneSftpTransferMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary_endpoint: Option<StandaloneSftpEndpoint>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<DateTime<Utc>>,
+}
+
+pub struct SaveStandaloneSftpProfileRequest {
+    pub id: Option<String>,
+    pub name: String,
+    pub group: Option<String>,
+    pub notes: Option<String>,
+    pub icon: Option<String>,
+    pub color: Option<String>,
+    pub icon_background_color: Option<String>,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub auth: SavedAuth,
+    pub connect_timeout_seconds: u64,
+    pub proxy_chain: Vec<SavedProxyHop>,
+    pub upstream_proxy: SavedUpstreamProxyPolicy,
+    pub proxy_command: Option<SavedProxyCommand>,
+    pub identity_agent: Option<String>,
+    pub legacy_ssh_compatibility: bool,
+    pub ssh_algorithms: SshAlgorithmPreferences,
+    pub initial_remote_path: Option<String>,
+    pub transfer_mode: StandaloneSftpTransferMode,
+    pub secondary_endpoint: Option<StandaloneSftpEndpoint>,
+}
+
+impl fmt::Debug for SaveStandaloneSftpProfileRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Requests may own temporary credentials before the store moves them into keychain.
+        formatter
+            .debug_struct("SaveStandaloneSftpProfileRequest")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("group", &self.group)
+            .field("has_notes", &self.notes.is_some())
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("auth_type", &self.auth.auth_type())
+            .field("connect_timeout_seconds", &self.connect_timeout_seconds)
+            .field("proxy_chain_len", &self.proxy_chain.len())
+            .field("upstream_proxy", &self.upstream_proxy)
+            .field("has_proxy_command", &self.proxy_command.is_some())
+            .field("identity_agent", &self.identity_agent)
+            .field("legacy_ssh_compatibility", &self.legacy_ssh_compatibility)
+            .field("initial_remote_path", &self.initial_remote_path)
+            .field("transfer_mode", &self.transfer_mode)
+            .field("secondary_endpoint", &self.secondary_endpoint)
+            .finish()
+    }
+}
+
+/// Owns protected values for one endpoint during a standalone SFTP connection attempt.
+pub struct SavedStandaloneSftpEndpointRuntimeSecrets {
+    pub auth: Option<SecretString>,
+    pub proxy_chain: Vec<Option<SecretString>>,
+    pub upstream_proxy: Option<SecretString>,
+    pub proxy_command: Option<SecretString>,
+}
+
+impl fmt::Debug for SavedStandaloneSftpEndpointRuntimeSecrets {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SavedStandaloneSftpEndpointRuntimeSecrets")
+            .field("auth", &self.auth.as_ref().map(|_| "[redacted secret]"))
+            .field(
+                "proxy_chain",
+                &self
+                    .proxy_chain
+                    .iter()
+                    .map(|secret| secret.as_ref().map(|_| "[redacted secret]"))
+                    .collect::<Vec<_>>(),
+            )
+            .field(
+                "upstream_proxy",
+                &self.upstream_proxy.as_ref().map(|_| "[redacted secret]"),
+            )
+            .field(
+                "proxy_command",
+                &self.proxy_command.as_ref().map(|_| "[redacted secret]"),
+            )
+            .finish()
+    }
+}
+
+/// Owns protected values only for the lifetime of one standalone SFTP connection attempt.
+pub struct SavedStandaloneSftpProfileRuntimeSecrets {
+    pub auth: Option<SecretString>,
+    pub proxy_chain: Vec<Option<SecretString>>,
+    pub upstream_proxy: Option<SecretString>,
+    pub proxy_command: Option<SecretString>,
+    pub secondary_endpoint: Option<SavedStandaloneSftpEndpointRuntimeSecrets>,
+}
+
+impl fmt::Debug for SavedStandaloneSftpProfileRuntimeSecrets {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SavedStandaloneSftpProfileRuntimeSecrets")
+            .field("auth", &self.auth.as_ref().map(|_| "[redacted secret]"))
+            .field(
+                "proxy_chain",
+                &self
+                    .proxy_chain
+                    .iter()
+                    .map(|secret| secret.as_ref().map(|_| "[redacted secret]"))
+                    .collect::<Vec<_>>(),
+            )
+            .field(
+                "upstream_proxy",
+                &self.upstream_proxy.as_ref().map(|_| "[redacted secret]"),
+            )
+            .field(
+                "proxy_command",
+                &self.proxy_command.as_ref().map(|_| "[redacted secret]"),
+            )
+            .field("secondary_endpoint", &self.secondary_endpoint)
             .finish()
     }
 }
@@ -806,6 +1339,9 @@ pub struct RemoteDesktopProfile {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// Free-form user metadata. UI copy warns against storing credentials here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -840,6 +1376,7 @@ pub struct SaveRemoteDesktopProfileRequest {
     pub id: Option<String>,
     pub name: String,
     pub group: Option<String>,
+    pub notes: Option<String>,
     pub icon: Option<String>,
     pub color: Option<String>,
     pub icon_background_color: Option<String>,
@@ -866,6 +1403,7 @@ impl SerialProfile {
             id: Uuid::new_v4().to_string(),
             name: name.into(),
             group: None,
+            notes: None,
             icon: None,
             color: None,
             icon_background_color: None,
@@ -875,6 +1413,7 @@ impl SerialProfile {
             stop_bits: 1,
             parity: SerialParity::None,
             flow_control: SerialFlowControl::None,
+            terminal: ConnectionTerminalOptions::default(),
             connect_on_open: false,
             created_at: now,
             updated_at: now,
@@ -912,6 +1451,7 @@ impl TelnetProfile {
             id: Uuid::new_v4().to_string(),
             name: name.into(),
             group: None,
+            notes: None,
             icon: None,
             color: None,
             icon_background_color: None,
@@ -952,6 +1492,7 @@ impl MoshProfile {
             id: Uuid::new_v4().to_string(),
             name: name.into(),
             group: None,
+            notes: None,
             icon: None,
             color: None,
             icon_background_color: None,
@@ -959,6 +1500,7 @@ impl MoshProfile {
             ssh_port,
             username: username.into(),
             auth,
+            proxy_chain: Vec::new(),
             server_executable: default_mosh_server_executable(),
             udp_host_override: None,
             udp_port: MoshUdpPortSelection::Automatic,
@@ -967,6 +1509,8 @@ impl MoshProfile {
             locale: None,
             identity_agent: None,
             legacy_ssh_compatibility: false,
+            ssh_algorithms: SshAlgorithmPreferences::default(),
+            terminal: ConnectionTerminalOptions::default(),
             created_at: now,
             updated_at: now,
             last_used_at: None,
@@ -1009,6 +1553,81 @@ impl MoshProfile {
         }) {
             bail!("Mosh locale is invalid");
         }
+        self.ssh_algorithms.validate()?;
+        for hop in &self.proxy_chain {
+            hop.ssh_algorithms.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl StandaloneSftpProfile {
+    pub fn new(
+        name: impl Into<String>,
+        host: impl Into<String>,
+        port: u16,
+        username: impl Into<String>,
+        auth: SavedAuth,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::new_v4().to_string(),
+            version: CONFIG_VERSION,
+            name: name.into(),
+            group: None,
+            notes: None,
+            icon: None,
+            color: None,
+            icon_background_color: None,
+            host: host.into(),
+            port,
+            username: username.into(),
+            auth,
+            connect_timeout_seconds: DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS,
+            proxy_chain: Vec::new(),
+            upstream_proxy: SavedUpstreamProxyPolicy::UseGlobal,
+            proxy_command: None,
+            identity_agent: None,
+            legacy_ssh_compatibility: false,
+            ssh_algorithms: SshAlgorithmPreferences::default(),
+            initial_remote_path: None,
+            transfer_mode: StandaloneSftpTransferMode::LocalRemote,
+            secondary_endpoint: None,
+            created_at: now,
+            updated_at: now,
+            last_used_at: None,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.id.trim().is_empty() {
+            bail!("Standalone SFTP profile id is required");
+        }
+        if self.name.trim().is_empty() {
+            bail!("Standalone SFTP profile name is required");
+        }
+        if self.host.trim().is_empty() {
+            bail!("Standalone SFTP host is required");
+        }
+        if self.port == 0 {
+            bail!("Standalone SFTP port must be greater than zero");
+        }
+        if self.connect_timeout_seconds == 0 {
+            bail!("Standalone SFTP connect timeout must be greater than zero");
+        }
+        if self.username.trim().is_empty() {
+            bail!("Standalone SFTP username is required");
+        }
+        self.ssh_algorithms.validate()?;
+        for hop in &self.proxy_chain {
+            hop.ssh_algorithms.validate()?;
+        }
+        if self.transfer_mode == StandaloneSftpTransferMode::RemoteRemote {
+            self.secondary_endpoint
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Standalone SFTP secondary endpoint is required"))?
+                .validate()?;
+        }
         Ok(())
     }
 }
@@ -1025,6 +1644,7 @@ impl RemoteDesktopProfile {
             id: Uuid::new_v4().to_string(),
             name: name.into(),
             group: None,
+            notes: None,
             icon: None,
             color: None,
             icon_background_color: None,
@@ -1083,12 +1703,14 @@ pub struct SaveConnectionRequest {
     pub id: Option<String>,
     pub name: String,
     pub group: Option<String>,
+    pub notes: Option<String>,
     pub host: String,
     pub port: u16,
     pub username: String,
     pub auth: SavedAuth,
     pub proxy_chain: Vec<SavedProxyHop>,
     pub upstream_proxy: SavedUpstreamProxyPolicy,
+    pub proxy_command: Option<SavedProxyCommand>,
     pub color: Option<String>,
     pub icon_background_color: Option<String>,
     pub icon: Option<String>,
@@ -1098,6 +1720,7 @@ pub struct SaveConnectionRequest {
     pub identity_agent: Option<String>,
     pub agent_forwarding_socket: Option<String>,
     pub legacy_ssh_compatibility: bool,
+    pub ssh_algorithms: SshAlgorithmPreferences,
     pub dedicated_new_terminal_connection: bool,
     pub x11_forwarding: ConnectionX11ForwardingOptions,
     pub post_connect_command: Option<String>,
@@ -1111,6 +1734,7 @@ pub struct SavedConnectionRuntimeSecrets {
     pub auth: Option<SecretString>,
     pub proxy_chain: Vec<Option<SecretString>>,
     pub upstream_proxy: Option<SecretString>,
+    pub proxy_command: Option<SecretString>,
 }
 
 /// Identifies one typed secret-bearing slot without exposing its protected-store key.
@@ -1141,6 +1765,13 @@ impl fmt::Debug for SavedConnectionRuntimeSecrets {
                     .as_ref()
                     .map(|_| "[redacted secret]"),
             )
+            .field(
+                "proxy_command",
+                &self
+                    .proxy_command
+                    .as_ref()
+                    .map(|_| "[redacted secret]"),
+            )
             .finish()
     }
 }
@@ -1166,6 +1797,8 @@ pub struct ConnectionStoreData {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mosh_profiles: Vec<MoshProfile>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub standalone_sftp_profiles: Vec<StandaloneSftpProfile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remote_desktop_profiles: Vec<RemoteDesktopProfile>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub local_privilege_credentials: Vec<SavedPrivilegeCredential>,
@@ -1187,6 +1820,7 @@ impl Default for ConnectionStoreData {
             serial_profiles: Vec::new(),
             telnet_profiles: Vec::new(),
             mosh_profiles: Vec::new(),
+            standalone_sftp_profiles: Vec::new(),
             remote_desktop_profiles: Vec::new(),
             local_privilege_credentials: Vec::new(),
             pending_keychain_cleanup: Vec::new(),
@@ -1220,6 +1854,15 @@ pub struct MoshProfilesSyncSnapshot {
     pub exported_at: String,
     #[serde(default)]
     pub records: Vec<MoshProfile>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StandaloneSftpProfilesSyncSnapshot {
+    pub revision: String,
+    pub exported_at: String,
+    #[serde(default)]
+    pub records: Vec<StandaloneSftpProfile>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

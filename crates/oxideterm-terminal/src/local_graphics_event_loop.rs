@@ -18,7 +18,7 @@ use std::{
         mpsc::{self, Receiver, Sender, TryRecvError},
     },
     thread::JoinHandle,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use alacritty_terminal::{
@@ -61,6 +61,7 @@ pub(crate) enum LocalGraphicsMsg {
     SetEncoding(TerminalEncoding),
     SetOutputProcessor(Option<TerminalOutputProcessor>),
     SetOutputEventsEnabled(bool),
+    SetTriggerRules(Option<Arc<oxideterm_terminal_triggers::CompiledTriggerSet>>),
     StartModemTransfer {
         request: crate::TerminalModemTransferRequest,
         response_tx: Sender<Option<ModemTransfer>>,
@@ -73,6 +74,9 @@ pub(crate) enum LocalGraphicsMsg {
 pub(crate) struct LocalPtyReadReport {
     pub(crate) raw_bytes: usize,
     pub(crate) parsed_bytes: usize,
+    pub(crate) max_data_chunk_bytes: usize,
+    pub(crate) output_processing_duration: Duration,
+    pub(crate) terminal_lock_wait_duration: Duration,
     pub(crate) budget_exhausted: bool,
 }
 
@@ -152,6 +156,7 @@ where
             let encoding_detector = &mut state.encoding_detector;
             let output_decoder = &mut state.output_decoder;
             let output_events_enabled = state.output_events_enabled;
+            let trigger_stream = &mut state.trigger_stream;
             let privilege_prompt = &mut state.privilege_prompt;
             let shell_integration = &mut state.shell_integration;
             let alt_screen_active = &mut state.alt_screen_active;
@@ -164,6 +169,11 @@ where
                         }
                         let decoded = output_decoder.decode_to_utf8_bytes(&terminal_bytes);
                         parsed_bytes += terminal_bytes.len();
+                        if let Some(stream) = trigger_stream.as_mut() {
+                            stream.observe_bytes(decoded.as_ref(), |matched| {
+                                let _ = event_tx.send(TerminalEvent::TriggerMatched(matched));
+                            });
+                        }
                         for event in privilege_prompt.observe(decoded.as_ref()) {
                             let _ = event_tx.send(TerminalEvent::PrivilegePrompt(event));
                         }
@@ -349,6 +359,11 @@ where
                 LocalGraphicsMsg::SetOutputEventsEnabled(enabled) => {
                     state.output_events_enabled = enabled;
                 }
+                LocalGraphicsMsg::SetTriggerRules(rules) => {
+                    // The reader thread owns cross-chunk scanner state for this PTY.
+                    state.trigger_stream =
+                        rules.map(oxideterm_terminal_triggers::TerminalTriggerStream::new);
+                }
                 LocalGraphicsMsg::StartModemTransfer {
                     request,
                     response_tx,
@@ -396,6 +411,9 @@ where
         let mut unprocessed = 0;
         let mut processed = 0;
         let mut raw_bytes = 0;
+        let mut max_data_chunk_bytes = 0;
+        let mut output_processing_duration = Duration::ZERO;
+        let mut terminal_lock_wait_duration = Duration::ZERO;
         let mut graphics_changed = false;
         let mut budget_exhausted = false;
         let terminal_lease = self.terminal.lease();
@@ -419,13 +437,18 @@ where
                 Some(terminal) => terminal,
                 None => terminal.insert(match self.terminal.try_lock_unfair() {
                     None if unprocessed >= LOCAL_PTY_READ_BUFFER_BYTES => {
-                        self.terminal.lock_unfair()
+                        let lock_started = Instant::now();
+                        let terminal = self.terminal.lock_unfair();
+                        terminal_lock_wait_duration += lock_started.elapsed();
+                        terminal
                     }
                     None => continue,
                     Some(terminal) => terminal,
                 }),
             };
 
+            let chunk_bytes = unprocessed;
+            let processing_started = Instant::now();
             let (parsed_bytes, changed) = Self::advance_processed_output(
                 state,
                 terminal,
@@ -435,6 +458,8 @@ where
                 &self.event_tx,
                 &self.graphics_tx,
             );
+            output_processing_duration += processing_started.elapsed();
+            max_data_chunk_bytes = max_data_chunk_bytes.max(chunk_bytes);
             graphics_changed |= changed;
 
             processed += parsed_bytes;
@@ -460,6 +485,9 @@ where
         Ok(LocalPtyReadReport {
             raw_bytes,
             parsed_bytes: processed,
+            max_data_chunk_bytes,
+            output_processing_duration,
+            terminal_lock_wait_duration,
             budget_exhausted,
         })
     }
@@ -477,7 +505,10 @@ where
         let magic_tx = self.magic_tx.clone();
         let graphics_tx = self.graphics_tx.clone();
         let event_tx = self.event_tx.clone();
+        let lock_started = Instant::now();
         let mut terminal = self.terminal.lock_unfair();
+        let terminal_lock_wait_duration = lock_started.elapsed();
+        let processing_started = Instant::now();
         let (processed, graphics_changed) = Self::advance_guarded_bytes(
             state,
             &mut *terminal,
@@ -487,6 +518,7 @@ where
             &event_tx,
             &graphics_tx,
         );
+        let output_processing_duration = processing_started.elapsed();
         drop(terminal);
 
         if state.needs_write() {
@@ -500,6 +532,9 @@ where
         Ok(LocalPtyReadReport {
             raw_bytes,
             parsed_bytes: processed,
+            max_data_chunk_bytes: raw_bytes,
+            output_processing_duration,
+            terminal_lock_wait_duration,
             budget_exhausted: false,
         })
     }
@@ -768,6 +803,7 @@ struct LocalGraphicsState {
     magic_scan: MagicScanWindow,
     output_processor: Option<TerminalOutputProcessor>,
     output_events_enabled: bool,
+    trigger_stream: Option<oxideterm_terminal_triggers::TerminalTriggerStream>,
     output_decoder: TerminalOutputDecoder,
     privilege_prompt: TerminalPrivilegePromptStream,
     encoding_detector: EncodingMismatchDetector,
@@ -791,6 +827,7 @@ impl LocalGraphicsState {
             magic_scan: MagicScanWindow::default(),
             output_processor: None,
             output_events_enabled: false,
+            trigger_stream: None,
             output_decoder: TerminalOutputDecoder::new(encoding),
             privilege_prompt: TerminalPrivilegePromptStream::default(),
             encoding_detector: EncodingMismatchDetector::new(encoding),

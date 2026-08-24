@@ -2072,20 +2072,14 @@ fn define_explicit_approval_tool<T: JsonSchema>(
 }
 
 fn schema_object<T: JsonSchema>() -> JsonObject {
-    let mut object = serde_json::to_value(schema_for!(T))
+    let mut schema = serde_json::to_value(schema_for!(T))
         .ok()
         .and_then(|value| value.as_object().cloned())
         .unwrap_or_default();
-    // MCP spec requires tool inputSchema to be an object-typed schema.
-    // schemars emits internally-tagged enums (e.g. RecordingsControlArgs,
-    // StartTransferArgs) as a top-level `oneOf` without a `type` field,
-    // which strict MCP clients (Claude Code) reject, failing the whole
-    // tools/list. Backfill `type: object` so tagged-enum tool args still
-    // validate as objects.
-    object
-        .entry("type".to_string())
-        .or_insert_with(|| serde_json::Value::String("object".to_string()));
-    object
+
+    // MCP tool arguments cross the protocol as JSON objects, even when the schema uses oneOf.
+    schema.insert("type".to_owned(), Value::String("object".to_owned()));
+    schema
 }
 
 fn parse_arguments<T: DeserializeOwned>(arguments: JsonObject) -> Result<T, Box<CallToolResult>> {
@@ -2611,4 +2605,39 @@ fn tool_error(code: &'static str, message: impl Into<String>) -> CallToolResult 
 
 fn unauthorized_error() -> McpError {
     McpError::invalid_request("Unauthorized MCP client", None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_tool_input_schemas_have_object_roots() {
+        // MCP tool arguments must expose an object at the schema root, including tagged enums.
+        for definition in tool_definitions() {
+            assert_eq!(
+                definition
+                    .tool
+                    .input_schema
+                    .get("type")
+                    .and_then(Value::as_str),
+                Some("object"),
+                "tool {} must expose an object input schema",
+                definition.tool.name
+            );
+        }
+
+        for schema in [
+            schema_object::<RecordingsControlArgs>(),
+            schema_object::<StartTransferArgs>(),
+        ] {
+            assert!(
+                schema
+                    .get("oneOf")
+                    .and_then(Value::as_array)
+                    .is_some_and(|variants| !variants.is_empty()),
+                "tagged enum alternatives must be preserved"
+            );
+        }
+    }
 }

@@ -66,40 +66,87 @@ impl WorkspaceApp {
                     }
                 }
             }
-            if let Err(error) = validate_proxy_chain_form(form) {
-                form.error = Some(error);
-                cx.notify();
-                return None;
-            }
-            let missing_credentials_message =
-                this.i18n.t("sessions.saved_next_hop.missing_credentials");
-            let saved_proxy_hop_auth = match saved_proxy_hop_auth_from_store(
-                &this.connection_store,
-                form,
-                &missing_credentials_message,
-            ) {
-                Ok(saved_auth) => saved_auth,
-                Err(error) => {
+            let saved_proxy_hop_auth = if form.proxy_command_enabled {
+                Vec::new()
+            } else {
+                if let Err(error) = validate_proxy_chain_form(form) {
                     form.error = Some(error);
                     cx.notify();
                     return None;
                 }
-            };
-            // Resolve every fallible proxy input before moving any form-owned secret.
-            let upstream_proxy = match upstream_proxy_config_from_form(
-                &this.connection_store,
-                this.settings_store.settings(),
-                form,
-                secret_handoff,
-            ) {
-                Ok(upstream_proxy) => upstream_proxy,
-                Err(error) => {
-                    form.error = Some(error.to_string());
-                    cx.notify();
-                    return None;
+                let missing_credentials_message =
+                    this.i18n.t("sessions.saved_next_hop.missing_credentials");
+                match saved_proxy_hop_auth_from_store(
+                    &this.connection_store,
+                    form,
+                    &missing_credentials_message,
+                ) {
+                    Ok(saved_auth) => saved_auth,
+                    Err(error) => {
+                        form.error = Some(error);
+                        cx.notify();
+                        return None;
+                    }
                 }
             };
-            let auth = match form.auth_tab {
+            // Resolve every fallible route input before moving authentication drafts.
+            let proxy_command = if form.proxy_command_enabled {
+                let command = if form.proxy_command.trim().is_empty() {
+                    let saved_command = SavedProxyCommand {
+                        keychain_id: form.proxy_command_keychain_id.clone(),
+                        plaintext_command: None,
+                    };
+                    match this
+                        .connection_store
+                        .get_saved_proxy_command(&saved_command)
+                    {
+                        Ok(command) => command,
+                        Err(error) => {
+                            form.error = Some(error.to_string());
+                            cx.notify();
+                            return None;
+                        }
+                    }
+                } else {
+                    SecretString::from(secret_handoff.zeroizing(&mut form.proxy_command))
+                };
+                let proxy_alias = if form.name.trim().is_empty() {
+                    host.as_str()
+                } else {
+                    form.name.trim()
+                };
+                Some(proxy_command_from_value(
+                    this.settings_store
+                        .settings()
+                        .ssh_config
+                        .allow_proxy_command,
+                    command,
+                    proxy_alias,
+                    &host,
+                    Some(&username),
+                    port,
+                ))
+            } else {
+                None
+            };
+            let upstream_proxy = if proxy_command.is_some() {
+                None
+            } else {
+                match upstream_proxy_config_from_form(
+                    &this.connection_store,
+                    this.settings_store.settings(),
+                    form,
+                    secret_handoff,
+                ) {
+                    Ok(upstream_proxy) => upstream_proxy,
+                    Err(error) => {
+                        form.error = Some(error.to_string());
+                        cx.notify();
+                        return None;
+                    }
+                }
+            };
+            let fallback_auth = match form.auth_tab {
                 SshAuthTab::Password => {
                     AuthMethod::password_secret(secret_handoff.zeroizing(&mut form.password))
                 }
@@ -126,7 +173,21 @@ impl WorkspaceApp {
                 ),
                 SshAuthTab::TwoFactor => AuthMethod::KeyboardInteractive,
             };
-            let proxy_chain = proxy_chain_from_form(form, secret_handoff, saved_proxy_hop_auth);
+            let auth = if form.gssapi_enabled {
+                AuthMethod::kerberos_preferred(
+                    fallback_auth,
+                    (!form.gssapi_server_identity.trim().is_empty())
+                        .then(|| form.gssapi_server_identity.trim().to_string()),
+                    form.gssapi_delegate_credentials,
+                )
+            } else {
+                fallback_auth
+            };
+            let proxy_chain = if proxy_command.is_some() {
+                None
+            } else {
+                proxy_chain_from_form(form, secret_handoff, saved_proxy_hop_auth)
+            };
             let config = SshConfig {
                 host: host.clone(),
                 port: port.unwrap_or(22),
@@ -137,9 +198,11 @@ impl WorkspaceApp {
                 identity_agent: identity_agent_from_form(&form.identity_agent),
                 agent_forwarding_socket: form.agent_forwarding_socket.clone(),
                 legacy_ssh_compatibility: form.legacy_ssh_compatibility,
+                ssh_algorithms: form.ssh_algorithms.clone(),
                 x11_forwarding: x11_forward_policy(form.x11_forwarding),
                 proxy_chain,
                 upstream_proxy,
+                proxy_command,
                 strict_host_key_checking: true,
                 post_connect_command: (!form.post_connect_command.trim().is_empty())
                     .then(|| form.post_connect_command.trim().to_string()),
@@ -167,11 +230,15 @@ impl WorkspaceApp {
                     upstream_proxy,
                     title,
                     intent,
+                    host,
+                    port,
                     status,
                 } => {
                     // Restore the only upstream-proxy value before continuing the flow.
                     config.upstream_proxy = upstream_proxy;
-                    self.handle_ssh_preflight_result(config, title, intent, status, window, cx)
+                    self.handle_ssh_preflight_result(
+                        config, title, intent, host, port, status, window, cx,
+                    )
                 }
                 SshConnectionWorkerResult::SessionTreePreflight {
                     generation,
@@ -220,6 +287,121 @@ impl WorkspaceApp {
                     }
                     cx.notify();
                 }
+                SshConnectionWorkerResult::StandaloneSftpConnected {
+                    endpoint_id,
+                    saved_profile_id,
+                    title,
+                    initial_remote_path,
+                    consumer,
+                    result,
+                } => match result {
+                    Ok(handle) => {
+                        let connection_id = handle.connection_id().to_string();
+                        self.standalone_sftp_sessions.insert(
+                            endpoint_id.clone(),
+                            crate::workspace::sftp::StandaloneSftpRuntime {
+                                connection_id,
+                                consumer,
+                                handle,
+                                title: title.clone(),
+                            },
+                        );
+                        if let Some(profile_id) = saved_profile_id {
+                            let _ = self
+                                .connection_store
+                                .mark_standalone_sftp_profile_used(&profile_id);
+                        }
+                        self.session_manager.update(cx, |session_manager, cx| {
+                            session_manager.set_status(None, cx);
+                        });
+                        self.update_connection_form_state(cx, ConnectionFormState::clear);
+                        self.close_new_connection_select(cx);
+                        self.open_standalone_sftp_tab_surface(
+                            endpoint_id,
+                            title,
+                            initial_remote_path,
+                            cx,
+                        );
+                    }
+                    Err(error) => {
+                        let reported_to_form =
+                            self.connection_flow.update(cx, |connection_flow, cx| {
+                                connection_flow.set_form_feedback(
+                                    Some(false),
+                                    Some(error.clone()),
+                                    cx,
+                                )
+                            });
+                        if !reported_to_form {
+                            self.session_manager.update(cx, |session_manager, cx| {
+                                session_manager.set_status(Some(error), cx);
+                            });
+                        }
+                    }
+                },
+                SshConnectionWorkerResult::StandaloneSftpPairConnected {
+                    saved_profile_id,
+                    title,
+                    primary_endpoint_id,
+                    secondary_endpoint_id,
+                    primary_initial_remote_path,
+                    secondary_initial_remote_path,
+                    primary_consumer,
+                    secondary_consumer,
+                    result,
+                } => match result {
+                    Ok((primary_handle, secondary_handle)) => {
+                        self.standalone_sftp_sessions.insert(
+                            primary_endpoint_id.clone(),
+                            crate::workspace::sftp::StandaloneSftpRuntime {
+                                connection_id: primary_handle.connection_id().to_string(),
+                                consumer: primary_consumer,
+                                handle: primary_handle,
+                                title: title.clone(),
+                            },
+                        );
+                        self.standalone_sftp_sessions.insert(
+                            secondary_endpoint_id.clone(),
+                            crate::workspace::sftp::StandaloneSftpRuntime {
+                                connection_id: secondary_handle.connection_id().to_string(),
+                                consumer: secondary_consumer,
+                                handle: secondary_handle,
+                                title: title.clone(),
+                            },
+                        );
+                        let _ = self
+                            .connection_store
+                            .mark_standalone_sftp_profile_used(&saved_profile_id);
+                        self.session_manager.update(cx, |session_manager, cx| {
+                            session_manager.set_status(None, cx);
+                        });
+                        self.update_connection_form_state(cx, ConnectionFormState::clear);
+                        self.close_new_connection_select(cx);
+                        self.open_standalone_sftp_pair_tab_surface(
+                            primary_endpoint_id,
+                            secondary_endpoint_id,
+                            title,
+                            primary_initial_remote_path,
+                            secondary_initial_remote_path,
+                            cx,
+                        );
+                    }
+                    Err(error) => {
+                        let reported_to_form =
+                            self.connection_flow.update(cx, |connection_flow, cx| {
+                                connection_flow.set_form_feedback(
+                                    Some(false),
+                                    Some(error.clone()),
+                                    cx,
+                                )
+                            });
+                        if !reported_to_form {
+                            self.session_manager.update(cx, |session_manager, cx| {
+                                session_manager.set_status(Some(error), cx);
+                            });
+                        }
+                    }
+                },
                 SshConnectionWorkerResult::KeyboardInteractivePrompt {
                     request,
                     response_tx,
@@ -235,6 +417,8 @@ impl WorkspaceApp {
         config: SshConfig,
         title: String,
         intent: SshConnectionIntent,
+        host: String,
+        port: u16,
         status: HostKeyStatus,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -252,8 +436,6 @@ impl WorkspaceApp {
             }
             HostKeyStatus::Unknown { .. } | HostKeyStatus::Changed { .. } => {
                 self.prepare_modal_interaction_boundary(cx);
-                let host = config.host.clone();
-                let port = config.port;
                 let challenge = HostKeyChallenge {
                     presence: oxideterm_gpui_ui::motion::ExitPresence::visible(),
                     config,
@@ -271,6 +453,9 @@ impl WorkspaceApp {
                 cx.notify();
             }
             HostKeyStatus::Error { message } => {
+                if let Some(token) = intent.standalone_sftp_pair_launch_token() {
+                    self.pending_standalone_sftp_pair_launches.remove(token);
+                }
                 self.fail_public_mcp_mosh_open_for_intent(&intent, message.clone());
                 let reported_to_form = self.connection_flow.update(cx, |connection_flow, cx| {
                     connection_flow.set_form_feedback(None, Some(message.clone()), cx)
@@ -713,7 +898,7 @@ impl WorkspaceApp {
             SshConnectionIntent::ConnectSaved(id) => {
                 if let Some(connection_options) = self.connection_store.get(&id).map(|connection| {
                     (
-                        connection.options.terminal,
+                        connection.options.terminal.clone(),
                         connection.options.dedicated_new_terminal_connection,
                     )
                 }) && let Some(node) = self.ssh_nodes.get_mut(&target_node_id)
@@ -743,8 +928,11 @@ impl WorkspaceApp {
                 );
             }
             SshConnectionIntent::Test
+            | SshConnectionIntent::TestStandaloneSftp
             | SshConnectionIntent::DrillDown { .. }
-            | SshConnectionIntent::Mosh(_) => {}
+            | SshConnectionIntent::Mosh(_)
+            | SshConnectionIntent::StandaloneSftp { .. }
+            | SshConnectionIntent::StandaloneSftpSecondary { .. } => {}
         }
     }
 
@@ -1108,9 +1296,21 @@ impl WorkspaceApp {
                     },
                     task_runtime: self.workspace_runtime.read(cx).task_runtime(),
                 };
-                match self.create_mosh_terminal_tab(terminal_config, title, window, cx) {
+                match self.create_mosh_terminal_tab(
+                    terminal_config,
+                    options.terminal,
+                    title,
+                    window,
+                    cx,
+                ) {
                     Ok(session_id) => {
                         if let Some(saved_profile_id) = options.saved_profile_id {
+                            self.register_terminal_saved_connection(
+                                session_id,
+                                oxideterm_terminal_triggers::SavedConnectionKind::Mosh,
+                                saved_profile_id.clone(),
+                                cx,
+                            );
                             let _ = self
                                 .connection_store
                                 .mark_mosh_profile_used(&saved_profile_id);
@@ -1133,6 +1333,224 @@ impl WorkspaceApp {
                         });
                     }
                 }
+            }
+            SshConnectionIntent::StandaloneSftp {
+                saved_profile_id,
+                initial_remote_path,
+                pair_launch_token,
+            } => {
+                self.connection_flow.update(cx, |connection_flow, cx| {
+                    connection_flow.clear_host_key_challenge(cx);
+                });
+                if let Some(pair_launch_token) = pair_launch_token {
+                    let Some(secondary_config) = self
+                        .pending_standalone_sftp_pair_launches
+                        .get_mut(&pair_launch_token)
+                        .and_then(|launch| {
+                            launch.primary_config = Some(config);
+                            launch.secondary_config.take()
+                        })
+                    else {
+                        self.pending_standalone_sftp_pair_launches
+                            .remove(&pair_launch_token);
+                        let message = self.i18n.t("sftp.standalone.missing_credentials");
+                        self.connection_flow.update(cx, |connection_flow, cx| {
+                            connection_flow.set_form_feedback(None, Some(message), cx)
+                        });
+                        cx.notify();
+                        return;
+                    };
+                    self.start_ssh_preflight(
+                        secondary_config,
+                        title,
+                        SshConnectionIntent::StandaloneSftpSecondary { pair_launch_token },
+                        cx,
+                    );
+                    return;
+                }
+                let endpoint_id = saved_profile_id
+                    .clone()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                if self.standalone_sftp_sessions.contains_key(&endpoint_id) {
+                    self.update_connection_form_state(cx, ConnectionFormState::clear);
+                    self.close_new_connection_select(cx);
+                    self.open_standalone_sftp_tab_surface(
+                        endpoint_id,
+                        title,
+                        initial_remote_path,
+                        cx,
+                    );
+                    return;
+                }
+
+                let consumer = ConnectionConsumer::Sftp(format!("standalone-tab:{endpoint_id}"));
+                let worker_registry = self.ssh_registry.clone();
+                let tx = self.ssh_worker_sender(cx);
+                let prompt_handler = Arc::new(NativeSshPromptHandler::new(tx.clone()));
+                let managed_key_resolver = managed_key_resolver_from_store(&self.connection_store);
+                let worker_consumer = consumer.clone();
+                let worker_endpoint_id = endpoint_id.clone();
+                let worker_title = title.clone();
+                let worker_saved_profile_id = saved_profile_id.clone();
+                let worker_initial_remote_path = initial_remote_path.clone();
+                self.forwarding_runtime.spawn(async move {
+                    let client = SshTransportClient::new(config)
+                        .with_prompt_handler(prompt_handler)
+                        .with_managed_key_resolver(managed_key_resolver);
+                    let result = match client
+                        .connect_dedicated_node_with_registry(
+                            worker_registry.clone(),
+                            worker_consumer.clone(),
+                        )
+                        .await
+                    {
+                        Ok(handle) => match handle.acquire_sftp().await {
+                            Ok(_) => Ok(handle),
+                            Err(error) => {
+                                worker_registry.release(handle.connection_id(), &worker_consumer);
+                                Err(error.to_string())
+                            }
+                        },
+                        Err(error) => Err(error.to_string()),
+                    };
+                    let connected_id = result
+                        .as_ref()
+                        .ok()
+                        .map(|handle| handle.connection_id().to_string());
+                    if tx
+                        .send(SshConnectionWorkerResult::StandaloneSftpConnected {
+                            endpoint_id: worker_endpoint_id,
+                            saved_profile_id: worker_saved_profile_id,
+                            title: worker_title,
+                            initial_remote_path: worker_initial_remote_path,
+                            consumer: worker_consumer.clone(),
+                            result,
+                        })
+                        .is_err()
+                        && let Some(connection_id) = connected_id
+                    {
+                        // Failed delivery means no workspace runtime adopted the tab consumer.
+                        worker_registry.release(&connection_id, &worker_consumer);
+                    }
+                });
+            }
+            SshConnectionIntent::StandaloneSftpSecondary { pair_launch_token } => {
+                self.connection_flow.update(cx, |connection_flow, cx| {
+                    connection_flow.clear_host_key_challenge(cx);
+                });
+                let Some(mut launch) = self
+                    .pending_standalone_sftp_pair_launches
+                    .remove(&pair_launch_token)
+                else {
+                    return;
+                };
+                let Some(primary_config) = launch.primary_config.take() else {
+                    return;
+                };
+                let primary_endpoint_id = launch.saved_profile_id.clone();
+                let secondary_endpoint_id = format!("{}:secondary", launch.saved_profile_id);
+                let primary_consumer = ConnectionConsumer::Sftp(format!(
+                    "standalone-tab:{primary_endpoint_id}:primary"
+                ));
+                let secondary_consumer = ConnectionConsumer::Sftp(format!(
+                    "standalone-tab:{primary_endpoint_id}:secondary"
+                ));
+                let worker_registry = self.ssh_registry.clone();
+                let tx = self.ssh_worker_sender(cx);
+                let prompt_handler = Arc::new(NativeSshPromptHandler::new(tx.clone()));
+                let managed_key_resolver = managed_key_resolver_from_store(&self.connection_store);
+                let worker_primary_consumer = primary_consumer.clone();
+                let worker_secondary_consumer = secondary_consumer.clone();
+                self.forwarding_runtime.spawn(async move {
+                    let primary_client = SshTransportClient::new(primary_config)
+                        .with_prompt_handler(prompt_handler.clone())
+                        .with_managed_key_resolver(managed_key_resolver.clone());
+                    let result = match primary_client
+                        .connect_dedicated_node_with_registry(
+                            worker_registry.clone(),
+                            worker_primary_consumer.clone(),
+                        )
+                        .await
+                    {
+                        Ok(primary_handle) => match primary_handle.acquire_sftp().await {
+                            Ok(_) => {
+                                let secondary_client = SshTransportClient::new(config)
+                                    .with_prompt_handler(prompt_handler)
+                                    .with_managed_key_resolver(managed_key_resolver);
+                                match secondary_client
+                                    .connect_dedicated_node_with_registry(
+                                        worker_registry.clone(),
+                                        worker_secondary_consumer.clone(),
+                                    )
+                                    .await
+                                {
+                                    Ok(secondary_handle) => {
+                                        match secondary_handle.acquire_sftp().await {
+                                            Ok(_) => Ok((primary_handle, secondary_handle)),
+                                            Err(error) => {
+                                                worker_registry.release(
+                                                    secondary_handle.connection_id(),
+                                                    &worker_secondary_consumer,
+                                                );
+                                                worker_registry.release(
+                                                    primary_handle.connection_id(),
+                                                    &worker_primary_consumer,
+                                                );
+                                                Err(error.to_string())
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        worker_registry.release(
+                                            primary_handle.connection_id(),
+                                            &worker_primary_consumer,
+                                        );
+                                        Err(error.to_string())
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                worker_registry.release(
+                                    primary_handle.connection_id(),
+                                    &worker_primary_consumer,
+                                );
+                                Err(error.to_string())
+                            }
+                        },
+                        Err(error) => Err(error.to_string()),
+                    };
+                    let connected_ids =
+                        result
+                            .as_ref()
+                            .ok()
+                            .map(|(primary_handle, secondary_handle)| {
+                                (
+                                    primary_handle.connection_id().to_string(),
+                                    secondary_handle.connection_id().to_string(),
+                                )
+                            });
+                    if tx
+                        .send(SshConnectionWorkerResult::StandaloneSftpPairConnected {
+                            saved_profile_id: launch.saved_profile_id,
+                            title: launch.title,
+                            primary_endpoint_id,
+                            secondary_endpoint_id,
+                            primary_initial_remote_path: launch.primary_initial_remote_path,
+                            secondary_initial_remote_path: launch.secondary_initial_remote_path,
+                            primary_consumer: worker_primary_consumer.clone(),
+                            secondary_consumer: worker_secondary_consumer.clone(),
+                            result,
+                        })
+                        .is_err()
+                        && let Some((primary_connection_id, secondary_connection_id)) =
+                            connected_ids
+                    {
+                        // Failed delivery leaves no workspace owner for either endpoint consumer.
+                        worker_registry.release(&primary_connection_id, &worker_primary_consumer);
+                        worker_registry
+                            .release(&secondary_connection_id, &worker_secondary_consumer);
+                    }
+                });
             }
             SshConnectionIntent::DrillDown {
                 parent_id,
@@ -1193,7 +1611,43 @@ impl WorkspaceApp {
                 self.persist_session_tree_snapshot();
             }
             SshConnectionIntent::Test => self.start_ssh_test(config, cx),
+            SshConnectionIntent::TestStandaloneSftp => self.start_standalone_sftp_test(config, cx),
         }
+    }
+
+    fn start_standalone_sftp_test(&mut self, config: SshConfig, cx: &mut Context<Self>) {
+        let message = self.i18n.t("ssh.form.test_running");
+        self.connection_flow.update(cx, |connection_flow, cx| {
+            connection_flow.set_form_feedback(Some(true), Some(message), cx)
+        });
+        let tx = self.ssh_worker_sender(cx);
+        let prompt_handler = Arc::new(NativeSshPromptHandler::new(tx.clone()));
+        let managed_key_resolver = managed_key_resolver_from_store(&self.connection_store);
+        let registry = self.ssh_registry.clone();
+        let consumer =
+            ConnectionConsumer::Sftp(format!("standalone-test:{}", uuid::Uuid::new_v4()));
+        self.forwarding_runtime.spawn(async move {
+            let client = SshTransportClient::new(config)
+                .with_prompt_handler(prompt_handler)
+                .with_managed_key_resolver(managed_key_resolver);
+            let result = match client
+                .connect_dedicated_node_with_registry(registry.clone(), consumer.clone())
+                .await
+            {
+                Ok(handle) => {
+                    let result = handle
+                        .acquire_sftp()
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string());
+                    registry.release(handle.connection_id(), &consumer);
+                    result
+                }
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = tx.send(SshConnectionWorkerResult::Test { result });
+        });
+        cx.notify();
     }
 
     pub(in crate::workspace) fn start_ssh_test(

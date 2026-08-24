@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use gpui::SharedString;
 use oxideterm_terminal::{TerminalCell, TerminalColor, TerminalSnapshot};
 
 #[derive(Clone, Debug)]
@@ -12,31 +13,39 @@ struct LinkText {
     boundaries: Vec<usize>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct TerminalLinkRange {
     pub(crate) row: usize,
     pub(crate) start_col: usize,
     pub(crate) end_col: usize,
-    pub(crate) target: String,
+    // Cached visible link ranges are rebuilt every frame, so targets must remain cheap to clone.
+    pub(crate) target: SharedString,
     pub(crate) kind: TerminalLinkKind,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum TerminalLinkKind {
     Url,
     Path,
 }
 
-pub(crate) fn link_ranges_contain(ranges: &[TerminalLinkRange], row: usize, col: usize) -> bool {
+pub(crate) fn link_should_be_styled(
+    ranges: &[TerminalLinkRange],
+    hovered: Option<&TerminalLinkRange>,
+    row: usize,
+    col: usize,
+) -> bool {
     ranges
         .iter()
-        .any(|range| range.row == row && col >= range.start_col && col < range.end_col)
+        .find(|range| range.row == row && col >= range.start_col && col < range.end_col)
+        .is_some_and(|range| range.kind == TerminalLinkKind::Url || hovered == Some(range))
 }
 
 pub(crate) fn is_link_stylable_cell(cell: &TerminalCell) -> bool {
     cell.bg == TerminalColor::rgb(0x0d, 0x0f, 0x12)
 }
 
+#[cfg(test)]
 pub(crate) fn display_link_ranges_with_path_detection(
     snapshot: &TerminalSnapshot,
     detect_file_paths: bool,
@@ -91,10 +100,13 @@ pub(super) fn detect_link_ranges_for_rows_with_path_detection(
             continue;
         };
         let link_text = link_text_for_row(row);
+        let row_links_start = links.len();
         links.extend(detect_osc8_ranges(row_index, row));
-        links.extend(detect_url_ranges(row_index, &link_text, &links));
+        let url_ranges = detect_url_ranges(row_index, &link_text, &links[row_links_start..]);
+        links.extend(url_ranges);
         if detect_file_paths {
-            links.extend(detect_path_ranges(row_index, &link_text, &links));
+            let path_ranges = detect_path_ranges(row_index, &link_text, &links[row_links_start..]);
+            links.extend(path_ranges);
         }
     }
     links
@@ -116,7 +128,7 @@ fn link_text_for_row(row: &oxideterm_terminal::TerminalRow) -> LinkText {
         text.push(cell.ch);
         last_end_col = col + if cell.wide { 2 } else { 1 };
 
-        for ch in cell.zerowidth.chars() {
+        for ch in cell.zerowidth().chars() {
             boundaries.push(col);
             text.push(ch);
         }
@@ -145,16 +157,14 @@ pub(crate) fn detect_osc8_ranges(
     let mut ranges = Vec::new();
     let mut col = 0;
     while col < terminal_row.cells.len() {
-        let Some(uri) = terminal_row.cells[col].hyperlink.as_deref() else {
+        let Some(uri) = terminal_row.cells[col].hyperlink() else {
             col += 1;
             continue;
         };
 
         let start_col = col;
         col += 1;
-        while col < terminal_row.cells.len()
-            && terminal_row.cells[col].hyperlink.as_deref() == Some(uri)
-        {
+        while col < terminal_row.cells.len() && terminal_row.cells[col].hyperlink() == Some(uri) {
             col += 1;
         }
 
@@ -162,7 +172,7 @@ pub(crate) fn detect_osc8_ranges(
             row,
             start_col,
             end_col: col,
-            target: uri.to_string(),
+            target: uri.into(),
             kind: terminal_link_kind_for_target(uri),
         });
     }
@@ -182,15 +192,20 @@ fn detect_url_ranges(
     link_text: &LinkText,
     existing_links: &[TerminalLinkRange],
 ) -> Vec<TerminalLinkRange> {
+    const HTTPS_PREFIX: [char; 8] = ['h', 't', 't', 'p', 's', ':', '/', '/'];
+    const HTTP_PREFIX: [char; 7] = ['h', 't', 't', 'p', ':', '/', '/'];
+
     let chars: Vec<char> = link_text.text.chars().collect();
     let mut ranges = Vec::new();
     let mut index = 0;
     while index < chars.len() {
-        let rest = chars[index..].iter().collect::<String>();
-        let Some(prefix_len) = ["https://", "http://"]
-            .iter()
-            .find_map(|prefix| rest.starts_with(prefix).then_some(prefix.chars().count()))
-        else {
+        // Match directly on the character slice so a non-link prefix never allocates or copies
+        // the remainder of a long terminal row.
+        let prefix_len = if chars[index..].starts_with(&HTTPS_PREFIX) {
+            HTTPS_PREFIX.len()
+        } else if chars[index..].starts_with(&HTTP_PREFIX) {
+            HTTP_PREFIX.len()
+        } else {
             index += 1;
             continue;
         };
@@ -214,7 +229,7 @@ fn detect_url_ranges(
                 row,
                 start_col,
                 end_col,
-                target: chars[start..end].iter().collect(),
+                target: chars[start..end].iter().collect::<String>().into(),
                 kind: TerminalLinkKind::Url,
             });
         }
@@ -256,7 +271,7 @@ fn detect_path_ranges(
                 row,
                 start_col,
                 end_col,
-                target: token,
+                target: token.into(),
                 kind: TerminalLinkKind::Path,
             });
         }

@@ -1,4 +1,9 @@
+use super::highlight::{semantic_class_label, semantic_context_label};
 use super::*;
+use oxideterm_terminal_triggers::{
+    LocalProcessSpec, TerminalTriggerAction, TerminalTriggerDispatch, TerminalTriggerMatchMode,
+    TerminalTriggerScope,
+};
 
 pub(in crate::workspace) const SETTINGS_ROW_LABEL_MIN_WIDTH: f32 = 180.0; // Keep localized labels readable before controls wrap.
 
@@ -473,6 +478,29 @@ impl WorkspaceApp {
                 }
                 Some(popup)
             }
+            (SettingsTab::Terminal, SettingsSelect::TerminalSessionLogFileMode) => {
+                let mut popup = select_overlay_popup(&self.tokens, width);
+                for &mode in terminal_session_log_file_mode_options() {
+                    popup = popup.child(select_option_action(
+                        select_option(
+                            &self.tokens,
+                            terminal_session_log_file_mode_label(mode, &self.i18n),
+                            mode == settings.terminal.session_log.file_mode,
+                        ),
+                        false,
+                        false,
+                        cx.listener(move |this, _event, _window, cx| {
+                            this.close_settings_select();
+                            this.edit_settings(
+                                |settings| settings.terminal.session_log.file_mode = mode,
+                                cx,
+                            );
+                            cx.stop_propagation();
+                        }),
+                    ));
+                }
+                Some(popup)
+            }
             (SettingsTab::Terminal, SettingsSelect::TerminalBackspaceSequence) => {
                 let mut popup = select_overlay_popup(&self.tokens, width);
                 for &sequence in terminal_backspace_sequence_options() {
@@ -594,6 +622,398 @@ impl WorkspaceApp {
                 }
                 Some(popup)
             }
+            (SettingsTab::Terminal, SettingsSelect::TerminalTriggerMatchMode) => {
+                let draft = self.terminal_trigger_draft()?;
+                let current = draft.matcher.mode;
+                let mut popup = select_overlay_popup(&self.tokens, width);
+                for mode in [
+                    TerminalTriggerMatchMode::Literal,
+                    TerminalTriggerMatchMode::Regex,
+                ] {
+                    let label = self.i18n.t(match mode {
+                        TerminalTriggerMatchMode::Literal => {
+                            "settings_view.terminal.triggers.literal"
+                        }
+                        TerminalTriggerMatchMode::Regex => "settings_view.terminal.triggers.regex",
+                    });
+                    popup = popup.child(select_option_action(
+                        select_option(&self.tokens, label, mode == current),
+                        false,
+                        false,
+                        cx.listener(move |this, _event, _window, cx| {
+                            this.close_settings_select();
+                            this.select_terminal_trigger_match_mode(mode);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ));
+                }
+                Some(popup)
+            }
+            (SettingsTab::Terminal, SettingsSelect::TerminalTriggerAction) => {
+                let draft = self.terminal_trigger_draft()?;
+                let current = match &draft.action {
+                    TerminalTriggerAction::SendText { .. } => 0,
+                    TerminalTriggerAction::RunQuickCommand { .. } => 1,
+                    TerminalTriggerAction::LaunchLocalProcess { .. } => 2,
+                };
+                let mut popup = select_overlay_popup(&self.tokens, width);
+                for action_index in 0..3 {
+                    let label_key = match action_index {
+                        0 => "settings_view.terminal.triggers.action_send_text",
+                        1 => "settings_view.terminal.triggers.action_quick_command",
+                        _ => "settings_view.terminal.triggers.action_local_process",
+                    };
+                    popup = popup.child(select_option_action(
+                        select_option(
+                            &self.tokens,
+                            self.i18n.t(label_key),
+                            action_index == current,
+                        ),
+                        false,
+                        false,
+                        cx.listener(move |this, _event, _window, cx| {
+                            this.close_settings_select();
+                            let action = match action_index {
+                                0 => TerminalTriggerAction::SendText {
+                                    text: String::new(),
+                                    append_enter: false,
+                                },
+                                1 => {
+                                    let quick_command_id = this
+                                        .terminal
+                                        .read(cx)
+                                        .quick_commands
+                                        .store
+                                        .commands
+                                        .first()
+                                        .map(|command| command.id.clone())
+                                        .unwrap_or_default();
+                                    TerminalTriggerAction::RunQuickCommand { quick_command_id }
+                                }
+                                _ => TerminalTriggerAction::LaunchLocalProcess {
+                                    process: LocalProcessSpec::DirectProgram {
+                                        executable: String::new(),
+                                        arguments: Vec::new(),
+                                        working_directory: None,
+                                    },
+                                },
+                            };
+                            this.select_terminal_trigger_action(action);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ));
+                }
+                Some(popup)
+            }
+            (SettingsTab::Terminal, SettingsSelect::TerminalTriggerProcessMode) => {
+                let draft = self.terminal_trigger_draft()?;
+                let current_shell = matches!(
+                    &draft.action,
+                    TerminalTriggerAction::LaunchLocalProcess {
+                        process: LocalProcessSpec::ExplicitShell { .. }
+                    }
+                );
+                let mut popup = select_overlay_popup(&self.tokens, width);
+                for shell in [false, true] {
+                    popup = popup.child(select_option_action(
+                        select_option(
+                            &self.tokens,
+                            self.i18n.t(if shell {
+                                "settings_view.terminal.triggers.explicit_shell"
+                            } else {
+                                "settings_view.terminal.triggers.direct_program"
+                            }),
+                            shell == current_shell,
+                        ),
+                        false,
+                        false,
+                        cx.listener(move |this, _event, _window, cx| {
+                            this.close_settings_select();
+                            this.select_terminal_trigger_process_mode(shell);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ));
+                }
+                Some(popup)
+            }
+            (SettingsTab::Terminal, SettingsSelect::TerminalTriggerQuickCommand) => {
+                let draft = self.terminal_trigger_draft()?;
+                let current = match &draft.action {
+                    TerminalTriggerAction::RunQuickCommand { quick_command_id } => {
+                        quick_command_id.clone()
+                    }
+                    _ => String::new(),
+                };
+                let mut popup = select_panel_overlay_popup_with_max_height(
+                    &self.tokens,
+                    width,
+                    self.tokens.metrics.settings_theme_select_popup_max_height,
+                );
+                for command in &self.terminal.read(cx).quick_commands.store.commands {
+                    let id = command.id.clone();
+                    popup = popup.child(select_option_action(
+                        select_option(&self.tokens, command.name.clone(), id == current),
+                        false,
+                        false,
+                        cx.listener(move |this, _event, _window, cx| {
+                            this.close_settings_select();
+                            this.select_terminal_trigger_quick_command(id.clone());
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ));
+                }
+                Some(popup)
+            }
+            (SettingsTab::Terminal, SettingsSelect::TerminalTriggerTiming) => {
+                let draft = self.terminal_trigger_draft()?;
+                let current = draft.timing.dispatch;
+                let mut popup = select_overlay_popup(&self.tokens, width);
+                for dispatch in [
+                    TerminalTriggerDispatch::Immediate,
+                    TerminalTriggerDispatch::AfterNextLineBreak,
+                ] {
+                    popup = popup.child(select_option_action(
+                        select_option(
+                            &self.tokens,
+                            self.i18n.t(match dispatch {
+                                TerminalTriggerDispatch::Immediate => {
+                                    "settings_view.terminal.triggers.immediate"
+                                }
+                                TerminalTriggerDispatch::AfterNextLineBreak => {
+                                    "settings_view.terminal.triggers.after_next_line_break"
+                                }
+                            }),
+                            dispatch == current,
+                        ),
+                        false,
+                        false,
+                        cx.listener(move |this, _event, _window, cx| {
+                            this.close_settings_select();
+                            this.select_terminal_trigger_timing(dispatch);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ));
+                }
+                Some(popup)
+            }
+            (SettingsTab::Terminal, SettingsSelect::TerminalTriggerScope) => {
+                let draft = self.terminal_trigger_draft()?;
+                let current = match &draft.scope {
+                    TerminalTriggerScope::AllTerminals => 0,
+                    TerminalTriggerScope::LocalTerminals => 1,
+                    TerminalTriggerScope::SavedConnections { .. } => 2,
+                };
+                let saved_connections = match &draft.scope {
+                    TerminalTriggerScope::SavedConnections { connections } => connections.clone(),
+                    _ => Vec::new(),
+                };
+                let mut popup = select_overlay_popup(&self.tokens, width);
+                for scope_index in 0..3 {
+                    let label_key = match scope_index {
+                        0 => "settings_view.terminal.triggers.all_terminals",
+                        1 => "settings_view.terminal.triggers.local_terminals",
+                        _ => "settings_view.terminal.triggers.saved_connections",
+                    };
+                    let existing_connections = saved_connections.clone();
+                    popup = popup.child(select_option_action(
+                        select_option(&self.tokens, self.i18n.t(label_key), scope_index == current),
+                        false,
+                        false,
+                        cx.listener(move |this, _event, _window, cx| {
+                            this.close_settings_select();
+                            let scope = match scope_index {
+                                0 => TerminalTriggerScope::AllTerminals,
+                                1 => TerminalTriggerScope::LocalTerminals,
+                                _ => TerminalTriggerScope::SavedConnections {
+                                    connections: existing_connections.clone(),
+                                },
+                            };
+                            this.select_terminal_trigger_scope(scope);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ));
+                }
+                Some(popup)
+            }
+            (SettingsTab::Terminal, SettingsSelect::TerminalSemanticScheme) => {
+                let mut popup = select_overlay_popup(&self.tokens, width);
+                for &scheme in terminal_semantic_scheme_options() {
+                    popup = popup.child(select_option_action(
+                        select_option(
+                            &self.tokens,
+                            terminal_semantic_scheme_label(scheme, &self.i18n),
+                            scheme == settings.terminal.semantic_scheme,
+                        ),
+                        false,
+                        false,
+                        cx.listener(move |this, _event, _window, cx| {
+                            this.close_settings_select();
+                            this.edit_settings(
+                                |settings| {
+                                    settings.terminal.semantic_scheme = scheme;
+                                    settings.terminal.semantic_custom_scheme = None;
+                                },
+                                cx,
+                            );
+                            cx.stop_propagation();
+                        }),
+                    ));
+                }
+                if !settings.terminal.custom_semantic_schemes.is_empty() {
+                    popup = popup
+                        .child(select_separator(&self.tokens))
+                        .child(select_label(
+                            &self.tokens,
+                            self.i18n
+                                .t("settings_view.terminal.highlight_rules.semantic_scheme_custom"),
+                        ));
+                    for custom in &settings.terminal.custom_semantic_schemes {
+                        let id = custom.id.clone();
+                        let selected = settings.terminal.semantic_custom_scheme.as_deref()
+                            == Some(id.as_str());
+                        popup = popup.child(select_option_action(
+                            select_option(&self.tokens, custom.name.clone(), selected),
+                            false,
+                            false,
+                            cx.listener(move |this, _event, _window, cx| {
+                                this.close_settings_select();
+                                this.edit_settings(
+                                    |settings| {
+                                        settings.terminal.semantic_custom_scheme = Some(id.clone());
+                                    },
+                                    cx,
+                                );
+                                cx.stop_propagation();
+                            }),
+                        ));
+                    }
+                }
+                Some(popup)
+            }
+            (SettingsTab::Terminal, SettingsSelect::HighlightRuleSet) => {
+                let mut popup =
+                    select_overlay_popup(&self.tokens, width).child(select_option_action(
+                        select_option(
+                            &self.tokens,
+                            self.i18n
+                                .t("settings_view.terminal.highlight_rules.rule_set_global_base"),
+                            settings.terminal.default_highlight_rule_set.is_none(),
+                        ),
+                        false,
+                        false,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.close_settings_select();
+                            this.edit_settings(
+                                |settings| settings.terminal.default_highlight_rule_set = None,
+                                cx,
+                            );
+                            cx.stop_propagation();
+                        }),
+                    ));
+                if !settings.terminal.highlight_rule_sets.is_empty() {
+                    popup = popup.child(select_separator(&self.tokens));
+                    for rule_set in &settings.terminal.highlight_rule_sets {
+                        let id = rule_set.id.clone();
+                        let selected = settings.terminal.default_highlight_rule_set.as_deref()
+                            == Some(id.as_str());
+                        popup = popup.child(select_option_action(
+                            select_option(&self.tokens, rule_set.name.clone(), selected),
+                            false,
+                            false,
+                            cx.listener(move |this, _event, _window, cx| {
+                                this.close_settings_select();
+                                this.edit_settings(
+                                    |settings| {
+                                        settings.terminal.default_highlight_rule_set =
+                                            Some(id.clone());
+                                    },
+                                    cx,
+                                );
+                                cx.stop_propagation();
+                            }),
+                        ));
+                    }
+                }
+                Some(popup)
+            }
+            (SettingsTab::Terminal, SettingsSelect::SemanticSchemeRuleClass(index)) => {
+                let selected = settings
+                    .terminal
+                    .active_custom_semantic_scheme()
+                    .and_then(|scheme| scheme.rules.get(index))
+                    .map(|rule| rule.class)?;
+                let mut popup = select_overlay_popup(&self.tokens, width);
+                for &class in SEMANTIC_CLASSES {
+                    popup = popup.child(select_option_action(
+                        select_option(
+                            &self.tokens,
+                            semantic_class_label(class, &self.i18n),
+                            class == selected,
+                        ),
+                        false,
+                        false,
+                        cx.listener(move |this, _event, _window, cx| {
+                            this.close_settings_select();
+                            this.edit_settings(
+                                |settings| {
+                                    let _ = edit_custom_semantic_scheme(settings, |scheme| {
+                                        if let Some(rule) = scheme.rules.get_mut(index) {
+                                            rule.class = class;
+                                        }
+                                    });
+                                },
+                                cx,
+                            );
+                            cx.stop_propagation();
+                        }),
+                    ));
+                }
+                Some(popup)
+            }
+            (SettingsTab::Terminal, SettingsSelect::SemanticSchemeRuleContext(index)) => {
+                let selected = settings
+                    .terminal
+                    .active_custom_semantic_scheme()
+                    .and_then(|scheme| scheme.rules.get(index))
+                    .map(|rule| rule.context)?;
+                let mut popup = select_overlay_popup(&self.tokens, width);
+                for context in [
+                    SemanticRuleContext::Any,
+                    SemanticRuleContext::Command,
+                    SemanticRuleContext::Output,
+                ] {
+                    popup = popup.child(select_option_action(
+                        select_option(
+                            &self.tokens,
+                            semantic_context_label(context, &self.i18n),
+                            context == selected,
+                        ),
+                        false,
+                        false,
+                        cx.listener(move |this, _event, _window, cx| {
+                            this.close_settings_select();
+                            this.edit_settings(
+                                |settings| {
+                                    let _ = edit_custom_semantic_scheme(settings, |scheme| {
+                                        if let Some(rule) = scheme.rules.get_mut(index) {
+                                            rule.context = context;
+                                        }
+                                    });
+                                },
+                                cx,
+                            );
+                            cx.stop_propagation();
+                        }),
+                    ));
+                }
+                Some(popup)
+            }
             (SettingsTab::Terminal, SettingsSelect::HighlightPreset) => {
                 let mut popup = select_overlay_popup(&self.tokens, width.max(288.0));
                 for (group_index, group) in
@@ -695,6 +1115,112 @@ impl WorkspaceApp {
                             cx.stop_propagation();
                         }),
                     ));
+                }
+                Some(popup)
+            }
+            (SettingsTab::Terminal, SettingsSelect::LocalShellSemanticScheme(index)) => {
+                let shell = self
+                    .effective_local_shells_for_settings(settings)
+                    .into_iter()
+                    .nth(index)?;
+                let selected = settings.local_terminal.semantic_scheme_for_shell(&shell.id);
+                let shell_id = shell.id.clone();
+                let inherited_label = self
+                    .i18n
+                    .t("ssh.form.terminal_use_application_default")
+                    .replace(
+                        "{{value}}",
+                        &application_semantic_scheme_label(settings, &self.i18n),
+                    );
+                let mut popup =
+                    select_overlay_popup(&self.tokens, width).child(select_option_action(
+                        select_option(&self.tokens, inherited_label, selected.is_none()),
+                        false,
+                        false,
+                        cx.listener({
+                            let shell_id = shell_id.clone();
+                            move |this, _event, _window, cx| {
+                                this.close_settings_select();
+                                this.edit_settings(
+                                    |settings| {
+                                        settings
+                                            .local_terminal
+                                            .semantic_scheme_by_shell
+                                            .remove(&shell_id);
+                                    },
+                                    cx,
+                                );
+                                cx.stop_propagation();
+                            }
+                        }),
+                    ));
+                for (scheme_id, scheme) in [
+                    ("balanced", TerminalSemanticScheme::Balanced),
+                    ("conservative", TerminalSemanticScheme::Conservative),
+                ] {
+                    let scheme_id = scheme_id.to_string();
+                    popup = popup.child(select_option_action(
+                        select_option(
+                            &self.tokens,
+                            terminal_semantic_scheme_label(scheme, &self.i18n),
+                            selected == Some(scheme_id.as_str()),
+                        ),
+                        false,
+                        false,
+                        cx.listener({
+                            let shell_id = shell_id.clone();
+                            move |this, _event, _window, cx| {
+                                this.close_settings_select();
+                                this.edit_settings(
+                                    |settings| {
+                                        settings
+                                            .local_terminal
+                                            .semantic_scheme_by_shell
+                                            .insert(shell_id.clone(), scheme_id.clone());
+                                    },
+                                    cx,
+                                );
+                                cx.stop_propagation();
+                            }
+                        }),
+                    ));
+                }
+                if !settings.terminal.custom_semantic_schemes.is_empty() {
+                    popup = popup
+                        .child(select_separator(&self.tokens))
+                        .child(select_label(
+                            &self.tokens,
+                            self.i18n
+                                .t("settings_view.terminal.highlight_rules.semantic_scheme_custom"),
+                        ));
+                    for custom in &settings.terminal.custom_semantic_schemes {
+                        let scheme_id = custom.id.clone();
+                        popup = popup.child(select_option_action(
+                            select_option(
+                                &self.tokens,
+                                custom.name.clone(),
+                                selected == Some(scheme_id.as_str()),
+                            ),
+                            false,
+                            false,
+                            cx.listener({
+                                let shell_id = shell_id.clone();
+                                move |this, _event, _window, cx| {
+                                    this.close_settings_select();
+                                    this.edit_settings(
+                                        |settings| {
+                                            settings
+                                                .local_terminal
+                                                .semantic_scheme_by_shell
+                                                .insert(shell_id.clone(), scheme_id.clone());
+                                        },
+                                        cx,
+                                    );
+                                    cx.stop_propagation();
+                                }
+                            }),
+                        ));
+                    }
                 }
                 Some(popup)
             }

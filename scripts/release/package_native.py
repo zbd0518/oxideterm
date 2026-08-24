@@ -41,6 +41,7 @@ BASE_APP_NAME = "OxideTerm"
 STABLE_APP_IDENTIFIER = "com.oxideterm.app"
 APP_BIN = "oxideterm-native"
 CLI_BIN = "oxideterm"
+CONNECTION_URI_SCHEMES = ("ssh", "telnet", "mosh", "rdp", "vnc")
 HELPER_BINS = ("oxideterm-rdp-helper", "oxideterm-vnc-helper")
 UPDATE_HELPER_PACKAGE = "oxideterm-update"
 UPDATE_HELPER_BIN = "oxideterm-update-helper"
@@ -61,6 +62,17 @@ LINUX_PACKAGE_KIND_FILENAME = "PACKAGE_KIND"
 THIRD_PARTY_LICENSE_DIR = ROOT_DIR / "licenses" / "third-party"
 LINUX_DEB_GRAPHICS_RECOMMENDS = ("libegl1", "libvulkan1")
 LINUX_RPM_GRAPHICS_RECOMMENDS = ("libglvnd-egl", "vulkan-loader")
+LINUX_APPIMAGE_SYSTEM_LIBRARY_PREFIXES = (
+    "ld-linux",
+    "libanl.so",
+    "libc.so",
+    "libdl.so",
+    "libm.so",
+    "libpthread.so",
+    "libresolv.so",
+    "librt.so",
+    "libutil.so",
+)
 RELEASE_DOCUMENTS = (
     (ROOT_DIR / "LICENSE", "LICENSE"),
     (
@@ -428,11 +440,20 @@ def find_makensis() -> str | None:
     return None
 
 
+def native_cargo_build_env(target: str) -> dict[str, str]:
+    env = os.environ.copy()
+    if target.endswith("apple-darwin"):
+        # Release builds must use the system GSS framework even when Homebrew
+        # exposes an alternative Kerberos implementation through pkg-config.
+        env["LIBGSSAPI_IMPL"] = "apple"
+    return env
+
+
 def build_cli(target: str, target_was_explicit: bool) -> Path:
     args = ["cargo", "build", "-p", "oxideterm-cli", "--release"]
     if target_was_explicit:
         args.extend(["--target", target])
-    run(args)
+    run(args, env=native_cargo_build_env(target))
 
     source = release_binary(target, target_was_explicit, CLI_BIN)
     if not source.exists():
@@ -451,7 +472,7 @@ def build_helper(package: str, target: str, target_was_explicit: bool) -> Path:
     args = ["cargo", "build", "-p", package, "--release"]
     if target_was_explicit:
         args.extend(["--target", target])
-    run(args)
+    run(args, env=native_cargo_build_env(target))
 
     source = release_binary(target, target_was_explicit, package)
     if not source.exists():
@@ -483,7 +504,7 @@ def build_update_helper(target: str, target_was_explicit: bool) -> Path:
     ]
     if target_was_explicit:
         args.extend(["--target", target])
-    run(args)
+    run(args, env=native_cargo_build_env(target))
 
     source = release_binary(target, target_was_explicit, UPDATE_HELPER_BIN)
     if not source.exists():
@@ -503,7 +524,7 @@ def build_app(target: str, target_was_explicit: bool) -> Path:
     ]
     if target_was_explicit:
         args.extend(["--target", target])
-    run(args)
+    run(args, env=native_cargo_build_env(target))
 
     source = release_binary(target, target_was_explicit, APP_BIN)
     if not source.exists():
@@ -617,6 +638,13 @@ def build_macos_info_plist(version: str, identity: ReleaseIdentity) -> dict:
         "CFBundleVersion": version,
         "LSMinimumSystemVersion": "13.0",
         "NSHighResolutionCapable": True,
+        "CFBundleURLTypes": [
+            {
+                "CFBundleTypeRole": "Viewer",
+                "CFBundleURLName": f"{identity.app_identifier}.connection-uri",
+                "CFBundleURLSchemes": list(CONNECTION_URI_SCHEMES),
+            }
+        ],
     }
     return merge_macos_info_plist_extensions(plist)
 
@@ -1030,6 +1058,44 @@ def create_windows_installer(
     script_path.unlink(missing_ok=True)
 
 
+def windows_protocol_registration_script(
+    identity: ReleaseIdentity, binary_name: str
+) -> str:
+    # Capabilities make OxideTerm an available handler without replacing the
+    # user's current default for any registered scheme.
+    capabilities_key = f"Software\\{identity.windows_registry_key}\\Capabilities"
+    lines = [
+        f'  WriteRegStr HKCU "{capabilities_key}" "ApplicationName" "{identity.app_name}"',
+        f'  WriteRegStr HKCU "{capabilities_key}" "ApplicationDescription" "{identity.app_name}"',
+        f'  WriteRegStr HKCU "{capabilities_key}" "ApplicationIcon" "$INSTDIR\\{binary_name},0"',
+        f'  WriteRegStr HKCU "Software\\RegisteredApplications" "{identity.app_name}" "{capabilities_key}"',
+    ]
+    for scheme in CONNECTION_URI_SCHEMES:
+        prog_id = f"{identity.app_identifier}.{scheme}"
+        class_key = f"Software\\Classes\\{prog_id}"
+        lines.extend(
+            [
+                f'  WriteRegStr HKCU "{class_key}" "" "{identity.app_name} {scheme.upper()} URI"',
+                f'  WriteRegStr HKCU "{class_key}" "URL Protocol" ""',
+                f'  WriteRegStr HKCU "{class_key}\\DefaultIcon" "" "$INSTDIR\\{binary_name},0"',
+                rf'  WriteRegStr HKCU "{class_key}\shell\open\command" "" "$\"$INSTDIR\{binary_name}$\" $\"%1$\""',
+                f'  WriteRegStr HKCU "{capabilities_key}\\URLAssociations" "{scheme}" "{prog_id}"',
+            ]
+        )
+    return "\n".join(lines)
+
+
+def windows_protocol_unregistration_script(identity: ReleaseIdentity) -> str:
+    lines = [
+        f'  DeleteRegValue HKCU "Software\\RegisteredApplications" "{identity.app_name}"'
+    ]
+    for scheme in CONNECTION_URI_SCHEMES:
+        lines.append(
+            f'  DeleteRegKey HKCU "Software\\Classes\\{identity.app_identifier}.{scheme}"'
+        )
+    return "\n".join(lines)
+
+
 def windows_installer_script(
     *,
     binary: Path,
@@ -1063,6 +1129,8 @@ def windows_installer_script(
     # Modern UI replaces the compiler-level Icon directives with its own
     # interface settings, which must be defined before MUI2.nsh is included.
     modern_ui_icon = nsis_path(icon_path)
+    protocol_registration = windows_protocol_registration_script(identity, binary.name)
+    protocol_unregistration = windows_protocol_unregistration_script(identity)
 
     return f"""
 Unicode true
@@ -1146,6 +1214,7 @@ legacy_shortcuts_done:
   Exec '"$INSTDIR\\{UPDATE_HELPER_DIR}\\{UPDATE_HELPER_BIN}.exe" --install-dir "$INSTDIR" --app-exe "$INSTDIR\\{binary.name}" --launch'
 
 install_done:
+{protocol_registration}
 SectionEnd
 
 Section "Start Menu Shortcut"
@@ -1166,6 +1235,7 @@ Section "Uninstall"
   Delete "$SMPROGRAMS\\{identity.app_name}\\{identity.app_name}.lnk"
   RMDir "$SMPROGRAMS\\{identity.app_name}"
   DeleteRegKey HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{identity.windows_uninstall_key}"
+{protocol_unregistration}
   DeleteRegKey HKCU "Software\\{identity.windows_registry_key}"
   RMDir /r "$INSTDIR"
 SectionEnd
@@ -1341,11 +1411,16 @@ def write_linux_desktop_file(path: Path, identity: ReleaseIdentity, exec_value: 
                 "[Desktop Entry]",
                 "Type=Application",
                 f"Name={identity.app_name}",
-                f"Exec={exec_value} %U",
+                f"Exec={exec_value} %u",
                 f"Icon={identity.linux_icon_name}",
                 f"StartupWMClass={identity.linux_desktop_id}",
                 "Terminal=false",
                 "Categories=Development;TerminalEmulator;Network;",
+                "MimeType="
+                + ";".join(
+                    f"x-scheme-handler/{scheme}" for scheme in CONNECTION_URI_SCHEMES
+                )
+                + ";",
                 "StartupNotify=true",
                 "",
             ]
@@ -1370,6 +1445,52 @@ def copy_linux_icons(root: Path, identity: ReleaseIdentity) -> None:
         )
 
 
+def linux_dynamic_libraries(binary: Path) -> dict[str, Path]:
+    result = subprocess.run(
+        ["ldd", str(binary)],
+        cwd=ROOT_DIR,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    libraries = {}
+    for line in result.stdout.splitlines():
+        mapping = line.strip().split(" => ", 1)
+        if len(mapping) != 2:
+            continue
+        name, resolved = mapping
+        path_text = resolved.split(" ", 1)[0]
+        path = Path(path_text)
+        if path.is_file():
+            libraries[name] = path
+    return libraries
+
+
+def copy_linux_appimage_kerberos_libraries(binary: Path, appdir: Path) -> None:
+    """Bundle the non-glibc Kerberos closure needed before the auth UI can open."""
+    binary_libraries = linux_dynamic_libraries(binary)
+    pending = [
+        (name, path)
+        for name, path in binary_libraries.items()
+        if name.startswith(("libgssapi_krb5.so", "libgssapi.so"))
+    ]
+    if not pending:
+        raise RuntimeError("OxideTerm binary does not expose its Kerberos runtime dependency")
+
+    libraries: dict[str, Path] = {}
+    while pending:
+        name, path = pending.pop()
+        if name in libraries or name.startswith(LINUX_APPIMAGE_SYSTEM_LIBRARY_PREFIXES):
+            continue
+        libraries[name] = path
+        pending.extend(linux_dynamic_libraries(path).items())
+
+    library_dir = appdir / "usr" / "lib"
+    library_dir.mkdir(parents=True, exist_ok=True)
+    for name, path in sorted(libraries.items()):
+        shutil.copy2(path, library_dir / name)
+
+
 def create_linux_appimage(
     binary: Path, target: str, version: str, label: str, identity: ReleaseIdentity
 ) -> None:
@@ -1386,6 +1507,7 @@ def create_linux_appimage(
     app_binary = usr_bin / APP_BIN
     shutil.copy2(binary, app_binary)
     make_executable(app_binary)
+    copy_linux_appimage_kerberos_libraries(app_binary, appdir)
     copy_runtime_resources(usr_bin / "resources", target, encode_agent_binaries=True)
     document_root = appdir / "usr" / "share" / "doc" / identity.linux_package_name
     copy_release_documents(document_root)
@@ -1411,6 +1533,7 @@ def create_linux_appimage(
             [
                 "#!/bin/sh",
                 'APPDIR="${APPDIR:-$(dirname "$(readlink -f "$0")")}"',
+                'export LD_LIBRARY_PATH="$APPDIR/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"',
                 f'exec "$APPDIR/usr/bin/{APP_BIN}" "$@"',
                 "",
             ]

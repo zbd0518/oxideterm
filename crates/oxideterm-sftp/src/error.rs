@@ -25,6 +25,8 @@ pub enum SftpError {
     TransferCancelled,
     #[error("Transfer interrupted: {0}")]
     TransferInterrupted(String),
+    #[error("Application is shutting down")]
+    TransferShutdown,
     #[error("SFTP session not initialized for: {0}")]
     NotInitialized(String),
     #[error("Transfer error: {0}")]
@@ -36,6 +38,14 @@ pub enum SftpError {
 }
 
 impl SftpError {
+    /// Control-flow failures must stop the current strategy instead of triggering fallback I/O.
+    pub fn is_transfer_control(&self) -> bool {
+        matches!(
+            self,
+            Self::TransferCancelled | Self::TransferInterrupted(_) | Self::TransferShutdown
+        )
+    }
+
     pub fn is_channel_recoverable(&self) -> bool {
         match self {
             Self::ChannelError(_) | Self::ProtocolError(_) | Self::SubsystemNotAvailable(_) => true,
@@ -53,6 +63,7 @@ impl SftpError {
             | Self::InvalidPath(_)
             | Self::TransferCancelled
             | Self::TransferInterrupted(_)
+            | Self::TransferShutdown
             | Self::NotInitialized(_)
             | Self::TransferError(_)
             | Self::WriteError(_)

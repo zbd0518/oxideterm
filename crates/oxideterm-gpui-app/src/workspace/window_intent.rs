@@ -12,7 +12,7 @@ use std::{
 };
 
 use gpui::{Context, EventEmitter, Task, Window};
-use oxideterm_ssh_launch::NativeSshLaunch;
+use oxideterm_ssh_launch::NativeConnectionLaunch;
 use tokio::sync::Notify;
 
 use super::{WorkspaceApp, delivery};
@@ -25,7 +25,8 @@ pub(in crate::workspace) enum WindowIntentAction {
     OpenSettings,
     CheckForUpdates,
     Quit,
-    OpenNativeSsh(NativeSshLaunch),
+    OpenNativeConnection(NativeConnectionLaunch),
+    OpenExternalConnectionUri(NativeConnectionLaunch),
 }
 
 /// Moves a platform action into the root window adapter exactly once.
@@ -348,8 +349,11 @@ impl WorkspaceWindowIntentEntity {
                 crate::single_instance::SingleInstanceEvent::ShowMainWindow => {
                     WindowIntentAction::ShowMainWindow
                 }
-                crate::single_instance::SingleInstanceEvent::OpenNativeSsh(launch) => {
-                    WindowIntentAction::OpenNativeSsh(launch)
+                crate::single_instance::SingleInstanceEvent::OpenNativeConnection(launch) => {
+                    WindowIntentAction::OpenNativeConnection(launch)
+                }
+                crate::single_instance::SingleInstanceEvent::OpenExternalConnectionUri(launch) => {
+                    WindowIntentAction::OpenExternalConnectionUri(launch)
                 }
             };
             cx.emit(WindowIntent::new(action));
@@ -435,18 +439,25 @@ impl WorkspaceApp {
                 oxideterm_desktop_presence::request_quit();
                 cx.quit();
             }
-            WindowIntentAction::OpenNativeSsh(launch) => {
+            WindowIntentAction::OpenNativeConnection(launch) => {
                 oxideterm_desktop_presence::show_main_window();
-                match launch {
-                    NativeSshLaunch::Temporary(launch) => {
-                        if let Err(error) = self.open_temporary_ssh_launch(launch, cx) {
-                            eprintln!("failed to open forwarded SSH launch: {error:#}");
-                        }
-                    }
-                    NativeSshLaunch::SavedConnection(launch) => {
-                        // Saved launches re-enter the same store and NodeRouter flow as the UI.
-                        self.open_saved_connection(&launch.saved_connection_id, window, cx);
-                    }
+                if let Err(error) = self.open_native_connection_launch(launch, window, cx) {
+                    eprintln!("failed to open forwarded connection launch: {error:#}");
+                }
+                window.activate_window();
+            }
+            WindowIntentAction::OpenExternalConnectionUri(launch) => {
+                if !self
+                    .settings_store
+                    .settings()
+                    .general
+                    .external_connection_uris_enabled
+                {
+                    return;
+                }
+                oxideterm_desktop_presence::show_main_window();
+                if let Err(error) = self.open_native_connection_launch(launch, window, cx) {
+                    eprintln!("failed to open external connection URI: {error:#}");
                 }
                 window.activate_window();
             }

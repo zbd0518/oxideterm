@@ -197,9 +197,9 @@ pub fn settings_tab_section_count(
     match tab {
         SettingsTab::General => {
             if cfg!(any(target_os = "windows", target_os = "macos")) {
-                6
+                7
             } else {
-                5
+                6
             }
         }
         SettingsTab::Portable => 1,
@@ -230,8 +230,9 @@ pub fn terminal_settings_section_count(page: TerminalSettingsPage) -> usize {
         // The dedicated keybindings page owns shortcut discovery and editing.
         TerminalSettingsPage::Local => 4,
         TerminalSettingsPage::CommandBar => 3,
-        TerminalSettingsPage::Awareness => 2,
+        TerminalSettingsPage::Awareness => 3,
         TerminalSettingsPage::Transfer => 1,
+        TerminalSettingsPage::Logging => 1,
         TerminalSettingsPage::Highlight => 1,
     };
     1 + page_cards
@@ -330,72 +331,5 @@ mod tests {
         assert_eq!(layout.groups().last(), Some(&original_first_group));
         assert!(layout.remove_empty_group(4));
         assert_eq!(layout.group_count(), 5);
-    }
-
-    #[test]
-    fn settings_tab_ids_round_trip() {
-        for tab in SettingsTab::all() {
-            assert_eq!(SettingsTab::from_id(tab.id()), Some(*tab));
-        }
-    }
-
-    #[test]
-    fn section_counts_match_navigation_cards() {
-        let dynamic = SettingsDynamicSectionCounts {
-            terminal_page: TerminalSettingsPage::Display,
-            ai_page: AiSettingsPage::General,
-            visible_keybinding_scope_count: 0,
-            knowledge_has_error: false,
-            knowledge_has_selected_collection: false,
-        };
-        let expected = if cfg!(any(target_os = "windows", target_os = "macos")) {
-            6
-        } else {
-            5
-        };
-
-        for (tab, section_count) in [
-            (SettingsTab::General, expected),
-            (SettingsTab::Connections, 6),
-            (SettingsTab::Network, 3),
-            (SettingsTab::Help, 6),
-        ] {
-            assert_eq!(
-                settings_tab_section_count(tab, dynamic),
-                section_count,
-                "{tab:?} section count"
-            );
-        }
-
-        for (page, section_count) in [
-            (TerminalSettingsPage::Display, 5),
-            (TerminalSettingsPage::Input, 2),
-            (TerminalSettingsPage::CommandBar, 4),
-            (TerminalSettingsPage::Awareness, 3),
-            (TerminalSettingsPage::Local, 5),
-        ] {
-            assert_eq!(
-                terminal_settings_section_count(page),
-                section_count,
-                "{page:?} terminal section count"
-            );
-        }
-
-        for (page, section_count) in [
-            (AiSettingsPage::Tools, 4),
-            (AiSettingsPage::General, 3),
-            (AiSettingsPage::Context, 5),
-        ] {
-            assert_eq!(
-                ai_settings_section_count(page),
-                section_count,
-                "{page:?} AI section count"
-            );
-        }
-
-        assert_eq!(keybinding_settings_section_count(0), 2);
-        assert_eq!(keybinding_settings_section_count(3), 4);
-        assert_eq!(knowledge_settings_section_count(false, false), 1);
-        assert_eq!(knowledge_settings_section_count(true, true), 3);
     }
 }

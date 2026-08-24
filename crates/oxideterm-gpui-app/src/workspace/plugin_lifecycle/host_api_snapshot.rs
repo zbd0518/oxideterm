@@ -511,6 +511,7 @@ mod tests {
             id: "saved-1".to_string(),
             name: "Production".to_string(),
             group: Some("Servers".to_string()),
+            notes: None,
             host: "example.test".to_string(),
             port: 22,
             username: "operator".to_string(),
@@ -519,6 +520,9 @@ mod tests {
             cert_path: Some("/private/id_ed25519-cert.pub".to_string()),
             managed_key_id: Some("managed-secret-ref".to_string()),
             managed_key_name: Some("Managed key".to_string()),
+            gssapi_authentication: false,
+            gssapi_server_identity: None,
+            gssapi_delegate_credentials: false,
             proxy_chain: vec![ProxyHopInfo {
                 host: "jump.example.test".to_string(),
                 port: 22,
@@ -528,10 +532,14 @@ mod tests {
                 cert_path: None,
                 managed_key_id: Some("jump-secret-ref".to_string()),
                 managed_key_name: None,
+                gssapi_authentication: false,
+                gssapi_server_identity: None,
+                gssapi_delegate_credentials: false,
                 agent_forwarding: false,
                 identity_agent: Some("/private/jump-agent.sock".to_string()),
                 agent_forwarding_socket: None,
                 legacy_ssh_compatibility: false,
+                ssh_algorithms: oxideterm_connections::SshAlgorithmPreferences::default(),
             }],
             upstream_proxy: SavedUpstreamProxyPolicy::Custom {
                 proxy: SavedUpstreamProxyConfig {
@@ -557,6 +565,7 @@ mod tests {
             identity_agent: Some("/private/agent.sock".to_string()),
             agent_forwarding_socket: Some("/private/forward-agent.sock".to_string()),
             legacy_ssh_compatibility: false,
+            ssh_algorithms: oxideterm_connections::SshAlgorithmPreferences::default(),
             post_connect_command: Some("export TOKEN=private".to_string()),
         };
 

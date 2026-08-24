@@ -68,6 +68,9 @@ fn migrate_legacy_auth_credentials(
                 Ok(false)
             }
         }
+        SavedAuth::KerberosPreferred { fallback, .. } => {
+            migrate_legacy_auth_credentials(fallback, keychain)
+        }
         SavedAuth::KeyboardInteractive | SavedAuth::Agent => Ok(false),
     }
 }
@@ -218,6 +221,44 @@ fn managed_key_usage_from_data(data: &ConnectionStoreData, key_id: &str) -> Mana
             }
         }
     }
+    for profile in &data.standalone_sftp_profiles {
+        if matches!(&profile.auth, SavedAuth::ManagedKey { key_id: id, .. } if id == key_id) {
+            items.push(ManagedSshKeyUsageItem {
+                connection_id: profile.id.clone(),
+                connection_name: profile.name.clone(),
+                location: "standalone_sftp".to_string(),
+            });
+        }
+        for (index, hop) in profile.proxy_chain.iter().enumerate() {
+            if matches!(&hop.auth, SavedAuth::ManagedKey { key_id: id, .. } if id == key_id) {
+                items.push(ManagedSshKeyUsageItem {
+                    connection_id: profile.id.clone(),
+                    connection_name: profile.name.clone(),
+                    location: format!("standalone_sftp.proxy_chain[{index}]"),
+                });
+            }
+        }
+        if let Some(endpoint) = &profile.secondary_endpoint {
+            if matches!(&endpoint.auth, SavedAuth::ManagedKey { key_id: id, .. } if id == key_id) {
+                items.push(ManagedSshKeyUsageItem {
+                    connection_id: profile.id.clone(),
+                    connection_name: profile.name.clone(),
+                    location: "standalone_sftp.secondary_endpoint".to_string(),
+                });
+            }
+            for (index, hop) in endpoint.proxy_chain.iter().enumerate() {
+                if matches!(&hop.auth, SavedAuth::ManagedKey { key_id: id, .. } if id == key_id) {
+                    items.push(ManagedSshKeyUsageItem {
+                        connection_id: profile.id.clone(),
+                        connection_name: profile.name.clone(),
+                        location: format!(
+                            "standalone_sftp.secondary_endpoint.proxy_chain[{index}]"
+                        ),
+                    });
+                }
+            }
+        }
+    }
 
     ManagedSshKeyUsage {
         key_id: key_id.to_string(),
@@ -255,12 +296,45 @@ fn existing_upstream_proxy_password_keychain_id(
     }
 }
 
+fn existing_proxy_command_keychain_id(
+    proxy_command: Option<&SavedProxyCommand>,
+) -> Option<String> {
+    proxy_command.and_then(|command| command.keychain_id.clone())
+}
+
 fn collect_connection_keychain_ids(connection: &SavedConnection) -> Vec<String> {
     collect_keychain_ids_for_parts(
         &connection.auth,
         &connection.proxy_chain,
         &connection.upstream_proxy,
+        connection.proxy_command.as_ref(),
     )
+}
+
+fn collect_mosh_keychain_ids(profile: &MoshProfile) -> Vec<String> {
+    let mut ids = collect_keychain_ids_for_auth(&profile.auth);
+    for hop in &profile.proxy_chain {
+        ids.extend(collect_keychain_ids_for_auth(&hop.auth));
+    }
+    ids
+}
+
+fn collect_standalone_sftp_keychain_ids(profile: &StandaloneSftpProfile) -> Vec<String> {
+    let mut ids = collect_keychain_ids_for_parts(
+        &profile.auth,
+        &profile.proxy_chain,
+        &profile.upstream_proxy,
+        profile.proxy_command.as_ref(),
+    );
+    if let Some(endpoint) = &profile.secondary_endpoint {
+        ids.extend(collect_keychain_ids_for_parts(
+            &endpoint.auth,
+            &endpoint.proxy_chain,
+            &endpoint.upstream_proxy,
+            endpoint.proxy_command.as_ref(),
+        ));
+    }
+    ids
 }
 
 fn collect_privilege_keychain_ids(connection: &SavedConnection) -> Vec<String> {
@@ -299,16 +373,19 @@ fn collect_keychain_ids_for_parts(
     auth: &SavedAuth,
     proxy_chain: &[SavedProxyHop],
     upstream_proxy: &SavedUpstreamProxyPolicy,
+    proxy_command: Option<&SavedProxyCommand>,
 ) -> Vec<String> {
     let mut ids = collect_keychain_ids_for_auth(auth);
     for hop in proxy_chain {
         ids.extend(collect_keychain_ids_for_auth(&hop.auth));
     }
     ids.extend(collect_keychain_ids_for_upstream_proxy(upstream_proxy));
+    ids.extend(proxy_command.and_then(|command| command.keychain_id.clone()));
     ids
 }
 
 fn collect_keychain_ids_for_auth(auth: &SavedAuth) -> Vec<String> {
+    let auth = auth.conventional_fallback();
     match auth {
         SavedAuth::Password {
             keychain_id: Some(keychain_id),
@@ -408,6 +485,21 @@ fn auth_with_protected_credential(auth: SavedAuth) -> Result<(SavedAuth, String)
                 reference,
             ))
         }
+        SavedAuth::KerberosPreferred {
+            server_identity,
+            delegate_credentials,
+            fallback,
+        } => {
+            let (fallback, reference) = auth_with_protected_credential(*fallback)?;
+            Ok((
+                SavedAuth::with_kerberos_preferred(
+                    fallback,
+                    server_identity,
+                    delegate_credentials,
+                ),
+                reference,
+            ))
+        }
         SavedAuth::KeyboardInteractive | SavedAuth::Agent => {
             bail!("The selected authentication method has no stored credential slot")
         }
@@ -463,6 +555,21 @@ fn auth_without_protected_credential(auth: &SavedAuth) -> (SavedAuth, Option<Str
             },
             passphrase_keychain_id.clone(),
         ),
+        SavedAuth::KerberosPreferred {
+            server_identity,
+            delegate_credentials,
+            fallback,
+        } => {
+            let (fallback, reference) = auth_without_protected_credential(fallback);
+            (
+                SavedAuth::with_kerberos_preferred(
+                    fallback,
+                    server_identity.clone(),
+                    *delegate_credentials,
+                ),
+                reference,
+            )
+        }
         SavedAuth::KeyboardInteractive => (SavedAuth::KeyboardInteractive, None),
         SavedAuth::Agent => (SavedAuth::Agent, None),
     }
@@ -478,6 +585,10 @@ fn new_key_passphrase_keychain_id() -> String {
 
 fn new_upstream_proxy_password_keychain_id() -> String {
     format!("oxide_conn_upstream_proxy_{}", Uuid::new_v4())
+}
+
+fn new_proxy_command_keychain_id() -> String {
+    format!("oxide_conn_proxy_command_{}", Uuid::new_v4())
 }
 
 fn privilege_keychain_id(connection_id: &str, credential_id: &str) -> String {

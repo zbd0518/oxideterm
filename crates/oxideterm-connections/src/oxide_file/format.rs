@@ -118,6 +118,8 @@ pub struct OxideMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mosh_profiles_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standalone_sftp_profiles_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_desktop_profiles_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_settings_count: Option<usize>,
@@ -141,6 +143,8 @@ pub struct EncryptedPayload {
     pub telnet_profiles_json: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mosh_profiles_json: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standalone_sftp_profiles_json: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_desktop_profiles_json: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -171,6 +175,10 @@ impl fmt::Debug for EncryptedPayload {
                 &self.telnet_profiles_json.is_some(),
             )
             .field("has_mosh_profiles_json", &self.mosh_profiles_json.is_some())
+            .field(
+                "has_standalone_sftp_profiles_json",
+                &self.standalone_sftp_profiles_json.is_some(),
+            )
             .field(
                 "has_remote_desktop_profiles_json",
                 &self.remote_desktop_profiles_json.is_some(),
@@ -223,6 +231,8 @@ pub struct EncryptedConnection {
     pub source_connection_id: Option<String>,
     pub name: String,
     pub group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
     pub host: String,
     pub port: u16,
     pub username: String,
@@ -257,6 +267,8 @@ impl fmt::Debug for EncryptedConnection {
             )
             .field("name", &self.name)
             .field("group", &self.group)
+            // Notes are free-form and may contain operationally sensitive context.
+            .field("has_notes", &self.notes.is_some())
             .field("host", &self.host)
             .field("port", &self.port)
             .field("username", &self.username)
@@ -470,6 +482,13 @@ pub enum EncryptedAuth {
     },
     KeyboardInteractive,
     Agent,
+    KerberosPreferred {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server_identity: Option<String>,
+        #[serde(default)]
+        delegate_credentials: bool,
+        fallback: Box<EncryptedAuth>,
+    },
 }
 
 impl fmt::Debug for EncryptedAuth {
@@ -514,6 +533,16 @@ impl fmt::Debug for EncryptedAuth {
                 .finish(),
             Self::KeyboardInteractive => f.write_str("KeyboardInteractive"),
             Self::Agent => f.write_str("Agent"),
+            Self::KerberosPreferred {
+                server_identity,
+                delegate_credentials,
+                fallback,
+            } => f
+                .debug_struct("KerberosPreferred")
+                .field("server_identity_configured", &server_identity.is_some())
+                .field("delegate_credentials", delegate_credentials)
+                .field("fallback", fallback)
+                .finish(),
         }
     }
 }

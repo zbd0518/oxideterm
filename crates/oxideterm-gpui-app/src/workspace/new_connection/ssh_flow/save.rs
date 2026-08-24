@@ -6,13 +6,48 @@ use crate::workspace::{
     WorkspaceNotificationKind, WorkspaceNotificationScope, WorkspaceNotificationSeverity,
 };
 use gpui::App;
-use oxideterm_connections::{ConnectionStore, SavedAuth, SavedConnection, SavedProxyHop};
+use oxideterm_connections::{
+    ConnectionStore, SavedAuth, SavedConnection, SavedProxyHop, StandaloneSftpEndpoint,
+    StandaloneSftpTransferMode,
+};
 use oxideterm_gpui_terminal::TerminalNoticeVariant;
 
 struct PreparedMoshConnect {
     config: SshConfig,
     title: String,
     options: MoshConnectionOptions,
+}
+
+fn saved_authentication_plan(
+    fallback: SavedAuth,
+    enabled: bool,
+    server_identity: &str,
+    delegate_credentials: bool,
+) -> SavedAuth {
+    if !enabled {
+        return fallback;
+    }
+    SavedAuth::with_kerberos_preferred(
+        fallback,
+        (!server_identity.trim().is_empty()).then(|| server_identity.trim().to_string()),
+        delegate_credentials,
+    )
+}
+
+fn runtime_authentication_plan(
+    fallback: AuthMethod,
+    enabled: bool,
+    server_identity: &str,
+    delegate_credentials: bool,
+) -> AuthMethod {
+    if !enabled {
+        return fallback;
+    }
+    AuthMethod::kerberos_preferred(
+        fallback,
+        (!server_identity.trim().is_empty()).then(|| server_identity.trim().to_string()),
+        delegate_credentials,
+    )
 }
 
 fn parse_mosh_udp_port(value: &str) -> anyhow::Result<SavedMoshUdpPortSelection> {
@@ -39,8 +74,299 @@ fn mosh_password_draft_is_persistent(form: &NewConnectionForm) -> bool {
     form.save_password || (form.mosh_profile_id.is_some() && !form.password.is_empty())
 }
 
+fn saved_profile_notes(notes: &str) -> Option<String> {
+    let notes = notes.trim();
+    (!notes.is_empty()).then(|| notes.to_string())
+}
+
+fn standalone_sftp_secondary_target_matches(
+    form: &StandaloneSftpSecondaryForm,
+    endpoint: &StandaloneSftpEndpoint,
+) -> bool {
+    form.host.trim() == endpoint.host
+        && form.port.trim().parse::<u16>().ok() == Some(endpoint.port)
+        && form.username.trim() == endpoint.username
+}
+
+fn standalone_sftp_secondary_auth_matches(
+    form: &StandaloneSftpSecondaryForm,
+    auth: &SavedAuth,
+) -> bool {
+    form.auth_tab == ssh_auth_tab_from_saved_auth(auth)
+        && form.gssapi_enabled == auth.gssapi_options().is_some()
+        && form.key_path.trim() == auth.key_path().unwrap_or_default()
+        && form.cert_path.trim() == auth.cert_path().unwrap_or_default()
+        && form.managed_key_id.trim() == auth.managed_key_id().unwrap_or_default()
+        && form.gssapi_server_identity.trim()
+            == auth
+                .gssapi_options()
+                .and_then(|(identity, _)| identity)
+                .unwrap_or_default()
+        && form.gssapi_delegate_credentials
+            == auth.gssapi_options().is_some_and(|(_, delegate)| delegate)
+}
+
+fn saved_standalone_sftp_proxy_hop_from_form(
+    hop: &mut NewConnectionProxyHop,
+) -> anyhow::Result<SavedProxyHop> {
+    let host = hop.host.trim().to_string();
+    let username = hop.username.trim().to_string();
+    if host.is_empty() || username.is_empty() {
+        anyhow::bail!("Proxy host and username are required");
+    }
+    let port = hop
+        .port
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port > 0)
+        .ok_or_else(|| anyhow::anyhow!("Proxy port is invalid"))?;
+    let fallback = match hop.auth_tab {
+        SshAuthTab::Password => SavedAuth::Password {
+            keychain_id: None,
+            plaintext_password: Some(SecretString::from(std::mem::take(&mut hop.password))),
+        },
+        SshAuthTab::Agent => SavedAuth::Agent,
+        SshAuthTab::DefaultKey => SavedAuth::Key {
+            key_path: String::new(),
+            has_passphrase: !hop.passphrase.is_empty(),
+            passphrase_keychain_id: None,
+            plaintext_passphrase: (!hop.passphrase.is_empty())
+                .then(|| SecretString::from(std::mem::take(&mut hop.passphrase))),
+        },
+        SshAuthTab::SshKey => SavedAuth::Key {
+            key_path: hop.key_path.trim().to_string(),
+            has_passphrase: !hop.passphrase.is_empty(),
+            passphrase_keychain_id: None,
+            plaintext_passphrase: (!hop.passphrase.is_empty())
+                .then(|| SecretString::from(std::mem::take(&mut hop.passphrase))),
+        },
+        SshAuthTab::ManagedKey => SavedAuth::ManagedKey {
+            key_id: hop.managed_key_id.trim().to_string(),
+            passphrase_keychain_id: None,
+            plaintext_passphrase: (!hop.passphrase.is_empty())
+                .then(|| SecretString::from(std::mem::take(&mut hop.passphrase))),
+        },
+        SshAuthTab::Certificate => SavedAuth::Certificate {
+            key_path: hop.key_path.trim().to_string(),
+            cert_path: hop.cert_path.trim().to_string(),
+            has_passphrase: !hop.passphrase.is_empty(),
+            passphrase_keychain_id: None,
+            plaintext_passphrase: (!hop.passphrase.is_empty())
+                .then(|| SecretString::from(std::mem::take(&mut hop.passphrase))),
+        },
+        SshAuthTab::TwoFactor => SavedAuth::KeyboardInteractive,
+    };
+    let auth = saved_authentication_plan(
+        fallback,
+        hop.gssapi_enabled,
+        &hop.gssapi_server_identity,
+        hop.gssapi_delegate_credentials,
+    );
+    Ok(SavedProxyHop {
+        host,
+        port,
+        username,
+        auth,
+        agent_forwarding: hop.agent_forwarding,
+        identity_agent: identity_agent_from_form(&hop.identity_agent),
+        agent_forwarding_socket: hop.agent_forwarding_socket.clone(),
+        legacy_ssh_compatibility: hop.legacy_ssh_compatibility,
+        ssh_algorithms: hop.ssh_algorithms.clone(),
+    })
+}
+
+fn saved_standalone_sftp_secondary_route_from_form(
+    connection_store: &ConnectionStore,
+    form: &mut StandaloneSftpSecondaryForm,
+    existing: Option<&StandaloneSftpEndpoint>,
+    missing_credentials_message: &str,
+) -> anyhow::Result<(
+    Vec<SavedProxyHop>,
+    SavedUpstreamProxyPolicy,
+    Option<SavedProxyCommand>,
+)> {
+    let saved_auth_copies = saved_proxy_hop_auth_copies(
+        connection_store,
+        &form.proxy_hops,
+        missing_credentials_message,
+    )?;
+    let edit_sources = form
+        .proxy_hops
+        .iter()
+        .map(|hop| EditedProxyHopSource {
+            persisted_proxy_hop_index: hop.persisted_proxy_hop_index,
+            has_explicit_secret_draft: hop.has_explicit_secret_draft(),
+        })
+        .collect();
+    let mut proxy_chain = form
+        .proxy_hops
+        .iter_mut()
+        .map(saved_standalone_sftp_proxy_hop_from_form)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    preserve_edited_proxy_hop_auth(
+        &mut proxy_chain,
+        existing.map_or(&[], |endpoint| endpoint.proxy_chain.as_slice()),
+        edit_sources,
+        saved_auth_copies,
+        missing_credentials_message,
+    )?;
+
+    let upstream_proxy = match form.upstream_proxy_policy {
+        NewConnectionUpstreamProxyPolicy::UseGlobal => SavedUpstreamProxyPolicy::UseGlobal,
+        NewConnectionUpstreamProxyPolicy::Direct => SavedUpstreamProxyPolicy::Direct,
+        NewConnectionUpstreamProxyPolicy::Custom => {
+            let host = form.upstream_proxy_host.trim().to_string();
+            if host.is_empty() {
+                anyhow::bail!("Upstream proxy host is required");
+            }
+            let port = form
+                .upstream_proxy_port
+                .trim()
+                .parse::<u16>()
+                .ok()
+                .filter(|port| *port > 0)
+                .ok_or_else(|| anyhow::anyhow!("Upstream proxy port is invalid"))?;
+            let auth = match form.upstream_proxy_auth {
+                NewConnectionUpstreamProxyAuth::None => SavedUpstreamProxyAuth::None,
+                NewConnectionUpstreamProxyAuth::Password => {
+                    let username = form.upstream_proxy_username.trim().to_string();
+                    if username.is_empty() {
+                        anyhow::bail!("Upstream proxy username is required");
+                    }
+                    SavedUpstreamProxyAuth::Password {
+                        username,
+                        keychain_id: form.upstream_proxy_password_keychain_id.clone(),
+                        plaintext_password: (!form.upstream_proxy_password.is_empty()).then(|| {
+                            SecretString::from(std::mem::take(&mut form.upstream_proxy_password))
+                        }),
+                    }
+                }
+            };
+            SavedUpstreamProxyPolicy::Custom {
+                proxy: SavedUpstreamProxyConfig {
+                    protocol: form.upstream_proxy_protocol,
+                    host,
+                    port,
+                    auth,
+                    remote_dns: form.upstream_proxy_remote_dns,
+                    no_proxy: form.upstream_proxy_no_proxy.trim().to_string(),
+                },
+            }
+        }
+    };
+    let proxy_command = if form.proxy_command_enabled {
+        if form.proxy_command.trim().is_empty() && form.proxy_command_keychain_id.is_none() {
+            anyhow::bail!("ProxyCommand value is required");
+        }
+        Some(SavedProxyCommand {
+            keychain_id: form.proxy_command_keychain_id.clone(),
+            plaintext_command: (!form.proxy_command.trim().is_empty())
+                .then(|| SecretString::from(std::mem::take(&mut form.proxy_command))),
+        })
+    } else {
+        None
+    };
+    Ok((proxy_chain, upstream_proxy, proxy_command))
+}
+
+fn saved_standalone_sftp_secondary_endpoint_from_form(
+    connection_store: &ConnectionStore,
+    form: &mut StandaloneSftpSecondaryForm,
+    existing: Option<&StandaloneSftpEndpoint>,
+    missing_credentials_message: &str,
+) -> anyhow::Result<StandaloneSftpEndpoint> {
+    let host = form.host.trim().to_string();
+    let username = form.username.trim().to_string();
+    if host.is_empty() {
+        anyhow::bail!("Second SFTP host is required");
+    }
+    if username.is_empty() {
+        anyhow::bail!("Second SFTP username is required");
+    }
+    let port = form
+        .port
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port > 0)
+        .ok_or_else(|| anyhow::anyhow!("Second SFTP port is invalid"))?;
+    let can_preserve_auth = existing.is_some_and(|endpoint| {
+        standalone_sftp_secondary_target_matches(form, endpoint)
+            && standalone_sftp_secondary_auth_matches(form, &endpoint.auth)
+            && form.password.is_empty()
+            && form.passphrase.is_empty()
+    });
+    let auth = if can_preserve_auth {
+        existing.expect("checked above").auth.clone()
+    } else {
+        let fallback = match form.auth_tab {
+            SshAuthTab::Password => SavedAuth::Password {
+                keychain_id: None,
+                plaintext_password: (form.save_password && !form.password.is_empty())
+                    .then(|| SecretString::from(std::mem::take(&mut form.password))),
+            },
+            SshAuthTab::Agent => SavedAuth::Agent,
+            SshAuthTab::DefaultKey => SavedAuth::Key {
+                key_path: String::new(),
+                has_passphrase: !form.passphrase.is_empty(),
+                passphrase_keychain_id: None,
+                plaintext_passphrase: (!form.passphrase.is_empty())
+                    .then(|| SecretString::from(std::mem::take(&mut form.passphrase))),
+            },
+            SshAuthTab::SshKey => SavedAuth::Key {
+                key_path: form.key_path.trim().to_string(),
+                has_passphrase: !form.passphrase.is_empty(),
+                passphrase_keychain_id: None,
+                plaintext_passphrase: (!form.passphrase.is_empty())
+                    .then(|| SecretString::from(std::mem::take(&mut form.passphrase))),
+            },
+            SshAuthTab::ManagedKey => SavedAuth::ManagedKey {
+                key_id: form.managed_key_id.trim().to_string(),
+                passphrase_keychain_id: None,
+                plaintext_passphrase: (!form.passphrase.is_empty())
+                    .then(|| SecretString::from(std::mem::take(&mut form.passphrase))),
+            },
+            SshAuthTab::Certificate => SavedAuth::Certificate {
+                key_path: form.key_path.trim().to_string(),
+                cert_path: form.cert_path.trim().to_string(),
+                has_passphrase: !form.passphrase.is_empty(),
+                passphrase_keychain_id: None,
+                plaintext_passphrase: (!form.passphrase.is_empty())
+                    .then(|| SecretString::from(std::mem::take(&mut form.passphrase))),
+            },
+            SshAuthTab::TwoFactor => SavedAuth::KeyboardInteractive,
+        };
+        saved_authentication_plan(
+            fallback,
+            form.gssapi_enabled,
+            &form.gssapi_server_identity,
+            form.gssapi_delegate_credentials,
+        )
+    };
+    let (proxy_chain, upstream_proxy, proxy_command) =
+        saved_standalone_sftp_secondary_route_from_form(
+            connection_store,
+            form,
+            existing,
+            missing_credentials_message,
+        )?;
+    let mut endpoint = StandaloneSftpEndpoint::new(host, port, username, auth);
+    endpoint.proxy_chain = proxy_chain;
+    endpoint.upstream_proxy = upstream_proxy;
+    endpoint.proxy_command = proxy_command;
+    endpoint.connect_timeout_seconds = form.connect_timeout_seconds;
+    endpoint.identity_agent = identity_agent_from_form(&form.identity_agent);
+    endpoint.legacy_ssh_compatibility = form.legacy_ssh_compatibility;
+    endpoint.ssh_algorithms = form.ssh_algorithms.clone();
+    endpoint.initial_remote_path = (!form.initial_remote_path.trim().is_empty())
+        .then(|| form.initial_remote_path.trim().to_string());
+    endpoint.validate()?;
+    Ok(endpoint)
+}
+
 fn saved_mosh_auth_from_form(form: &mut NewConnectionForm) -> SavedAuth {
-    match form.auth_tab {
+    let fallback = match form.auth_tab {
         SshAuthTab::Password => {
             // Editing follows SSH property semantics: a newly entered password is
             // an explicit replacement and crosses directly into protected storage.
@@ -86,11 +412,17 @@ fn saved_mosh_auth_from_form(form: &mut NewConnectionForm) -> SavedAuth {
                 .then(|| SecretString::from(std::mem::take(&mut form.passphrase))),
         },
         SshAuthTab::TwoFactor => SavedAuth::KeyboardInteractive,
-    }
+    };
+    saved_authentication_plan(
+        fallback,
+        form.gssapi_enabled,
+        &form.gssapi_server_identity,
+        form.gssapi_delegate_credentials,
+    )
 }
 
 fn runtime_mosh_auth_from_form(form: &mut NewConnectionForm) -> AuthMethod {
-    match form.auth_tab {
+    let fallback = match form.auth_tab {
         SshAuthTab::Password => {
             AuthMethod::password_secret(take_zeroizing_secret(&mut form.password))
         }
@@ -113,14 +445,32 @@ fn runtime_mosh_auth_from_form(form: &mut NewConnectionForm) -> AuthMethod {
             (!form.passphrase.is_empty()).then(|| take_zeroizing_secret(&mut form.passphrase)),
         ),
         SshAuthTab::TwoFactor => AuthMethod::KeyboardInteractive,
-    }
+    };
+    runtime_authentication_plan(
+        fallback,
+        form.gssapi_enabled,
+        &form.gssapi_server_identity,
+        form.gssapi_delegate_credentials,
+    )
 }
 
 fn runtime_mosh_auth_from_saved(
     auth: &SavedAuth,
-    secrets: SavedMoshProfileRuntimeSecrets,
+    secret: Option<SecretString>,
 ) -> Option<AuthMethod> {
-    let secret = secrets.auth.map(SecretString::into_zeroizing);
+    if let SavedAuth::KerberosPreferred {
+        server_identity,
+        delegate_credentials,
+        fallback,
+    } = auth
+    {
+        return Some(AuthMethod::kerberos_preferred(
+            runtime_mosh_auth_from_saved(fallback, secret)?,
+            server_identity.clone(),
+            *delegate_credentials,
+        ));
+    }
+    let secret = secret.map(SecretString::into_zeroizing);
     Some(match auth {
         SavedAuth::Password { .. } => AuthMethod::password_secret(secret?),
         SavedAuth::Key { key_path, .. } => AuthMethod::key_secret(key_path.clone(), secret),
@@ -134,6 +484,52 @@ fn runtime_mosh_auth_from_saved(
         } => AuthMethod::certificate_secret(key_path.clone(), cert_path.clone(), secret),
         SavedAuth::KeyboardInteractive => AuthMethod::KeyboardInteractive,
         SavedAuth::Agent => AuthMethod::Agent,
+        SavedAuth::KerberosPreferred { .. } => unreachable!("handled above"),
+    })
+}
+
+fn runtime_mosh_config_from_saved(
+    profile: &oxideterm_connections::MoshProfile,
+    mut secrets: SavedMoshProfileRuntimeSecrets,
+    auth_override: Option<AuthMethod>,
+) -> Option<SshConfig> {
+    if secrets.proxy_chain.len() != profile.proxy_chain.len() {
+        return None;
+    }
+    let auth = auth_override
+        .or_else(|| runtime_mosh_auth_from_saved(&profile.auth, secrets.auth.take()))?;
+    let proxy_chain = profile
+        .proxy_chain
+        .iter()
+        .zip(secrets.proxy_chain)
+        .map(|(hop, secret)| {
+            Some(ProxyHopConfig {
+                host: hop.host.clone(),
+                port: hop.port,
+                username: hop.username.clone(),
+                auth: runtime_mosh_auth_from_saved(&hop.auth, secret)?,
+                agent_forwarding: hop.agent_forwarding,
+                identity_agent: hop.identity_agent.clone(),
+                agent_forwarding_socket: hop.agent_forwarding_socket.clone(),
+                legacy_ssh_compatibility: hop.legacy_ssh_compatibility,
+                ssh_algorithms: hop.ssh_algorithms.clone(),
+                strict_host_key_checking: true,
+                trust_host_key: None,
+                expected_host_key_fingerprint: None,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(SshConfig {
+        host: profile.host.clone(),
+        port: profile.ssh_port,
+        username: profile.username.clone(),
+        auth,
+        proxy_chain: (!proxy_chain.is_empty()).then_some(proxy_chain),
+        identity_agent: profile.identity_agent.clone(),
+        legacy_ssh_compatibility: profile.legacy_ssh_compatibility,
+        ssh_algorithms: profile.ssh_algorithms.clone(),
+        strict_host_key_checking: true,
+        ..SshConfig::default()
     })
 }
 
@@ -148,6 +544,7 @@ pub(in crate::workspace) fn mosh_options_from_profile(
         ip_family: profile.ip_family,
         prediction: profile.prediction,
         locale: profile.locale.clone(),
+        terminal: profile.terminal.clone(),
         public_mcp_open_token: None,
     }
 }
@@ -240,11 +637,116 @@ fn preserve_edited_proxy_hop_auth(
     Ok(())
 }
 
+fn auth_for_duplicate_owner(
+    connection_store: &ConnectionStore,
+    auth: SavedAuth,
+) -> anyhow::Result<SavedAuth> {
+    match auth {
+        SavedAuth::Password {
+            keychain_id: _,
+            plaintext_password: Some(password),
+        } => Ok(SavedAuth::Password {
+            keychain_id: None,
+            plaintext_password: Some(password),
+        }),
+        SavedAuth::Password {
+            keychain_id: Some(_),
+            plaintext_password: None,
+        } => connection_store.copy_saved_auth_for_new_owner(&auth),
+        SavedAuth::Key {
+            key_path,
+            has_passphrase,
+            plaintext_passphrase: Some(passphrase),
+            ..
+        } => Ok(SavedAuth::Key {
+            key_path,
+            has_passphrase,
+            passphrase_keychain_id: None,
+            plaintext_passphrase: Some(passphrase),
+        }),
+        SavedAuth::Certificate {
+            key_path,
+            cert_path,
+            has_passphrase,
+            plaintext_passphrase: Some(passphrase),
+            ..
+        } => Ok(SavedAuth::Certificate {
+            key_path,
+            cert_path,
+            has_passphrase,
+            passphrase_keychain_id: None,
+            plaintext_passphrase: Some(passphrase),
+        }),
+        SavedAuth::ManagedKey {
+            key_id,
+            plaintext_passphrase: Some(passphrase),
+            ..
+        } => Ok(SavedAuth::ManagedKey {
+            key_id,
+            passphrase_keychain_id: None,
+            plaintext_passphrase: Some(passphrase),
+        }),
+        SavedAuth::Key {
+            passphrase_keychain_id: Some(_),
+            ..
+        }
+        | SavedAuth::Certificate {
+            passphrase_keychain_id: Some(_),
+            ..
+        }
+        | SavedAuth::ManagedKey {
+            passphrase_keychain_id: Some(_),
+            ..
+        } => connection_store.copy_saved_auth_for_new_owner(&auth),
+        auth => Ok(auth),
+    }
+}
+
+fn upstream_proxy_for_duplicate_owner(
+    connection_store: &ConnectionStore,
+    policy: SavedUpstreamProxyPolicy,
+) -> anyhow::Result<SavedUpstreamProxyPolicy> {
+    let SavedUpstreamProxyPolicy::Custom { mut proxy } = policy else {
+        return Ok(policy);
+    };
+    if let SavedUpstreamProxyAuth::Password {
+        username,
+        keychain_id,
+        plaintext_password,
+    } = proxy.auth
+    {
+        let password = match plaintext_password {
+            Some(password) => Some(password),
+            None if keychain_id.is_some() => {
+                Some(connection_store.get_saved_upstream_proxy_password(
+                    &SavedUpstreamProxyAuth::Password {
+                        username: username.clone(),
+                        keychain_id,
+                        plaintext_password: None,
+                    },
+                )?)
+            }
+            None => None,
+        };
+        // The duplicate persists a fresh protected-store owner during upsert.
+        proxy.auth = SavedUpstreamProxyAuth::Password {
+            username,
+            keychain_id: None,
+            plaintext_password: password,
+        };
+    }
+    Ok(SavedUpstreamProxyPolicy::Custom { proxy })
+}
+
 fn proxy_hop_auth_target_matches(left: &SavedProxyHop, right: &SavedProxyHop) -> bool {
     left.host == right.host
         && left.port == right.port
         && left.username == right.username
-        && match (&left.auth, &right.auth) {
+        && left.auth.gssapi_options() == right.auth.gssapi_options()
+        && match (
+            left.auth.conventional_fallback(),
+            right.auth.conventional_fallback(),
+        ) {
             (SavedAuth::Password { .. }, SavedAuth::Password { .. })
             | (SavedAuth::KeyboardInteractive, SavedAuth::KeyboardInteractive)
             | (SavedAuth::Agent, SavedAuth::Agent) => true,
@@ -394,6 +896,7 @@ impl WorkspaceApp {
                         identity_agent: config.identity_agent,
                         agent_forwarding_socket: config.agent_forwarding_socket,
                         legacy_ssh_compatibility: config.legacy_ssh_compatibility,
+                        ssh_algorithms: config.ssh_algorithms,
                         strict_host_key_checking: true,
                         trust_host_key: None,
                         expected_host_key_fingerprint: None,
@@ -417,6 +920,8 @@ impl WorkspaceApp {
         }) {
             return;
         }
+        // Closing the form drops any unconsumed second-endpoint credentials immediately.
+        self.pending_standalone_sftp_pair_launches.clear();
         self.focus_active_pane(window, cx);
         cx.notify();
     }
@@ -451,6 +956,28 @@ impl WorkspaceApp {
                 state.mode(),
             )
         };
+        if matches!(
+            transport,
+            Some(
+                NewConnectionTransport::Ssh
+                    | NewConnectionTransport::Mosh
+                    | NewConnectionTransport::StandaloneSftp
+            )
+        ) && self
+            .connection_form_state(cx)
+            .form
+            .as_ref()
+            .is_some_and(|form| !connection_timeout_drafts_valid(form))
+        {
+            let message = self.i18n.t("ssh.form.connect_timeout_invalid");
+            self.update_connection_form_state(cx, |state| {
+                if let Some(form) = state.form.as_mut() {
+                    form.error = Some(message);
+                }
+            });
+            cx.notify();
+            return;
+        }
         if transport == Some(NewConnectionTransport::LocalTerminal)
             && drill_down_parent_id.is_none()
             && mode == NewConnectionFormMode::NewConnection
@@ -500,6 +1027,12 @@ impl WorkspaceApp {
             && mode == NewConnectionFormMode::NewConnection
         {
             self.submit_mosh_connection_form(action, window, cx);
+            return;
+        }
+        if transport == Some(NewConnectionTransport::StandaloneSftp)
+            && drill_down_parent_id.is_none()
+        {
+            self.submit_standalone_sftp_connection_form(action, window, cx);
             return;
         }
         if transport
@@ -816,7 +1349,7 @@ impl WorkspaceApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((config, mut save_request)) =
+        let Some((config, terminal_options, mut save_request)) =
             self.with_connection_form_mut(cx, |this, form, cx| {
                 let form = form?;
                 let port_path = form.serial_port_path.trim().to_string();
@@ -857,6 +1390,7 @@ impl WorkspaceApp {
                     id: editing_profile_id,
                     name: serial_profile_name_or_port(&form.serial_profile_name, &port_path),
                     group: serial_profile_group_from_form(&form.group, &this.i18n),
+                    notes: saved_profile_notes(&form.notes),
                     icon: asset_icon_from_form(&form.icon),
                     color: asset_color_from_form(&form.color),
                     icon_background_color: asset_color_from_form(&form.icon_background_color),
@@ -866,11 +1400,12 @@ impl WorkspaceApp {
                     stop_bits: Some(form.serial_stop_bits),
                     parity: Some(serial_profile_parity_from_terminal(form.serial_parity)),
                     flow_control: Some(serial_profile_flow_from_terminal(form.serial_flow_control)),
+                    terminal: form.terminal.clone(),
                     connect_on_open: existing_connect_on_open,
                 });
                 form.pending = true;
                 form.error = None;
-                Some((config, save_request))
+                Some((config, form.terminal.clone(), save_request))
             })
         else {
             return;
@@ -922,11 +1457,19 @@ impl WorkspaceApp {
             }
         }
 
-        match self.create_serial_terminal_tab(config, window, cx) {
-            Ok(_) => {
+        match self.create_serial_terminal_tab(config, terminal_options, window, cx) {
+            Ok(session_id) => {
                 if let Some(request) = save_request {
                     match self.connection_store.upsert_serial_profile(request) {
-                        Ok(_) => self.queue_cloud_sync_dirty_refresh(cx),
+                        Ok(profile) => {
+                            self.register_terminal_saved_connection(
+                                session_id,
+                                oxideterm_terminal_triggers::SavedConnectionKind::Serial,
+                                profile.id,
+                                cx,
+                            );
+                            self.queue_cloud_sync_dirty_refresh(cx);
+                        }
                         Err(error) => {
                             let message = format!(
                                 "{}: {error}",
@@ -988,16 +1531,17 @@ impl WorkspaceApp {
                     id: editing_profile_id,
                     name: telnet_profile_name_or_endpoint(&form.telnet_profile_name, &host, port),
                     group: serial_profile_group_from_form(&form.group, &this.i18n),
+                    notes: saved_profile_notes(&form.notes),
                     icon: asset_icon_from_form(&form.icon),
                     color: asset_color_from_form(&form.color),
                     icon_background_color: asset_color_from_form(&form.icon_background_color),
                     host: host.clone(),
                     port,
-                    terminal: form.terminal,
+                    terminal: form.terminal.clone(),
                     connect_on_open: existing_connect_on_open,
                 });
                 let config = TelnetSessionConfig { host, port };
-                let terminal_options = form.terminal;
+                let terminal_options = form.terminal.clone();
                 form.pending = true;
                 form.error = None;
                 Some((config, terminal_options, save_request))
@@ -1030,12 +1574,16 @@ impl WorkspaceApp {
             return;
         }
 
+        let mut connected_profile_id = None;
         if action == NewConnectionSubmitAction::SaveAndConnect {
             let request = save_request
                 .take()
                 .expect("telnet save-and-open action must build a telnet profile request");
             match self.connection_store.upsert_telnet_profile(request) {
-                Ok(_) => self.queue_cloud_sync_dirty_refresh(cx),
+                Ok(profile) => {
+                    connected_profile_id = Some(profile.id);
+                    self.queue_cloud_sync_dirty_refresh(cx);
+                }
                 Err(error) => {
                     self.update_connection_form_state(cx, |state| {
                         if let Some(form) = state.form.as_mut() {
@@ -1055,10 +1603,13 @@ impl WorkspaceApp {
         // Telnet is opened as a native local terminal transport. It does not
         // create an SSH node, so SSH-only saved-connection/test flows stay out.
         match self.create_telnet_terminal_tab(config, terminal_options, window, cx) {
-            Ok(_) => {
+            Ok(session_id) => {
                 if let Some(request) = save_request {
                     match self.connection_store.upsert_telnet_profile(request) {
-                        Ok(_) => self.queue_cloud_sync_dirty_refresh(cx),
+                        Ok(profile) => {
+                            connected_profile_id = Some(profile.id);
+                            self.queue_cloud_sync_dirty_refresh(cx);
+                        }
                         Err(error) => {
                             let message = format!(
                                 "{}: {error}",
@@ -1069,6 +1620,16 @@ impl WorkspaceApp {
                             });
                         }
                     }
+                }
+                if let Some(profile_id) = connected_profile_id {
+                    self.telnet_terminal_profile_ids
+                        .insert(session_id, profile_id.clone());
+                    self.register_terminal_saved_connection(
+                        session_id,
+                        oxideterm_terminal_triggers::SavedConnectionKind::Telnet,
+                        profile_id,
+                        cx,
+                    );
                 }
                 self.update_connection_form_state(cx, ConnectionFormState::clear);
             }
@@ -1125,6 +1686,11 @@ impl WorkspaceApp {
                 }
                 _ => {}
             }
+            if let Err(error) = validate_proxy_chain_form(form) {
+                form.error = Some(error);
+                cx.notify();
+                return None;
+            }
             let udp_port = match parse_mosh_udp_port(&form.mosh_udp_port) {
                 Ok(udp_port) => udp_port,
                 Err(_) => {
@@ -1154,19 +1720,36 @@ impl WorkspaceApp {
                 prediction: form.mosh_prediction,
                 locale: (!form.mosh_locale.trim().is_empty())
                     .then(|| form.mosh_locale.trim().to_string()),
+                terminal: form.terminal.clone(),
                 public_mcp_open_token: None,
             };
             let ssh_port = ssh_port.expect("validated Mosh SSH port must exist");
 
             if action == NewConnectionSubmitAction::Connect {
+                let saved_proxy_hop_auth = match saved_proxy_hop_auth_from_store(
+                    &this.connection_store,
+                    form,
+                    &this.i18n.t("sessions.saved_next_hop.missing_credentials"),
+                ) {
+                    Ok(auth) => auth,
+                    Err(error) => {
+                        form.error = Some(error);
+                        cx.notify();
+                        return None;
+                    }
+                };
+                let proxy_chain =
+                    proxy_chain_from_form(form, RuntimeSecretHandoff::Move, saved_proxy_hop_auth);
                 let auth = runtime_mosh_auth_from_form(form);
                 let config = SshConfig {
                     host,
                     port: ssh_port,
                     username,
                     auth,
+                    proxy_chain,
                     identity_agent: identity_agent_from_form(&form.identity_agent),
                     legacy_ssh_compatibility: form.legacy_ssh_compatibility,
+                    ssh_algorithms: form.ssh_algorithms.clone(),
                     strict_host_key_checking: true,
                     ..SshConfig::default()
                 };
@@ -1183,6 +1766,50 @@ impl WorkspaceApp {
                 ));
             }
 
+            let existing_profile = form
+                .mosh_profile_id
+                .as_deref()
+                .and_then(|id| this.connection_store.get_mosh_profile(id))
+                .cloned();
+            let proxy_chain = match (|| -> anyhow::Result<Vec<SavedProxyHop>> {
+                let missing_credentials_message =
+                    this.i18n.t("sessions.saved_next_hop.missing_credentials");
+                let saved_auth_copies = saved_proxy_hop_auth_copies(
+                    &this.connection_store,
+                    &form.proxy_hops,
+                    &missing_credentials_message,
+                )?;
+                let edit_sources = form
+                    .proxy_hops
+                    .iter()
+                    .map(|hop| EditedProxyHopSource {
+                        persisted_proxy_hop_index: hop.persisted_proxy_hop_index,
+                        has_explicit_secret_draft: hop.has_explicit_secret_draft(),
+                    })
+                    .collect();
+                let mut proxy_chain = form
+                    .proxy_hops
+                    .iter_mut()
+                    .map(saved_standalone_sftp_proxy_hop_from_form)
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                preserve_edited_proxy_hop_auth(
+                    &mut proxy_chain,
+                    existing_profile
+                        .as_ref()
+                        .map_or(&[], |profile| profile.proxy_chain.as_slice()),
+                    edit_sources,
+                    saved_auth_copies,
+                    &missing_credentials_message,
+                )?;
+                Ok(proxy_chain)
+            })() {
+                Ok(proxy_chain) => proxy_chain,
+                Err(error) => {
+                    form.error = Some(error.to_string());
+                    cx.notify();
+                    return None;
+                }
+            };
             let auth_override = (action == NewConnectionSubmitAction::SaveAndConnect
                 && form.auth_tab == SshAuthTab::Password
                 && !mosh_password_draft_is_persistent(form))
@@ -1192,6 +1819,7 @@ impl WorkspaceApp {
                 id: form.mosh_profile_id.clone(),
                 name: title,
                 group: serial_profile_group_from_form(&form.group, &this.i18n),
+                notes: saved_profile_notes(&form.notes),
                 icon: asset_icon_from_form(&form.icon),
                 color: asset_color_from_form(&form.color),
                 icon_background_color: asset_color_from_form(&form.icon_background_color),
@@ -1199,6 +1827,7 @@ impl WorkspaceApp {
                 ssh_port,
                 username,
                 auth,
+                proxy_chain,
                 server_executable,
                 udp_host_override: options.udp_host_override,
                 udp_port,
@@ -1207,6 +1836,8 @@ impl WorkspaceApp {
                 locale: options.locale,
                 identity_agent: identity_agent_from_form(&form.identity_agent),
                 legacy_ssh_compatibility: form.legacy_ssh_compatibility,
+                ssh_algorithms: form.ssh_algorithms.clone(),
+                terminal: form.terminal.clone(),
             };
             form.pending = true;
             form.error = None;
@@ -1252,8 +1883,7 @@ impl WorkspaceApp {
             return;
         }
 
-        let Some(auth) =
-            auth_override.or_else(|| runtime_mosh_auth_from_saved(&profile.auth, runtime_secrets))
+        let Some(config) = runtime_mosh_config_from_saved(&profile, runtime_secrets, auth_override)
         else {
             self.update_connection_form_state(cx, |state| {
                 if let Some(form) = state.form.as_mut() {
@@ -1264,16 +1894,6 @@ impl WorkspaceApp {
             cx.notify();
             return;
         };
-        let config = SshConfig {
-            host: profile.host.clone(),
-            port: profile.ssh_port,
-            username: profile.username.clone(),
-            auth,
-            identity_agent: profile.identity_agent.clone(),
-            legacy_ssh_compatibility: profile.legacy_ssh_compatibility,
-            strict_host_key_checking: true,
-            ..SshConfig::default()
-        };
         let title = profile.name.clone();
         let options = mosh_options_from_profile(&profile);
         self.update_connection_form_state(cx, |state| {
@@ -1283,6 +1903,235 @@ impl WorkspaceApp {
         });
         self.start_ssh_preflight(config, title, SshConnectionIntent::Mosh(options), cx);
         cx.notify();
+    }
+
+    pub(super) fn submit_standalone_sftp_connection_form(
+        &mut self,
+        action: NewConnectionSubmitAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if action == NewConnectionSubmitAction::Connect {
+            let initial_remote_path =
+                self.connection_form_state(cx)
+                    .form
+                    .as_ref()
+                    .and_then(|form| {
+                        let path = form.sftp_initial_remote_path.trim();
+                        (!path.is_empty()).then(|| path.to_string())
+                    });
+            self.start_new_connection_flow(
+                SshConnectionIntent::StandaloneSftp {
+                    saved_profile_id: None,
+                    initial_remote_path,
+                    pair_launch_token: None,
+                },
+                window,
+                cx,
+            );
+            return;
+        }
+
+        let prepared = self.with_connection_form_mut(cx, |this, form, cx| {
+            let form = form?;
+            if form.name.trim().is_empty()
+                && !form.host.trim().is_empty()
+                && !form.username.trim().is_empty()
+            {
+                form.name = format!("{}@{}", form.username.trim(), form.host.trim());
+            }
+            let existing_profile = form
+                .standalone_sftp_profile_id
+                .as_deref()
+                .and_then(|id| this.connection_store.get_standalone_sftp_profile(id))
+                .cloned();
+            let existing_auth = existing_profile
+                .as_ref()
+                .map(|profile| profile.auth.clone());
+            let base_request = if existing_auth.is_some() {
+                save_request_from_form_with_existing_auth(
+                    form,
+                    form.standalone_sftp_profile_id.clone(),
+                    existing_auth.as_ref(),
+                )
+            } else {
+                save_request_from_form_with_proxy_hop_prefix(
+                    form,
+                    &mut [],
+                    form.standalone_sftp_profile_id.clone(),
+                )
+            };
+            let base_request = match base_request {
+                Ok(request) => request,
+                Err(error) => {
+                    form.error = Some(error.to_string());
+                    cx.notify();
+                    return None;
+                }
+            };
+            let auth_override = (action == NewConnectionSubmitAction::SaveAndConnect
+                && form.auth_tab == SshAuthTab::Password
+                && !form.save_password)
+                .then(|| AuthMethod::password_secret(take_zeroizing_secret(&mut form.password)));
+            let secondary_endpoint =
+                if form.standalone_sftp_transfer_mode == StandaloneSftpTransferMode::RemoteRemote {
+                    match saved_standalone_sftp_secondary_endpoint_from_form(
+                        &this.connection_store,
+                        &mut form.standalone_sftp_secondary,
+                        existing_profile
+                            .as_ref()
+                            .and_then(|profile| profile.secondary_endpoint.as_ref()),
+                        &this.i18n.t("sessions.saved_next_hop.missing_credentials"),
+                    ) {
+                        Ok(endpoint) => Some(endpoint),
+                        Err(error) => {
+                            form.error = Some(error.to_string());
+                            cx.notify();
+                            return None;
+                        }
+                    }
+                } else {
+                    None
+                };
+            let secondary_auth_override = (action == NewConnectionSubmitAction::SaveAndConnect
+                && form.standalone_sftp_transfer_mode == StandaloneSftpTransferMode::RemoteRemote
+                && form.standalone_sftp_secondary.auth_tab == SshAuthTab::Password
+                && !form.standalone_sftp_secondary.save_password)
+                .then(|| {
+                    AuthMethod::password_secret(take_zeroizing_secret(
+                        &mut form.standalone_sftp_secondary.password,
+                    ))
+                });
+            let request = SaveStandaloneSftpProfileRequest {
+                id: base_request.id,
+                name: base_request.name,
+                group: base_request.group,
+                notes: base_request.notes,
+                icon: base_request.icon,
+                color: base_request.color,
+                icon_background_color: base_request.icon_background_color,
+                host: base_request.host,
+                port: base_request.port,
+                username: base_request.username,
+                auth: base_request.auth,
+                connect_timeout_seconds: base_request.connect_timeout_seconds,
+                proxy_chain: base_request.proxy_chain,
+                upstream_proxy: base_request.upstream_proxy,
+                proxy_command: base_request.proxy_command,
+                identity_agent: base_request.identity_agent,
+                legacy_ssh_compatibility: base_request.legacy_ssh_compatibility,
+                ssh_algorithms: base_request.ssh_algorithms,
+                initial_remote_path: (!form.sftp_initial_remote_path.trim().is_empty())
+                    .then(|| form.sftp_initial_remote_path.trim().to_string()),
+                transfer_mode: form.standalone_sftp_transfer_mode,
+                secondary_endpoint,
+            };
+            form.pending = true;
+            form.error = None;
+            Some((request, auth_override, secondary_auth_override))
+        });
+        let Some((request, auth_override, secondary_auth_override)) = prepared else {
+            return;
+        };
+
+        let (profile, runtime_secrets) = match self
+            .connection_store
+            .upsert_standalone_sftp_profile_with_runtime_secrets(request)
+        {
+            Ok(saved) => saved,
+            Err(error) => {
+                self.update_connection_form_state(cx, |state| {
+                    if let Some(form) = state.form.as_mut() {
+                        form.pending = false;
+                        form.error = Some(format!(
+                            "{}: {error}",
+                            self.i18n.t("sftp.standalone.save_failed")
+                        ));
+                    }
+                });
+                cx.notify();
+                return;
+            }
+        };
+        self.queue_cloud_sync_dirty_refresh(cx);
+        if action == NewConnectionSubmitAction::Save {
+            self.update_connection_form_state(cx, ConnectionFormState::clear);
+            self.close_new_connection_select(cx);
+            cx.notify();
+            return;
+        }
+
+        let mut runtime_secrets = runtime_secrets;
+        let secondary_runtime_secrets = runtime_secrets.secondary_endpoint.take();
+        let Some(config) = ssh_config_from_standalone_sftp_profile_with_runtime_secrets(
+            &self.connection_store,
+            self.settings_store.settings(),
+            &profile,
+            runtime_secrets,
+            auth_override,
+        ) else {
+            self.update_connection_form_state(cx, |state| {
+                if let Some(form) = state.form.as_mut() {
+                    form.pending = false;
+                    form.error = Some(self.i18n.t("sftp.standalone.missing_credentials"));
+                }
+            });
+            cx.notify();
+            return;
+        };
+        let secondary_config = match (
+            profile.secondary_endpoint.as_ref(),
+            secondary_runtime_secrets,
+        ) {
+            (Some(endpoint), Some(secrets)) => {
+                ssh_config_from_standalone_sftp_endpoint_with_runtime_secrets(
+                    &self.connection_store,
+                    self.settings_store.settings(),
+                    &profile.name,
+                    endpoint,
+                    secrets,
+                    secondary_auth_override,
+                )
+            }
+            (None, None) => None,
+            _ => None,
+        };
+        if profile.transfer_mode == StandaloneSftpTransferMode::RemoteRemote
+            && secondary_config.is_none()
+        {
+            self.update_connection_form_state(cx, |state| {
+                if let Some(form) = state.form.as_mut() {
+                    form.pending = false;
+                    form.error = Some(self.i18n.t("sftp.standalone.missing_credentials"));
+                }
+            });
+            cx.notify();
+            return;
+        }
+        let pair_launch_token = secondary_config.map(|secondary_config| {
+            let token = uuid::Uuid::new_v4().to_string();
+            self.pending_standalone_sftp_pair_launches.insert(
+                token.clone(),
+                PendingStandaloneSftpPairLaunch {
+                    saved_profile_id: profile.id.clone(),
+                    title: profile.name.clone(),
+                    primary_initial_remote_path: profile.initial_remote_path.clone(),
+                    secondary_initial_remote_path: profile
+                        .secondary_endpoint
+                        .as_ref()
+                        .and_then(|endpoint| endpoint.initial_remote_path.clone()),
+                    primary_config: None,
+                    secondary_config: Some(secondary_config),
+                },
+            );
+            token
+        });
+        let intent = SshConnectionIntent::StandaloneSftp {
+            saved_profile_id: Some(profile.id.clone()),
+            initial_remote_path: profile.initial_remote_path.clone(),
+            pair_launch_token,
+        };
+        self.start_new_connection_config_flow(config, profile.name, intent, window, cx);
     }
 
     pub(super) fn submit_remote_desktop_connection_form(
@@ -1391,6 +2240,7 @@ impl WorkspaceApp {
                     id: editing_profile_id,
                     name: label.clone(),
                     group: serial_profile_group_from_form(&form.group, &this.i18n),
+                    notes: saved_profile_notes(&form.notes),
                     icon: asset_icon_from_form(&form.icon),
                     color: asset_color_from_form(&form.color),
                     icon_background_color: asset_color_from_form(&form.icon_background_color),
@@ -1504,12 +2354,14 @@ impl WorkspaceApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if intent == SshConnectionIntent::Test
-            && self
-                .connection_form_state(cx)
-                .form
-                .as_ref()
-                .is_some_and(|form| form.auth_tab == SshAuthTab::TwoFactor)
+        if matches!(
+            intent,
+            SshConnectionIntent::Test | SshConnectionIntent::TestStandaloneSftp
+        ) && self
+            .connection_form_state(cx)
+            .form
+            .as_ref()
+            .is_some_and(|form| form.auth_tab == SshAuthTab::TwoFactor)
         {
             self.update_connection_form_state(cx, |state| {
                 if let Some(form) = state.form.as_mut() {
@@ -1519,7 +2371,10 @@ impl WorkspaceApp {
             cx.notify();
             return;
         }
-        let secret_handoff = if intent == SshConnectionIntent::Test {
+        let secret_handoff = if matches!(
+            intent,
+            SshConnectionIntent::Test | SshConnectionIntent::TestStandaloneSftp
+        ) {
             RuntimeSecretHandoff::CopyForTest
         } else {
             RuntimeSecretHandoff::Move
@@ -1570,7 +2425,14 @@ impl WorkspaceApp {
             }
         });
 
-        if config.proxy_chain.is_some() {
+        if config.proxy_chain.is_some()
+            && !matches!(
+                intent,
+                SshConnectionIntent::StandaloneSftp { .. }
+                    | SshConnectionIntent::StandaloneSftpSecondary { .. }
+                    | SshConnectionIntent::TestStandaloneSftp
+            )
+        {
             self.start_proxy_session_tree_connect(config, title, intent, None, window, cx);
             cx.notify();
             return;
@@ -1615,7 +2477,7 @@ impl WorkspaceApp {
                 SavedConnectionPromptAction::Connect,
                 Some(
                     self.i18n
-                        .t("sessionManager.edit_properties.password_placeholder"),
+                        .t("sessionManager.edit_properties.password_required"),
                 ),
                 window,
                 cx,
@@ -1639,7 +2501,7 @@ impl WorkspaceApp {
         };
         self.prepare_modal_interaction_boundary(cx);
         let mut form = form_from_saved_connection(&conn, error);
-        restore_saved_proxy_chain_in_form(&mut form, &conn);
+        restore_legacy_jump_host_in_form(&mut form, &conn, &self.connection_store);
         self.update_connection_form_state(cx, |state| {
             state.replace_with_new_form(form);
             state.editing_saved_connection_id = Some(id.to_string());
@@ -1662,7 +2524,8 @@ impl WorkspaceApp {
             return;
         };
         self.prepare_modal_interaction_boundary(cx);
-        let form = form_from_saved_connection(&conn, error);
+        let mut form = form_from_saved_connection(&conn, error);
+        restore_legacy_jump_host_in_form(&mut form, &conn, &self.connection_store);
         self.update_connection_form_state(cx, |state| {
             state.replace_with_new_form(form);
             state.editing_saved_connection_id = Some(id.to_string());
@@ -1747,7 +2610,23 @@ impl WorkspaceApp {
         let Some((mut config, title)) = self.build_new_connection_config(secret_handoff, cx) else {
             return;
         };
+        if config.proxy_command.is_none()
+            && let Some(conn) = self.connection_store.get(&id)
+            && let Some(saved_config) = ssh_config_from_saved_connection_with_auth(
+                &self.connection_store,
+                self.settings_store.settings(),
+                conn,
+                Some(AuthMethod::Agent),
+            )
+            && saved_config.proxy_command.is_some()
+        {
+            // Imported ProxyCommand routing remains attached when only auth is supplied by a prompt.
+            config.proxy_command = saved_config.proxy_command;
+            config.proxy_chain = None;
+            config.upstream_proxy = None;
+        }
         if config.proxy_chain.is_none()
+            && config.proxy_command.is_none()
             && let Some(conn) = self.connection_store.get(&id)
             && let Some(proxy_chain) =
                 proxy_chain_config_from_saved_connection(&self.connection_store, conn)
@@ -1933,21 +2812,61 @@ impl WorkspaceApp {
         let source_auth = source_connection
             .as_ref()
             .map(|connection| connection.auth.clone());
-        let Some(save_request) = self.with_connection_form_mut(cx, |_this, form, _cx| {
+        let Some(save_request) = self.with_connection_form_mut(cx, |this, form, _cx| {
             let form = form?;
-            Some(
-                save_request_from_form_with_existing_auth(form, None, source_auth.as_ref()).map(
-                    |mut request| {
-                        if form.proxy_hops.is_empty()
-                            && let Some(connection) = source_connection.as_ref()
-                        {
-                            // Preserve the source chain when it was not expanded for editing.
-                            request.proxy_chain = connection.proxy_chain.clone();
-                        }
-                        request
-                    },
-                ),
-            )
+            Some((|| {
+                let source_connection = source_connection
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Source connection is no longer available"))?;
+                let missing_credentials_message =
+                    this.i18n.t("sessions.saved_next_hop.missing_credentials");
+                let saved_auth_copies = saved_proxy_hop_auth_copies(
+                    &this.connection_store,
+                    &form.proxy_hops,
+                    &missing_credentials_message,
+                )?;
+                let edit_sources = form
+                    .proxy_hops
+                    .iter()
+                    .map(|hop| EditedProxyHopSource {
+                        persisted_proxy_hop_index: hop.persisted_proxy_hop_index,
+                        has_explicit_secret_draft: hop.has_explicit_secret_draft(),
+                    })
+                    .collect();
+                let mut request =
+                    save_request_from_form_with_existing_auth(form, None, source_auth.as_ref())?;
+                preserve_edited_proxy_hop_auth(
+                    &mut request.proxy_chain,
+                    &source_connection.proxy_chain,
+                    edit_sources,
+                    saved_auth_copies,
+                    &missing_credentials_message,
+                )?;
+                request.auth = auth_for_duplicate_owner(&this.connection_store, request.auth)?;
+                for hop in &mut request.proxy_chain {
+                    hop.auth = auth_for_duplicate_owner(
+                        &this.connection_store,
+                        std::mem::replace(&mut hop.auth, SavedAuth::Agent),
+                    )?;
+                }
+                request.upstream_proxy = upstream_proxy_for_duplicate_owner(
+                    &this.connection_store,
+                    request.upstream_proxy,
+                )?;
+                if request.proxy_command.is_some()
+                    && let Some(source_command) = source_connection.proxy_command.as_ref()
+                {
+                    // A duplicate receives a new protected-store owner instead of sharing an id.
+                    request.proxy_command = Some(SavedProxyCommand {
+                        keychain_id: None,
+                        plaintext_command: Some(
+                            this.connection_store
+                                .get_saved_proxy_command(source_command)?,
+                        ),
+                    });
+                }
+                Ok::<SaveConnectionRequest, anyhow::Error>(request)
+            })())
         }) else {
             return;
         };
@@ -2021,6 +2940,132 @@ impl WorkspaceApp {
         cx.notify();
     }
 
+    pub(in crate::workspace) fn open_saved_standalone_sftp_profile(
+        &mut self,
+        id: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(profile) = self
+            .connection_store
+            .get_standalone_sftp_profile(id)
+            .cloned()
+        else {
+            return;
+        };
+        if self.standalone_sftp_sessions.contains_key(id) {
+            let secondary_endpoint_id = format!("{id}:secondary");
+            if profile.transfer_mode == StandaloneSftpTransferMode::RemoteRemote
+                && self
+                    .standalone_sftp_sessions
+                    .contains_key(&secondary_endpoint_id)
+            {
+                self.open_standalone_sftp_pair_tab_surface(
+                    id.to_string(),
+                    secondary_endpoint_id,
+                    profile.name,
+                    profile.initial_remote_path,
+                    profile
+                        .secondary_endpoint
+                        .and_then(|endpoint| endpoint.initial_remote_path),
+                    cx,
+                );
+            } else {
+                self.open_standalone_sftp_tab_surface(
+                    id.to_string(),
+                    profile.name,
+                    profile.initial_remote_path,
+                    cx,
+                );
+            }
+            return;
+        }
+        let mut runtime_secrets = match self
+            .connection_store
+            .load_standalone_sftp_profile_runtime_secrets(id)
+        {
+            Ok(secrets) => secrets,
+            Err(error) => {
+                self.session_manager.update(cx, |session_manager, cx| {
+                    session_manager.set_status(Some(error.to_string()), cx);
+                });
+                return;
+            }
+        };
+        let secondary_runtime_secrets = runtime_secrets.secondary_endpoint.take();
+        let Some(config) = ssh_config_from_standalone_sftp_profile_with_runtime_secrets(
+            &self.connection_store,
+            self.settings_store.settings(),
+            &profile,
+            runtime_secrets,
+            None,
+        ) else {
+            self.session_manager.update(cx, |session_manager, cx| {
+                session_manager
+                    .set_status(Some(self.i18n.t("sftp.standalone.missing_credentials")), cx);
+            });
+            return;
+        };
+        let secondary_config = match (
+            profile.secondary_endpoint.as_ref(),
+            secondary_runtime_secrets,
+        ) {
+            (Some(endpoint), Some(secrets)) => {
+                ssh_config_from_standalone_sftp_endpoint_with_runtime_secrets(
+                    &self.connection_store,
+                    self.settings_store.settings(),
+                    &profile.name,
+                    endpoint,
+                    secrets,
+                    None,
+                )
+            }
+            (None, None) => None,
+            _ => None,
+        };
+        if profile.transfer_mode == StandaloneSftpTransferMode::RemoteRemote
+            && secondary_config.is_none()
+        {
+            self.session_manager.update(cx, |session_manager, cx| {
+                session_manager
+                    .set_status(Some(self.i18n.t("sftp.standalone.missing_credentials")), cx);
+            });
+            return;
+        }
+        let pair_launch_token = secondary_config.map(|secondary_config| {
+            let token = uuid::Uuid::new_v4().to_string();
+            self.pending_standalone_sftp_pair_launches.insert(
+                token.clone(),
+                PendingStandaloneSftpPairLaunch {
+                    saved_profile_id: profile.id.clone(),
+                    title: profile.name.clone(),
+                    primary_initial_remote_path: profile.initial_remote_path.clone(),
+                    secondary_initial_remote_path: profile
+                        .secondary_endpoint
+                        .as_ref()
+                        .and_then(|endpoint| endpoint.initial_remote_path.clone()),
+                    primary_config: None,
+                    secondary_config: Some(secondary_config),
+                },
+            );
+            token
+        });
+        self.session_manager.update(cx, |session_manager, cx| {
+            session_manager.set_status(Some(self.i18n.t("ssh.form.checking_host_key")), cx);
+        });
+        self.start_ssh_preflight(
+            config,
+            profile.name,
+            SshConnectionIntent::StandaloneSftp {
+                saved_profile_id: Some(profile.id),
+                initial_remote_path: profile.initial_remote_path,
+                pair_launch_token,
+            },
+            cx,
+        );
+        cx.notify();
+    }
+
     pub(in crate::workspace) fn open_saved_mosh_profile(
         &mut self,
         id: &str,
@@ -2030,7 +3075,24 @@ impl WorkspaceApp {
         let Some(profile) = self.connection_store.get_mosh_profile(id).cloned() else {
             return;
         };
-        let Some(auth) = auth_method_from_saved_auth(&self.connection_store, &profile.auth) else {
+        let runtime_secrets = match self.connection_store.load_mosh_profile_runtime_secrets(id) {
+            Ok(secrets) => secrets,
+            Err(_) => {
+                self.open_saved_mosh_profile_editor(id, window, cx);
+                let missing_credentials = self
+                    .i18n
+                    .t("sessionManager.mosh_profiles.missing_credentials");
+                self.update_connection_form_state(cx, |state| {
+                    if let Some(form) = state.form.as_mut() {
+                        form.error = Some(missing_credentials);
+                        form.focused_field = NewConnectionField::Name;
+                        form.field_focused = false;
+                    }
+                });
+                return;
+            }
+        };
+        let Some(config) = runtime_mosh_config_from_saved(&profile, runtime_secrets, None) else {
             // Portable profiles intentionally omit credentials. Open the editor at the
             // matching secret field so the device-local value can be supplied safely.
             self.open_saved_mosh_profile_editor(id, window, cx);
@@ -2052,16 +3114,6 @@ impl WorkspaceApp {
                 }
             });
             return;
-        };
-        let config = SshConfig {
-            host: profile.host.clone(),
-            port: profile.ssh_port,
-            username: profile.username.clone(),
-            auth,
-            identity_agent: profile.identity_agent.clone(),
-            legacy_ssh_compatibility: profile.legacy_ssh_compatibility,
-            strict_host_key_checking: true,
-            ..SshConfig::default()
         };
         let title = profile.name.clone();
         let options = mosh_options_from_profile(&profile);
@@ -2086,23 +3138,59 @@ impl WorkspaceApp {
         let upstream_proxy = config.upstream_proxy.take();
         let worker_config = config;
         let worker_title = title;
+        let routed_preflight = worker_config
+            .proxy_chain
+            .as_ref()
+            .is_some_and(|chain| !chain.is_empty())
+            && matches!(
+                &intent,
+                SshConnectionIntent::StandaloneSftp { .. }
+                    | SshConnectionIntent::StandaloneSftpSecondary { .. }
+                    | SshConnectionIntent::TestStandaloneSftp
+                    | SshConnectionIntent::Mosh(_)
+            );
+        let prompt_handler = Arc::new(NativeSshPromptHandler::new(tx.clone()));
+        let managed_key_resolver = managed_key_resolver_from_store(&self.connection_store);
         std::thread::spawn(move || {
-            let status = match tokio::runtime::Runtime::new() {
-                Ok(runtime) => runtime.block_on(check_host_key_with_upstream_proxy(
-                    &host,
+            let (checked_host, checked_port, status) = match tokio::runtime::Runtime::new() {
+                Ok(runtime) if routed_preflight => {
+                    // Routed SFTP and Mosh preflight authenticate through every hop. The
+                    // bounded zeroizing copy survives only until the accepted launch starts.
+                    let mut route_config = worker_config.clone();
+                    route_config.upstream_proxy = upstream_proxy.clone();
+                    runtime.block_on(
+                        SshTransportClient::new(route_config)
+                            .with_prompt_handler(prompt_handler)
+                            .with_managed_key_resolver(managed_key_resolver)
+                            .preflight_route_host_keys(),
+                    )
+                }
+                Ok(runtime) => (
+                    host.clone(),
                     port,
-                    connect_timeout_seconds,
-                    upstream_proxy.as_ref(),
-                )),
-                Err(error) => HostKeyStatus::Error {
-                    message: format!("failed to initialize SSH runtime: {error}"),
-                },
+                    runtime.block_on(check_host_key_with_route(
+                        &host,
+                        port,
+                        connect_timeout_seconds,
+                        upstream_proxy.as_ref(),
+                        worker_config.proxy_command.as_ref(),
+                    )),
+                ),
+                Err(error) => (
+                    host.clone(),
+                    port,
+                    HostKeyStatus::Error {
+                        message: format!("failed to initialize SSH runtime: {error}"),
+                    },
+                ),
             };
             let _ = tx.send(SshConnectionWorkerResult::Preflight {
                 config: worker_config,
                 upstream_proxy,
                 title: worker_title,
                 intent,
+                host: checked_host,
+                port: checked_port,
                 status,
             });
         });
@@ -2127,6 +3215,7 @@ mod saved_connection_open_tests {
             identity_agent: None,
             agent_forwarding_socket: None,
             legacy_ssh_compatibility: false,
+            ssh_algorithms: oxideterm_connections::SshAlgorithmPreferences::default(),
         }
     }
 
@@ -2188,6 +3277,38 @@ mod saved_connection_open_tests {
             } if password == "replacement-secret"
         ));
         assert!(form.password.is_empty());
+    }
+
+    #[test]
+    fn saved_mosh_proxy_chain_becomes_bootstrap_route() {
+        let mut profile = oxideterm_connections::MoshProfile::new(
+            "Mosh through jump",
+            "target.example.com",
+            22,
+            "ops",
+            SavedAuth::Agent,
+        );
+        profile.proxy_chain = vec![password_proxy_hop(SavedAuth::Password {
+            keychain_id: Some("jump-password-owner".to_string()),
+            plaintext_password: None,
+        })];
+
+        let config = runtime_mosh_config_from_saved(
+            &profile,
+            SavedMoshProfileRuntimeSecrets {
+                auth: None,
+                proxy_chain: vec![Some(SecretString::from("jump-password"))],
+            },
+            None,
+        )
+        .expect("Mosh bootstrap route");
+
+        assert_eq!(config.proxy_chain.as_ref().map(Vec::len), Some(1));
+        assert_eq!(
+            config.proxy_chain.as_ref().unwrap()[0].host,
+            "jump.example.com"
+        );
+        assert!(!format!("{config:?}").contains("jump-password"));
     }
 
     #[test]

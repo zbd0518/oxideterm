@@ -37,8 +37,8 @@
       "import_connections": "Nhập kết nối",
       "import_connections_hint": "Nhập cấu hình SSH và dữ liệu từ ứng dụng được hỗ trợ",
       "open_session_manager": "Trình quản lý phiên",
-      "open_session_manager_hint": "Duyệt, sửa, nhập và xuất các kết nối đã lưu",
-      "cloud_sync_hint": "Sao lưu dữ liệu không gian làm việc đã mã hóa lên dịch vụ của bạn"
+      "open_session_manager_hint": "Duyệt, sửa và nhập các kết nối đã lưu",
+      "cloud_sync_hint": "Sao lưu dữ liệu không gian làm việc đã mã hóa cục bộ hoặc lên dịch vụ của bạn"
     },
     "connection_monitor": {
       "title": "Giám sát kết nối"
@@ -55,6 +55,7 @@
     "cmd_new_terminal": "Terminal mới",
     "cmd_new_connection": "Kết nối SSH mới",
     "cmd_settings": "Mở cài đặt",
+    "cmd_manage_terminal_triggers": "Quản lý trình kích hoạt terminal",
     "cmd_toggle_sidebar": "Chuyển đổi thanh bên",
     "cmd_toggle_panel": "Bật/tắt bảng điều khiển",
     "cmd_toggle_ai_sidebar": "Bật/tắt OxideSens",
@@ -236,7 +237,9 @@
         "enable_sensitive_sync": "Bật đồng bộ nhạy cảm",
         "github_oauth_login": "Đăng nhập GitHub",
         "microsoft_oauth_login": "Đăng nhập Microsoft",
-        "google_oauth_login": "Đăng nhập Google"
+        "google_oauth_login": "Đăng nhập Google",
+        "import_local": "Nhập từ tệp cục bộ",
+        "export_local": "Xuất ra tệp cục bộ"
       },
       "fields": {
         "backend": "Backend",
@@ -275,6 +278,8 @@
         "sync_coverage": "Phạm vi được đồng bộ",
         "sync_preflight": "Kiểm tra trước đồng bộ",
         "sync_health": "Tình trạng đồng bộ",
+        "local_backup": "Sao lưu và khôi phục cục bộ",
+        "local_backup_description": "Sao lưu hoặc khôi phục tệp .oxide đã mã hóa mà không cần cấu hình đồng bộ đám mây.",
         "notes": "Ghi chú",
         "version_info": "Thông tin phiên bản"
       },
@@ -614,6 +619,8 @@
       },
       "confirm": {
         "import_title": "Nhập ảnh chụp từ xa?",
+        "force_upload_title": "Buộc ghi đè ảnh chụp từ xa?",
+        "force_upload_description": "Thao tác này thay thế ảnh chụp từ xa bằng dữ liệu cục bộ đã chọn, ngay cả khi dữ liệu đã được thay đổi trên thiết bị khác. Các thay đổi từ xa đó có thể bị mất.",
         "clear_secret_title": "Xóa thông tin đã lưu?",
         "clear_secret_description": "Thao tác này sẽ xóa giá trị đã lưu cho {{label}} khỏi bộ nhớ bảo mật. Hành động này không thể hoàn tác.",
         "restore_backup_title": "Khôi phục bản sao lưu cục bộ trước đó?",
@@ -727,11 +734,19 @@
         "key_path": "Đường dẫn khóa",
         "cert_path": "Đường dẫn chứng chỉ",
         "managed_key": "Khóa được quản lý",
+        "gssapi_authentication": "Ưu tiên Kerberos",
+        "gssapi_server_identity": "Tên máy chủ Kerberos",
+        "gssapi_delegate_credentials": "Ủy quyền thông tin Kerberos",
         "proxy_chain": "Chuỗi proxy",
         "agent_forwarding": "Chuyển tiếp agent",
         "post_connect_command": "Lệnh sau khi kết nối",
         "color": "Màu",
         "tags": "Thẻ",
+        "ssh_kex_algorithms": "Thuật toán trao đổi khóa SSH",
+        "ssh_host_key_algorithms": "Thuật toán khóa máy chủ SSH",
+        "ssh_cipher_algorithms": "Thuật toán mã hóa SSH",
+        "ssh_mac_algorithms": "Thuật toán toàn vẹn SSH",
+        "ssh_compression_algorithms": "Thuật toán nén SSH",
         "forward_type": "Kiểu chuyển tiếp",
         "bind_address": "Địa chỉ lắng nghe",
         "bind_port": "Cổng lắng nghe",

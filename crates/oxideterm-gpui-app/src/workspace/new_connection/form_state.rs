@@ -3,14 +3,20 @@ use std::fmt;
 use oxideterm_connections::{
     AuthType, ConnectionInfo, ConnectionTerminalOptions, ConnectionX11ForwardingOptions,
     DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS, MoshIpFamily, MoshPredictionMode, MoshProfile,
-    MoshUdpPortSelection, RemoteDesktopProfile, SavedAuth, SavedConnection,
-    SavedUpstreamProxyProtocol, SerialProfile, TelnetProfile, TransportUsernameTransition,
-    transport_port_replacement, transport_username_transition,
+    MoshUdpPortSelection, RemoteDesktopProfile, SavedAuth, SavedConnection, SavedProxyHop,
+    SavedUpstreamProxyProtocol, SerialProfile, SshAlgorithmPreferences, StandaloneSftpTransferMode,
+    TelnetProfile, TransportUsernameTransition, transport_port_replacement,
+    transport_username_transition,
 };
 pub(in crate::workspace) use oxideterm_connections::{
     ConnectionTransport as NewConnectionTransport, RDP_DEFAULT_PORT_TEXT, SSH_DEFAULT_PORT_TEXT,
     TELNET_DEFAULT_PORT_TEXT, VNC_DEFAULT_PORT_TEXT,
 };
+
+/// Shared geometry keeps textarea rendering and IME hit testing aligned.
+pub(in crate::workspace) const CONNECTION_NOTES_LINE_HEIGHT: f32 = 20.0;
+pub(in crate::workspace) const CONNECTION_NOTES_MIN_HEIGHT: f32 = 84.0;
+pub(in crate::workspace) const CONNECTION_NOTES_VERTICAL_PADDING: f32 = 8.0;
 use oxideterm_remote_desktop::{
     RemoteDesktopProviderCapabilities, RemoteDesktopSessionOptions, RemoteDesktopVncCompression,
     RemoteDesktopVncImageQuality, RemoteDesktopVncOptions, RemoteDesktopVncSecurityPolicy,
@@ -146,13 +152,19 @@ pub(in crate::workspace) enum NewConnectionSelect {
     Group,
     KeyAuthSource,
     ManagedKey,
+    StandaloneSftpSecondaryKeyAuthSource,
+    StandaloneSftpSecondaryManagedKey,
     JumpSavedConnection,
     JumpKeyAuthSource,
     JumpManagedKey,
     UpstreamProxyPolicy,
     UpstreamProxyProtocol,
     UpstreamProxyAuth,
+    StandaloneSftpSecondaryUpstreamProxyPolicy,
+    StandaloneSftpSecondaryUpstreamProxyProtocol,
+    StandaloneSftpSecondaryUpstreamProxyAuth,
     RemoteDesktopSshGateway,
+    LocalShell,
     SerialPort,
     SerialDataBits,
     SerialStopBits,
@@ -161,6 +173,9 @@ pub(in crate::workspace) enum NewConnectionSelect {
     TerminalEncoding,
     TerminalBackspaceSequence,
     TerminalDeleteSequence,
+    TerminalSemanticScheme,
+    TerminalHighlightRuleSet,
+    TerminalSessionLogPolicy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -176,6 +191,13 @@ pub(in crate::workspace) enum NewConnectionUpstreamProxyAuth {
     Password,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(in crate::workspace) enum ConnectionRouteTarget {
+    #[default]
+    Primary,
+    StandaloneSftpSecondary,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(in crate::workspace) enum NewConnectionField {
     Name,
@@ -187,9 +209,32 @@ pub(in crate::workspace) enum NewConnectionField {
     ManagedKeyId,
     CertPath,
     Passphrase,
+    GssapiServerIdentity,
     IdentityAgent,
     Group,
+    Notes,
+    InitialRemotePath,
+    ConnectTimeoutSeconds,
+    StandaloneSftpSecondaryHost,
+    StandaloneSftpSecondaryPort,
+    StandaloneSftpSecondaryUsername,
+    StandaloneSftpSecondaryPassword,
+    StandaloneSftpSecondaryKeyPath,
+    StandaloneSftpSecondaryManagedKeyId,
+    StandaloneSftpSecondaryCertPath,
+    StandaloneSftpSecondaryPassphrase,
+    StandaloneSftpSecondaryGssapiServerIdentity,
+    StandaloneSftpSecondaryIdentityAgent,
+    StandaloneSftpSecondaryInitialRemotePath,
+    StandaloneSftpSecondaryConnectTimeoutSeconds,
+    StandaloneSftpSecondaryProxyCommand,
+    StandaloneSftpSecondaryUpstreamProxyHost,
+    StandaloneSftpSecondaryUpstreamProxyPort,
+    StandaloneSftpSecondaryUpstreamProxyNoProxy,
+    StandaloneSftpSecondaryUpstreamProxyUsername,
+    StandaloneSftpSecondaryUpstreamProxyPassword,
     PostConnectCommand,
+    ProxyCommand,
     Color,
     IconBackgroundColor,
     JumpHost,
@@ -200,6 +245,7 @@ pub(in crate::workspace) enum NewConnectionField {
     JumpManagedKeyId,
     JumpCertPath,
     JumpPassphrase,
+    JumpGssapiServerIdentity,
     JumpIdentityAgent,
     UpstreamProxyHost,
     UpstreamProxyPort,
@@ -224,6 +270,7 @@ pub(in crate::workspace) enum RemoteDesktopSessionFeature {
     AudioPlayback,
     AudioCapture,
     MultiMonitor,
+    DisableRdpGraphicsPipeline,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -272,6 +319,8 @@ pub(in crate::workspace) fn remote_desktop_feature_supported(
         RemoteDesktopSessionFeature::AudioPlayback => capabilities.audio_playback,
         RemoteDesktopSessionFeature::AudioCapture => capabilities.audio_capture,
         RemoteDesktopSessionFeature::MultiMonitor => capabilities.multi_monitor,
+        // Compatibility controls are client policy rather than provider capabilities.
+        RemoteDesktopSessionFeature::DisableRdpGraphicsPipeline => true,
     }
 }
 
@@ -287,6 +336,9 @@ pub(in crate::workspace) fn remote_desktop_feature_selected(
         RemoteDesktopSessionFeature::AudioPlayback => options.audio.playback,
         RemoteDesktopSessionFeature::AudioCapture => options.audio.capture,
         RemoteDesktopSessionFeature::MultiMonitor => options.display.use_all_monitors,
+        RemoteDesktopSessionFeature::DisableRdpGraphicsPipeline => {
+            options.rdp.disable_graphics_pipeline
+        }
     }
 }
 
@@ -305,6 +357,9 @@ pub(in crate::workspace) fn toggle_remote_desktop_feature(
         RemoteDesktopSessionFeature::MultiMonitor => {
             options.display.use_all_monitors = !selected;
         }
+        RemoteDesktopSessionFeature::DisableRdpGraphicsPipeline => {
+            options.rdp.disable_graphics_pipeline = !selected;
+        }
     }
 }
 
@@ -320,10 +375,14 @@ pub(in crate::workspace) struct NewConnectionProxyHop {
     pub(in crate::workspace) managed_key_id: String,
     pub(in crate::workspace) cert_path: String,
     pub(in crate::workspace) passphrase: String,
+    pub(in crate::workspace) gssapi_enabled: bool,
+    pub(in crate::workspace) gssapi_server_identity: String,
+    pub(in crate::workspace) gssapi_delegate_credentials: bool,
     pub(in crate::workspace) agent_forwarding: bool,
     pub(in crate::workspace) identity_agent: String,
     pub(in crate::workspace) agent_forwarding_socket: Option<String>,
     pub(in crate::workspace) legacy_ssh_compatibility: bool,
+    pub(in crate::workspace) ssh_algorithms: SshAlgorithmPreferences,
 }
 
 impl fmt::Debug for NewConnectionProxyHop {
@@ -341,6 +400,15 @@ impl fmt::Debug for NewConnectionProxyHop {
             .field("managed_key_id", &self.managed_key_id)
             .field("cert_path", &self.cert_path)
             .field("passphrase", &"[redacted secret]")
+            .field("gssapi_enabled", &self.gssapi_enabled)
+            .field(
+                "gssapi_server_identity_configured",
+                &!self.gssapi_server_identity.trim().is_empty(),
+            )
+            .field(
+                "gssapi_delegate_credentials",
+                &self.gssapi_delegate_credentials,
+            )
             .field("agent_forwarding", &self.agent_forwarding)
             .field(
                 "identity_agent_configured",
@@ -369,10 +437,49 @@ impl NewConnectionProxyHop {
             managed_key_id: String::new(),
             cert_path: String::new(),
             passphrase: String::new(),
+            gssapi_enabled: false,
+            gssapi_server_identity: String::new(),
+            gssapi_delegate_credentials: false,
             agent_forwarding: false,
             identity_agent: String::new(),
             agent_forwarding_socket: None,
             legacy_ssh_compatibility: false,
+            ssh_algorithms: oxideterm_connections::SshAlgorithmPreferences::default(),
+        }
+    }
+
+    pub(in crate::workspace) fn from_saved(
+        persisted_proxy_hop_index: usize,
+        hop: &SavedProxyHop,
+    ) -> Self {
+        // Reopen only route metadata; protected credentials stay in their current owner.
+        Self {
+            saved_connection_id: String::new(),
+            persisted_proxy_hop_index: Some(persisted_proxy_hop_index),
+            host: hop.host.clone(),
+            port: hop.port.to_string(),
+            username: hop.username.clone(),
+            auth_tab: ssh_auth_tab_from_saved_auth(&hop.auth),
+            password: String::new(),
+            key_path: hop.auth.key_path().unwrap_or_default().to_string(),
+            managed_key_id: hop.auth.managed_key_id().unwrap_or_default().to_string(),
+            cert_path: hop.auth.cert_path().unwrap_or_default().to_string(),
+            passphrase: String::new(),
+            gssapi_enabled: hop.auth.gssapi_options().is_some(),
+            gssapi_server_identity: hop
+                .auth
+                .gssapi_options()
+                .and_then(|(identity, _)| identity.map(ToOwned::to_owned))
+                .unwrap_or_default(),
+            gssapi_delegate_credentials: hop
+                .auth
+                .gssapi_options()
+                .is_some_and(|(_, delegate)| delegate),
+            agent_forwarding: hop.agent_forwarding,
+            identity_agent: hop.identity_agent.clone().unwrap_or_default(),
+            agent_forwarding_socket: hop.agent_forwarding_socket.clone(),
+            legacy_ssh_compatibility: hop.legacy_ssh_compatibility,
+            ssh_algorithms: hop.ssh_algorithms.clone(),
         }
     }
 
@@ -405,6 +512,17 @@ impl NewConnectionProxyHop {
             && self.key_path.trim() == connection.auth.key_path().unwrap_or_default()
             && self.cert_path.trim() == connection.auth.cert_path().unwrap_or_default()
             && self.managed_key_id.trim() == connection.auth.managed_key_id().unwrap_or_default()
+            && self.gssapi_server_identity.trim()
+                == connection
+                    .auth
+                    .gssapi_options()
+                    .and_then(|(identity, _)| identity)
+                    .unwrap_or_default()
+            && self.gssapi_delegate_credentials
+                == connection
+                    .auth
+                    .gssapi_options()
+                    .is_some_and(|(_, delegate)| delegate)
     }
 
     fn zeroize_secret_drafts(&mut self) {
@@ -442,15 +560,22 @@ impl NewConnectionProxyHop {
         self.key_path = connection.key_path.clone().unwrap_or_default();
         self.cert_path = connection.cert_path.clone().unwrap_or_default();
         self.managed_key_id = connection.managed_key_id.clone().unwrap_or_default();
+        self.gssapi_enabled = connection.gssapi_authentication;
+        self.gssapi_server_identity = connection
+            .gssapi_server_identity
+            .clone()
+            .unwrap_or_default();
+        self.gssapi_delegate_credentials = connection.gssapi_delegate_credentials;
         self.agent_forwarding = connection.agent_forwarding;
         self.identity_agent = connection.identity_agent.clone().unwrap_or_default();
         self.agent_forwarding_socket = connection.agent_forwarding_socket.clone();
         self.legacy_ssh_compatibility = connection.legacy_ssh_compatibility;
+        self.ssh_algorithms = connection.ssh_algorithms.clone();
     }
 }
 
 pub(in crate::workspace) fn ssh_auth_tab_from_saved_auth(auth: &SavedAuth) -> SshAuthTab {
-    match auth {
+    match auth.conventional_fallback() {
         SavedAuth::Password { .. } => SshAuthTab::Password,
         SavedAuth::Key { key_path, .. } if key_path.is_empty() => SshAuthTab::DefaultKey,
         SavedAuth::Key { .. } => SshAuthTab::SshKey,
@@ -458,12 +583,172 @@ pub(in crate::workspace) fn ssh_auth_tab_from_saved_auth(auth: &SavedAuth) -> Ss
         SavedAuth::Certificate { .. } => SshAuthTab::Certificate,
         SavedAuth::KeyboardInteractive => SshAuthTab::TwoFactor,
         SavedAuth::Agent => SshAuthTab::Agent,
+        SavedAuth::KerberosPreferred { .. } => unreachable!("fallback authentication is flattened"),
     }
 }
 
 impl Drop for NewConnectionProxyHop {
     fn drop(&mut self) {
         // Proxy credentials remain in one form owner and are scrubbed on removal.
+        self.zeroize_secret_drafts();
+    }
+}
+
+pub(in crate::workspace) struct StandaloneSftpSecondaryForm {
+    pub(in crate::workspace) host: String,
+    pub(in crate::workspace) port: String,
+    pub(in crate::workspace) username: String,
+    pub(in crate::workspace) auth_tab: SshAuthTab,
+    pub(in crate::workspace) password: String,
+    pub(in crate::workspace) password_keychain_id: Option<String>,
+    pub(in crate::workspace) password_visible: bool,
+    pub(in crate::workspace) key_path: String,
+    pub(in crate::workspace) managed_key_id: String,
+    pub(in crate::workspace) cert_path: String,
+    pub(in crate::workspace) passphrase: String,
+    pub(in crate::workspace) gssapi_enabled: bool,
+    pub(in crate::workspace) gssapi_server_identity: String,
+    pub(in crate::workspace) gssapi_delegate_credentials: bool,
+    pub(in crate::workspace) passphrase_visible: bool,
+    pub(in crate::workspace) save_password: bool,
+    pub(in crate::workspace) identity_agent: String,
+    pub(in crate::workspace) agent_available: Option<bool>,
+    pub(in crate::workspace) legacy_ssh_compatibility: bool,
+    pub(in crate::workspace) ssh_algorithms: SshAlgorithmPreferences,
+    pub(in crate::workspace) connect_timeout_seconds: u64,
+    /// Preserves transient invalid input while the numeric value fails closed at zero.
+    pub(in crate::workspace) connect_timeout_seconds_text: String,
+    pub(in crate::workspace) initial_remote_path: String,
+    pub(in crate::workspace) proxy_hops: Vec<NewConnectionProxyHop>,
+    pub(in crate::workspace) proxy_chain_expanded: bool,
+    pub(in crate::workspace) proxy_command_enabled: bool,
+    pub(in crate::workspace) proxy_command: String,
+    pub(in crate::workspace) proxy_command_keychain_id: Option<String>,
+    pub(in crate::workspace) upstream_proxy_policy: NewConnectionUpstreamProxyPolicy,
+    pub(in crate::workspace) upstream_proxy_protocol: SavedUpstreamProxyProtocol,
+    pub(in crate::workspace) upstream_proxy_host: String,
+    pub(in crate::workspace) upstream_proxy_port: String,
+    pub(in crate::workspace) upstream_proxy_auth: NewConnectionUpstreamProxyAuth,
+    pub(in crate::workspace) upstream_proxy_username: String,
+    pub(in crate::workspace) upstream_proxy_password: String,
+    pub(in crate::workspace) upstream_proxy_password_keychain_id: Option<String>,
+    pub(in crate::workspace) upstream_proxy_remote_dns: bool,
+    pub(in crate::workspace) upstream_proxy_no_proxy: String,
+}
+
+impl Default for StandaloneSftpSecondaryForm {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            port: SSH_DEFAULT_PORT_TEXT.to_string(),
+            username: "root".to_string(),
+            auth_tab: SshAuthTab::Password,
+            password: String::new(),
+            password_keychain_id: None,
+            password_visible: false,
+            key_path: String::new(),
+            managed_key_id: String::new(),
+            cert_path: String::new(),
+            passphrase: String::new(),
+            gssapi_enabled: false,
+            gssapi_server_identity: String::new(),
+            gssapi_delegate_credentials: false,
+            passphrase_visible: false,
+            save_password: false,
+            identity_agent: String::new(),
+            agent_available: None,
+            legacy_ssh_compatibility: false,
+            ssh_algorithms: oxideterm_connections::SshAlgorithmPreferences::default(),
+            connect_timeout_seconds: DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS,
+            connect_timeout_seconds_text: DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS.to_string(),
+            initial_remote_path: String::new(),
+            proxy_hops: Vec::new(),
+            proxy_chain_expanded: false,
+            proxy_command_enabled: false,
+            proxy_command: String::new(),
+            proxy_command_keychain_id: None,
+            upstream_proxy_policy: NewConnectionUpstreamProxyPolicy::UseGlobal,
+            upstream_proxy_protocol: SavedUpstreamProxyProtocol::Socks5,
+            upstream_proxy_host: "127.0.0.1".to_string(),
+            upstream_proxy_port: "1080".to_string(),
+            upstream_proxy_auth: NewConnectionUpstreamProxyAuth::None,
+            upstream_proxy_username: String::new(),
+            upstream_proxy_password: String::new(),
+            upstream_proxy_password_keychain_id: None,
+            upstream_proxy_remote_dns: true,
+            upstream_proxy_no_proxy: String::new(),
+        }
+    }
+}
+
+impl fmt::Debug for StandaloneSftpSecondaryForm {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StandaloneSftpSecondaryForm")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("auth_tab", &self.auth_tab)
+            .field("password", &"[redacted secret]")
+            .field("password_keychain_id", &self.password_keychain_id)
+            .field("key_path", &self.key_path)
+            .field("managed_key_id", &self.managed_key_id)
+            .field("cert_path", &self.cert_path)
+            .field("passphrase", &"[redacted secret]")
+            .field("gssapi_enabled", &self.gssapi_enabled)
+            .field(
+                "gssapi_server_identity_configured",
+                &!self.gssapi_server_identity.trim().is_empty(),
+            )
+            .field(
+                "gssapi_delegate_credentials",
+                &self.gssapi_delegate_credentials,
+            )
+            .field("save_password", &self.save_password)
+            .field(
+                "identity_agent_configured",
+                &identity_agent_selector(&self.identity_agent).is_some(),
+            )
+            .field("legacy_ssh_compatibility", &self.legacy_ssh_compatibility)
+            .field("connect_timeout_seconds", &self.connect_timeout_seconds)
+            .field("initial_remote_path", &self.initial_remote_path)
+            .field("proxy_hops", &self.proxy_hops)
+            .field("proxy_chain_expanded", &self.proxy_chain_expanded)
+            .field("proxy_command_enabled", &self.proxy_command_enabled)
+            .field("proxy_command", &"[redacted secret]")
+            .field("proxy_command_keychain_id", &self.proxy_command_keychain_id)
+            .field("upstream_proxy_policy", &self.upstream_proxy_policy)
+            .field("upstream_proxy_protocol", &self.upstream_proxy_protocol)
+            .field("upstream_proxy_host", &self.upstream_proxy_host)
+            .field("upstream_proxy_port", &self.upstream_proxy_port)
+            .field("upstream_proxy_auth", &self.upstream_proxy_auth)
+            .field("upstream_proxy_username", &self.upstream_proxy_username)
+            .field("upstream_proxy_password", &"[redacted secret]")
+            .field(
+                "upstream_proxy_password_keychain_id",
+                &self.upstream_proxy_password_keychain_id,
+            )
+            .field("upstream_proxy_remote_dns", &self.upstream_proxy_remote_dns)
+            .field("upstream_proxy_no_proxy", &self.upstream_proxy_no_proxy)
+            .finish()
+    }
+}
+
+impl StandaloneSftpSecondaryForm {
+    fn zeroize_secret_drafts(&mut self) {
+        self.password.zeroize();
+        self.passphrase.zeroize();
+        self.proxy_command.zeroize();
+        self.upstream_proxy_password.zeroize();
+        for hop in &mut self.proxy_hops {
+            hop.zeroize_secret_drafts();
+        }
+    }
+}
+
+impl Drop for StandaloneSftpSecondaryForm {
+    fn drop(&mut self) {
+        // The second endpoint owns its drafts independently and scrubs them on form teardown.
         self.zeroize_secret_drafts();
     }
 }
@@ -477,6 +762,11 @@ pub(in crate::workspace) struct NewConnectionForm {
     pub(in crate::workspace) port: String,
     pub(in crate::workspace) username: String,
     pub(in crate::workspace) auth_tab: SshAuthTab,
+    pub(in crate::workspace) gssapi_enabled: bool,
+    pub(in crate::workspace) gssapi_server_identity: String,
+    pub(in crate::workspace) gssapi_delegate_credentials: bool,
+    pub(in crate::workspace) gssapi_credentials_available: Option<bool>,
+    pub(in crate::workspace) gssapi_credentials_check_pending: bool,
     pub(in crate::workspace) password: String,
     pub(in crate::workspace) remote_desktop_session_options: RemoteDesktopSessionOptions,
     /// Identifies an existing RDP/VNC asset without overloading SSH edit state.
@@ -489,11 +779,15 @@ pub(in crate::workspace) struct NewConnectionForm {
     pub(in crate::workspace) serial_profile_id: Option<String>,
     /// Identifies an existing Telnet asset without changing a live Telnet session.
     pub(in crate::workspace) telnet_profile_id: Option<String>,
+    /// Identifies an independent SFTP asset without creating a NodeRouter node.
+    pub(in crate::workspace) standalone_sftp_profile_id: Option<String>,
+    /// Controls whether the dual-pane SFTP surface has one or two authenticated remotes.
+    pub(in crate::workspace) standalone_sftp_transfer_mode: StandaloneSftpTransferMode,
+    /// Owns the second endpoint only while editing a remote-to-remote profile.
+    pub(in crate::workspace) standalone_sftp_secondary: StandaloneSftpSecondaryForm,
     pub(in crate::workspace) saved_password_keychain_id: Option<String>,
     pub(in crate::workspace) password_loaded: bool,
     pub(in crate::workspace) password_visible: bool,
-    pub(in crate::workspace) password_loading: bool,
-    pub(in crate::workspace) password_error: Option<String>,
     pub(in crate::workspace) key_path: String,
     pub(in crate::workspace) managed_key_id: String,
     pub(in crate::workspace) cert_path: String,
@@ -501,15 +795,41 @@ pub(in crate::workspace) struct NewConnectionForm {
     pub(in crate::workspace) passphrase_visible: bool,
     pub(in crate::workspace) save_password: bool,
     pub(in crate::workspace) group: String,
+    pub(in crate::workspace) notes: String,
+    pub(in crate::workspace) sftp_initial_remote_path: String,
     pub(in crate::workspace) post_connect_command: String,
+    pub(in crate::workspace) proxy_command_enabled: bool,
+    pub(in crate::workspace) proxy_command: String,
+    pub(in crate::workspace) proxy_command_keychain_id: Option<String>,
     pub(in crate::workspace) color: String,
     pub(in crate::workspace) icon_background_color: String,
     pub(in crate::workspace) icon: String,
     pub(in crate::workspace) icon_picker_expanded: bool,
+    // None uses the default expanded state; user toggles remain transient UI state.
+    pub(in crate::workspace) basic_section_expanded: Option<bool>,
+    pub(in crate::workspace) authentication_section_expanded: Option<bool>,
+    pub(in crate::workspace) route_section_expanded: Option<bool>,
+    pub(in crate::workspace) standalone_sftp_secondary_route_section_expanded: Option<bool>,
+    pub(in crate::workspace) ssh_options_section_expanded: Option<bool>,
+    pub(in crate::workspace) terminal_section_expanded: Option<bool>,
+    pub(in crate::workspace) appearance_section_expanded: Option<bool>,
+    pub(in crate::workspace) remote_gateway_section_expanded: Option<bool>,
+    pub(in crate::workspace) vnc_preferences_section_expanded: Option<bool>,
+    pub(in crate::workspace) remote_features_section_expanded: Option<bool>,
+    pub(in crate::workspace) serial_parameters_section_expanded: Option<bool>,
+    pub(in crate::workspace) mosh_options_section_expanded: Option<bool>,
+    pub(in crate::workspace) sftp_options_section_expanded: Option<bool>,
+    pub(in crate::workspace) local_shell_section_expanded: Option<bool>,
+    /// Keeps the uncommon transport group out of the primary list until requested.
+    pub(in crate::workspace) advanced_connections_expanded: bool,
     pub(in crate::workspace) tags: Vec<String>,
     pub(in crate::workspace) proxy_hops: Vec<NewConnectionProxyHop>,
     pub(in crate::workspace) proxy_chain_expanded: bool,
     pub(in crate::workspace) jump_server_form: Option<NewConnectionProxyHop>,
+    /// Identifies a hop temporarily moved into the editor so cancel can restore it in place.
+    pub(in crate::workspace) jump_server_edit_index: Option<usize>,
+    /// Selects which independently owned endpoint receives the pending jump host.
+    pub(in crate::workspace) jump_server_target: ConnectionRouteTarget,
     pub(in crate::workspace) upstream_proxy_policy: NewConnectionUpstreamProxyPolicy,
     pub(in crate::workspace) upstream_proxy_protocol: SavedUpstreamProxyProtocol,
     pub(in crate::workspace) upstream_proxy_host: String,
@@ -524,7 +844,12 @@ pub(in crate::workspace) struct NewConnectionForm {
     pub(in crate::workspace) identity_agent: String,
     pub(in crate::workspace) agent_forwarding_socket: Option<String>,
     pub(in crate::workspace) legacy_ssh_compatibility: bool,
+    pub(in crate::workspace) ssh_algorithms: SshAlgorithmPreferences,
+    pub(in crate::workspace) ssh_algorithm_editor_open: bool,
+    pub(in crate::workspace) ssh_algorithm_editor_category: oxideterm_ssh::SshAlgorithmCategory,
     pub(in crate::workspace) connect_timeout_seconds: u64,
+    /// Preserves transient invalid input while the numeric value fails closed at zero.
+    pub(in crate::workspace) connect_timeout_seconds_text: String,
     pub(in crate::workspace) dedicated_new_terminal_connection: bool,
     pub(in crate::workspace) x11_forwarding: ConnectionX11ForwardingOptions,
     pub(in crate::workspace) terminal: ConnectionTerminalOptions,
@@ -566,6 +891,11 @@ impl fmt::Debug for NewConnectionForm {
             .field("port", &self.port)
             .field("username", &self.username)
             .field("auth_tab", &self.auth_tab)
+            .field("gssapi_enabled", &self.gssapi_enabled)
+            .field(
+                "gssapi_credentials_available",
+                &self.gssapi_credentials_available,
+            )
             .field("password", &"[redacted secret]")
             .field(
                 "remote_desktop_session_options",
@@ -580,13 +910,20 @@ impl fmt::Debug for NewConnectionForm {
             .field("serial_profile_id", &self.serial_profile_id)
             .field("telnet_profile_id", &self.telnet_profile_id)
             .field(
+                "standalone_sftp_profile_id",
+                &self.standalone_sftp_profile_id,
+            )
+            .field(
+                "standalone_sftp_transfer_mode",
+                &self.standalone_sftp_transfer_mode,
+            )
+            .field("standalone_sftp_secondary", &self.standalone_sftp_secondary)
+            .field(
                 "saved_password_keychain_id",
                 &self.saved_password_keychain_id,
             )
             .field("password_loaded", &self.password_loaded)
             .field("password_visible", &self.password_visible)
-            .field("password_loading", &self.password_loading)
-            .field("password_error", &self.password_error)
             .field("key_path", &self.key_path)
             .field("managed_key_id", &self.managed_key_id)
             .field("cert_path", &self.cert_path)
@@ -594,15 +931,69 @@ impl fmt::Debug for NewConnectionForm {
             .field("passphrase_visible", &self.passphrase_visible)
             .field("save_password", &self.save_password)
             .field("group", &self.group)
+            // Notes are user-authored free text and may contain sensitive context.
+            .field("notes_present", &!self.notes.is_empty())
+            .field("sftp_initial_remote_path", &self.sftp_initial_remote_path)
             .field("post_connect_command", &self.post_connect_command)
+            .field("proxy_command_enabled", &self.proxy_command_enabled)
+            .field("proxy_command", &"[redacted secret]")
+            .field("proxy_command_keychain_id", &self.proxy_command_keychain_id)
             .field("color", &self.color)
             .field("icon_background_color", &self.icon_background_color)
             .field("icon", &self.icon)
             .field("icon_picker_expanded", &self.icon_picker_expanded)
+            .field("basic_section_expanded", &self.basic_section_expanded)
+            .field(
+                "authentication_section_expanded",
+                &self.authentication_section_expanded,
+            )
+            .field("route_section_expanded", &self.route_section_expanded)
+            .field(
+                "ssh_options_section_expanded",
+                &self.ssh_options_section_expanded,
+            )
+            .field("terminal_section_expanded", &self.terminal_section_expanded)
+            .field(
+                "appearance_section_expanded",
+                &self.appearance_section_expanded,
+            )
+            .field(
+                "remote_gateway_section_expanded",
+                &self.remote_gateway_section_expanded,
+            )
+            .field(
+                "vnc_preferences_section_expanded",
+                &self.vnc_preferences_section_expanded,
+            )
+            .field(
+                "remote_features_section_expanded",
+                &self.remote_features_section_expanded,
+            )
+            .field(
+                "serial_parameters_section_expanded",
+                &self.serial_parameters_section_expanded,
+            )
+            .field(
+                "mosh_options_section_expanded",
+                &self.mosh_options_section_expanded,
+            )
+            .field(
+                "sftp_options_section_expanded",
+                &self.sftp_options_section_expanded,
+            )
+            .field(
+                "local_shell_section_expanded",
+                &self.local_shell_section_expanded,
+            )
+            .field(
+                "advanced_connections_expanded",
+                &self.advanced_connections_expanded,
+            )
             .field("tags", &self.tags)
             .field("proxy_hops", &self.proxy_hops)
             .field("proxy_chain_expanded", &self.proxy_chain_expanded)
             .field("jump_server_form", &self.jump_server_form)
+            .field("jump_server_edit_index", &self.jump_server_edit_index)
             .field("upstream_proxy_policy", &self.upstream_proxy_policy)
             .field("upstream_proxy_protocol", &self.upstream_proxy_protocol)
             .field("upstream_proxy_host", &self.upstream_proxy_host)
@@ -670,6 +1061,11 @@ impl Default for NewConnectionForm {
             port: SSH_DEFAULT_PORT_TEXT.to_string(),
             username: "root".to_string(),
             auth_tab: SshAuthTab::Password,
+            gssapi_enabled: false,
+            gssapi_server_identity: String::new(),
+            gssapi_delegate_credentials: false,
+            gssapi_credentials_available: None,
+            gssapi_credentials_check_pending: false,
             password: String::new(),
             remote_desktop_session_options: RemoteDesktopSessionOptions::default(),
             remote_desktop_profile_id: None,
@@ -677,11 +1073,12 @@ impl Default for NewConnectionForm {
             mosh_profile_id: None,
             serial_profile_id: None,
             telnet_profile_id: None,
+            standalone_sftp_profile_id: None,
+            standalone_sftp_transfer_mode: StandaloneSftpTransferMode::LocalRemote,
+            standalone_sftp_secondary: StandaloneSftpSecondaryForm::default(),
             saved_password_keychain_id: None,
             password_loaded: true,
             password_visible: false,
-            password_loading: false,
-            password_error: None,
             key_path: String::new(),
             managed_key_id: String::new(),
             cert_path: String::new(),
@@ -689,15 +1086,37 @@ impl Default for NewConnectionForm {
             passphrase_visible: false,
             save_password: false,
             group: String::new(),
+            notes: String::new(),
+            sftp_initial_remote_path: String::new(),
             post_connect_command: String::new(),
+            proxy_command_enabled: false,
+            proxy_command: String::new(),
+            proxy_command_keychain_id: None,
             color: String::new(),
             icon_background_color: String::new(),
             icon: String::new(),
             icon_picker_expanded: false,
+            basic_section_expanded: None,
+            authentication_section_expanded: None,
+            route_section_expanded: None,
+            standalone_sftp_secondary_route_section_expanded: None,
+            ssh_options_section_expanded: None,
+            terminal_section_expanded: None,
+            appearance_section_expanded: None,
+            remote_gateway_section_expanded: None,
+            vnc_preferences_section_expanded: None,
+            remote_features_section_expanded: None,
+            serial_parameters_section_expanded: None,
+            mosh_options_section_expanded: None,
+            sftp_options_section_expanded: None,
+            local_shell_section_expanded: None,
+            advanced_connections_expanded: false,
             tags: Vec::new(),
             proxy_hops: Vec::new(),
             proxy_chain_expanded: false,
             jump_server_form: None,
+            jump_server_edit_index: None,
+            jump_server_target: ConnectionRouteTarget::Primary,
             upstream_proxy_policy: NewConnectionUpstreamProxyPolicy::UseGlobal,
             upstream_proxy_protocol: SavedUpstreamProxyProtocol::Socks5,
             upstream_proxy_host: "127.0.0.1".to_string(),
@@ -712,7 +1131,11 @@ impl Default for NewConnectionForm {
             identity_agent: String::new(),
             agent_forwarding_socket: None,
             legacy_ssh_compatibility: false,
+            ssh_algorithms: oxideterm_connections::SshAlgorithmPreferences::default(),
+            ssh_algorithm_editor_open: false,
+            ssh_algorithm_editor_category: oxideterm_ssh::SshAlgorithmCategory::Kex,
             connect_timeout_seconds: DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS,
+            connect_timeout_seconds_text: DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS.to_string(),
             dedicated_new_terminal_connection: false,
             x11_forwarding: ConnectionX11ForwardingOptions::default(),
             terminal: ConnectionTerminalOptions::default(),
@@ -751,10 +1174,24 @@ impl NewConnectionForm {
             .is_some_and(|message| self.success_feedback_message.as_ref() == Some(message))
     }
 
+    pub(in crate::workspace) fn set_standalone_sftp_transfer_mode(
+        &mut self,
+        mode: StandaloneSftpTransferMode,
+    ) {
+        if mode == StandaloneSftpTransferMode::LocalRemote
+            && self.standalone_sftp_transfer_mode == StandaloneSftpTransferMode::RemoteRemote
+        {
+            // Hidden second-endpoint credentials must not outlive the selected topology.
+            self.standalone_sftp_secondary.zeroize_secret_drafts();
+        }
+        self.standalone_sftp_transfer_mode = mode;
+    }
+
     fn zeroize_secret_drafts(&mut self) {
         self.password.zeroize();
         self.passphrase.zeroize();
         self.upstream_proxy_password.zeroize();
+        self.proxy_command.zeroize();
     }
 }
 
@@ -785,6 +1222,7 @@ pub(in crate::workspace) fn form_from_remote_desktop_profile(
     form.saved_password_keychain_id = profile.credential_ref.clone();
     form.save_password = profile.credential_ref.is_some();
     form.group = profile.group.clone().unwrap_or(ungrouped_label);
+    form.notes = profile.notes.clone().unwrap_or_default();
     form.icon = profile.icon.clone().unwrap_or_default();
     form.color = profile.color.clone().unwrap_or_default();
     form.icon_background_color = profile.icon_background_color.clone().unwrap_or_default();
@@ -805,12 +1243,15 @@ pub(in crate::workspace) fn form_from_mosh_profile(
     form.port = profile.ssh_port.to_string();
     form.username = profile.username.clone();
     form.auth_tab = ssh_auth_tab_from_saved_auth(&profile.auth);
-    form.saved_password_keychain_id = match &profile.auth {
+    form.saved_password_keychain_id = match profile.auth.conventional_fallback() {
         SavedAuth::Password { keychain_id, .. } => keychain_id.clone(),
         _ => None,
     };
     // Password-profile editors default to persisting a replacement credential.
-    form.save_password = matches!(profile.auth, SavedAuth::Password { .. });
+    form.save_password = matches!(
+        profile.auth.conventional_fallback(),
+        SavedAuth::Password { .. }
+    );
     form.password_loaded = true;
     form.key_path = profile.auth.key_path().unwrap_or_default().to_string();
     form.managed_key_id = profile
@@ -819,7 +1260,18 @@ pub(in crate::workspace) fn form_from_mosh_profile(
         .unwrap_or_default()
         .to_string();
     form.cert_path = profile.auth.cert_path().unwrap_or_default().to_string();
+    form.gssapi_enabled = profile.auth.gssapi_options().is_some();
+    form.gssapi_server_identity = profile
+        .auth
+        .gssapi_options()
+        .and_then(|(identity, _)| identity.map(ToOwned::to_owned))
+        .unwrap_or_default();
+    form.gssapi_delegate_credentials = profile
+        .auth
+        .gssapi_options()
+        .is_some_and(|(_, delegate)| delegate);
     form.group = profile.group.clone().unwrap_or(ungrouped_label);
+    form.notes = profile.notes.clone().unwrap_or_default();
     form.icon = profile.icon.clone().unwrap_or_default();
     form.color = profile.color.clone().unwrap_or_default();
     form.icon_background_color = profile.icon_background_color.clone().unwrap_or_default();
@@ -827,6 +1279,14 @@ pub(in crate::workspace) fn form_from_mosh_profile(
     form.agent_available =
         oxideterm_ssh::ssh_agent_available(identity_agent_selector(&form.identity_agent));
     form.legacy_ssh_compatibility = profile.legacy_ssh_compatibility;
+    form.ssh_algorithms = profile.ssh_algorithms.clone();
+    form.proxy_hops = profile
+        .proxy_chain
+        .iter()
+        .enumerate()
+        .map(|(index, hop)| NewConnectionProxyHop::from_saved(index, hop))
+        .collect();
+    form.proxy_chain_expanded = !form.proxy_hops.is_empty();
     form.mosh_server_executable = profile.server_executable.clone();
     form.mosh_udp_host = profile.udp_host_override.clone().unwrap_or_default();
     form.mosh_udp_port = match profile.udp_port {
@@ -837,6 +1297,7 @@ pub(in crate::workspace) fn form_from_mosh_profile(
     form.mosh_locale = profile.locale.clone().unwrap_or_default();
     form.mosh_ip_family = profile.ip_family;
     form.mosh_prediction = profile.prediction;
+    form.terminal = profile.terminal.clone();
     form.focused_field = NewConnectionField::Name;
     form
 }
@@ -877,6 +1338,7 @@ pub(in crate::workspace) fn form_from_serial_profile(
     form.serial_profile_id = Some(profile.id.clone());
     form.serial_profile_name = profile.name.clone();
     form.group = profile.group.clone().unwrap_or(ungrouped_label);
+    form.notes = profile.notes.clone().unwrap_or_default();
     form.icon = profile.icon.clone().unwrap_or_default();
     form.color = profile.color.clone().unwrap_or_default();
     form.icon_background_color = profile.icon_background_color.clone().unwrap_or_default();
@@ -886,6 +1348,7 @@ pub(in crate::workspace) fn form_from_serial_profile(
     form.serial_stop_bits = profile.stop_bits;
     form.serial_parity = terminal_serial_parity_from_profile(&profile.parity);
     form.serial_flow_control = terminal_serial_flow_from_profile(&profile.flow_control);
+    form.terminal = profile.terminal.clone();
     form.focused_field = NewConnectionField::SerialProfileName;
     form
 }
@@ -900,12 +1363,13 @@ pub(in crate::workspace) fn form_from_telnet_profile(
     form.telnet_profile_id = Some(profile.id.clone());
     form.telnet_profile_name = profile.name.clone();
     form.group = profile.group.clone().unwrap_or(ungrouped_label);
+    form.notes = profile.notes.clone().unwrap_or_default();
     form.icon = profile.icon.clone().unwrap_or_default();
     form.color = profile.color.clone().unwrap_or_default();
     form.icon_background_color = profile.icon_background_color.clone().unwrap_or_default();
     form.host = profile.host.clone();
     form.port = profile.port.to_string();
-    form.terminal = profile.terminal;
+    form.terminal = profile.terminal.clone();
     form.focused_field = NewConnectionField::TelnetProfileName;
     form
 }
@@ -918,6 +1382,12 @@ pub(in crate::workspace) fn connection_secret_field_visible(
     match field {
         NewConnectionField::Password => Some(form.password_visible),
         NewConnectionField::Passphrase => Some(form.passphrase_visible),
+        NewConnectionField::StandaloneSftpSecondaryPassword => {
+            Some(form.standalone_sftp_secondary.password_visible)
+        }
+        NewConnectionField::StandaloneSftpSecondaryPassphrase => {
+            Some(form.standalone_sftp_secondary.passphrase_visible)
+        }
         _ => None,
     }
 }
@@ -934,6 +1404,16 @@ pub(in crate::workspace) fn toggle_connection_secret_field_visibility(
         }
         NewConnectionField::Passphrase => {
             form.passphrase_visible = !form.passphrase_visible;
+            true
+        }
+        NewConnectionField::StandaloneSftpSecondaryPassword => {
+            form.standalone_sftp_secondary.password_visible =
+                !form.standalone_sftp_secondary.password_visible;
+            true
+        }
+        NewConnectionField::StandaloneSftpSecondaryPassphrase => {
+            form.standalone_sftp_secondary.passphrase_visible =
+                !form.standalone_sftp_secondary.passphrase_visible;
             true
         }
         _ => false,
@@ -960,6 +1440,10 @@ pub(in crate::workspace) fn refresh_identity_agent_availability(form: &mut NewCo
 fn refresh_focused_identity_agent_availability(form: &mut NewConnectionForm) {
     if form.focused_field == NewConnectionField::IdentityAgent {
         refresh_identity_agent_availability(form);
+    } else if form.focused_field == NewConnectionField::StandaloneSftpSecondaryIdentityAgent {
+        form.standalone_sftp_secondary.agent_available = oxideterm_ssh::ssh_agent_available(
+            identity_agent_selector(&form.standalone_sftp_secondary.identity_agent),
+        );
     }
 }
 
@@ -990,6 +1474,7 @@ pub(in crate::workspace) fn apply_transport_default_username(
 pub(in crate::workspace) fn next_connection_field(
     field: NewConnectionField,
     auth_tab: SshAuthTab,
+    gssapi_enabled: bool,
     transport: NewConnectionTransport,
     upstream_proxy_policy: NewConnectionUpstreamProxyPolicy,
     upstream_proxy_auth: NewConnectionUpstreamProxyAuth,
@@ -1004,9 +1489,9 @@ pub(in crate::workspace) fn next_connection_field(
     }
     if transport == NewConnectionTransport::Serial {
         let fields = [
+            NewConnectionField::SerialProfileName,
             NewConnectionField::SerialPortPath,
             NewConnectionField::SerialBaudRate,
-            NewConnectionField::SerialProfileName,
         ];
         let index = fields
             .iter()
@@ -1023,9 +1508,9 @@ pub(in crate::workspace) fn next_connection_field(
     }
     if transport == NewConnectionTransport::Telnet {
         let fields = [
+            NewConnectionField::TelnetProfileName,
             NewConnectionField::Host,
             NewConnectionField::Port,
-            NewConnectionField::TelnetProfileName,
         ];
         let index = fields
             .iter()
@@ -1047,6 +1532,7 @@ pub(in crate::workspace) fn next_connection_field(
         let fields = if transport == NewConnectionTransport::Rdp {
             vec![
                 NewConnectionField::Name,
+                NewConnectionField::Group,
                 NewConnectionField::Host,
                 NewConnectionField::Port,
                 NewConnectionField::Username,
@@ -1055,6 +1541,7 @@ pub(in crate::workspace) fn next_connection_field(
         } else {
             vec![
                 NewConnectionField::Name,
+                NewConnectionField::Group,
                 NewConnectionField::Host,
                 NewConnectionField::Port,
                 NewConnectionField::Password,
@@ -1077,80 +1564,106 @@ pub(in crate::workspace) fn next_connection_field(
     let mut fields: Vec<NewConnectionField> = match auth_tab {
         SshAuthTab::Password => vec![
             NewConnectionField::Name,
+            NewConnectionField::Group,
+            NewConnectionField::Notes,
             NewConnectionField::Host,
             NewConnectionField::Port,
             NewConnectionField::Username,
             NewConnectionField::Password,
-            NewConnectionField::Group,
             NewConnectionField::PostConnectCommand,
         ],
         SshAuthTab::DefaultKey => vec![
             NewConnectionField::Name,
+            NewConnectionField::Group,
+            NewConnectionField::Notes,
             NewConnectionField::Host,
             NewConnectionField::Port,
             NewConnectionField::Username,
             NewConnectionField::Passphrase,
-            NewConnectionField::Group,
             NewConnectionField::PostConnectCommand,
         ],
         SshAuthTab::SshKey => vec![
             NewConnectionField::Name,
+            NewConnectionField::Group,
+            NewConnectionField::Notes,
             NewConnectionField::Host,
             NewConnectionField::Port,
             NewConnectionField::Username,
             NewConnectionField::KeyPath,
             NewConnectionField::Passphrase,
-            NewConnectionField::Group,
             NewConnectionField::PostConnectCommand,
         ],
         SshAuthTab::ManagedKey => vec![
             NewConnectionField::Name,
+            NewConnectionField::Group,
+            NewConnectionField::Notes,
             NewConnectionField::Host,
             NewConnectionField::Port,
             NewConnectionField::Username,
             NewConnectionField::ManagedKeyId,
             NewConnectionField::Passphrase,
-            NewConnectionField::Group,
             NewConnectionField::PostConnectCommand,
         ],
         SshAuthTab::Certificate => vec![
             NewConnectionField::Name,
+            NewConnectionField::Group,
+            NewConnectionField::Notes,
             NewConnectionField::Host,
             NewConnectionField::Port,
             NewConnectionField::Username,
             NewConnectionField::KeyPath,
             NewConnectionField::CertPath,
             NewConnectionField::Passphrase,
-            NewConnectionField::Group,
             NewConnectionField::PostConnectCommand,
         ],
         SshAuthTab::Agent => vec![
             NewConnectionField::Name,
+            NewConnectionField::Group,
+            NewConnectionField::Notes,
             NewConnectionField::Host,
             NewConnectionField::Port,
             NewConnectionField::Username,
             NewConnectionField::IdentityAgent,
-            NewConnectionField::Group,
             NewConnectionField::PostConnectCommand,
         ],
         SshAuthTab::TwoFactor => vec![
             NewConnectionField::Name,
+            NewConnectionField::Group,
+            NewConnectionField::Notes,
             NewConnectionField::Host,
             NewConnectionField::Port,
             NewConnectionField::Username,
-            NewConnectionField::Group,
             NewConnectionField::PostConnectCommand,
         ],
     };
+    if gssapi_enabled {
+        fields.insert(6, NewConnectionField::GssapiServerIdentity);
+    }
     if transport == NewConnectionTransport::Mosh {
-        fields.retain(|field| *field != NewConnectionField::PostConnectCommand);
+        fields.retain(|field| {
+            !matches!(
+                field,
+                NewConnectionField::Notes | NewConnectionField::PostConnectCommand
+            )
+        });
         fields.extend([
             NewConnectionField::MoshServerExecutable,
             NewConnectionField::MoshUdpHost,
             NewConnectionField::MoshUdpPort,
             NewConnectionField::MoshLocale,
         ]);
-    } else if upstream_proxy_policy == NewConnectionUpstreamProxyPolicy::Custom {
+    } else if transport == NewConnectionTransport::StandaloneSftp {
+        // Independent SFTP uses SSH authentication and routing without terminal-only commands.
+        fields.retain(|field| *field != NewConnectionField::PostConnectCommand);
+        fields.push(NewConnectionField::InitialRemotePath);
+    }
+    fields.push(NewConnectionField::ConnectTimeoutSeconds);
+    if upstream_proxy_policy == NewConnectionUpstreamProxyPolicy::Custom
+        && matches!(
+            transport,
+            NewConnectionTransport::Ssh | NewConnectionTransport::StandaloneSftp
+        )
+    {
         fields.extend([
             NewConnectionField::UpstreamProxyHost,
             NewConnectionField::UpstreamProxyPort,
@@ -1180,9 +1693,10 @@ pub(in crate::workspace) fn next_connection_field(
 pub(in crate::workspace) fn next_jump_connection_field(
     field: NewConnectionField,
     auth_tab: SshAuthTab,
+    gssapi_enabled: bool,
     forward: bool,
 ) -> NewConnectionField {
-    let fields: Vec<NewConnectionField> = match auth_tab {
+    let mut fields: Vec<NewConnectionField> = match auth_tab {
         SshAuthTab::Password => vec![
             NewConnectionField::JumpHost,
             NewConnectionField::JumpPort,
@@ -1228,9 +1742,111 @@ pub(in crate::workspace) fn next_jump_connection_field(
             NewConnectionField::JumpUsername,
         ],
     };
+    if gssapi_enabled {
+        fields.insert(3, NewConnectionField::JumpGssapiServerIdentity);
+    }
     let index = fields
         .iter()
         .position(|candidate| *candidate == field)
+        .unwrap_or(0);
+    let next = if forward {
+        (index + 1) % fields.len()
+    } else if index == 0 {
+        fields.len() - 1
+    } else {
+        index - 1
+    };
+    fields[next]
+}
+
+pub(in crate::workspace) fn next_standalone_sftp_field(
+    form: &NewConnectionForm,
+    forward: bool,
+) -> NewConnectionField {
+    fn append_auth_fields(
+        fields: &mut Vec<NewConnectionField>,
+        auth_tab: SshAuthTab,
+        gssapi_enabled: bool,
+        secondary: bool,
+    ) {
+        if gssapi_enabled {
+            fields.push(if secondary {
+                NewConnectionField::StandaloneSftpSecondaryGssapiServerIdentity
+            } else {
+                NewConnectionField::GssapiServerIdentity
+            });
+        }
+        match (auth_tab, secondary) {
+            (SshAuthTab::Password, false) => fields.push(NewConnectionField::Password),
+            (SshAuthTab::Password, true) => {
+                fields.push(NewConnectionField::StandaloneSftpSecondaryPassword)
+            }
+            (SshAuthTab::DefaultKey, false) => fields.push(NewConnectionField::Passphrase),
+            (SshAuthTab::DefaultKey, true) => {
+                fields.push(NewConnectionField::StandaloneSftpSecondaryPassphrase)
+            }
+            (SshAuthTab::SshKey, false) => {
+                fields.extend([NewConnectionField::KeyPath, NewConnectionField::Passphrase])
+            }
+            (SshAuthTab::SshKey, true) => fields.extend([
+                NewConnectionField::StandaloneSftpSecondaryKeyPath,
+                NewConnectionField::StandaloneSftpSecondaryPassphrase,
+            ]),
+            (SshAuthTab::ManagedKey, false) => fields.extend([
+                NewConnectionField::ManagedKeyId,
+                NewConnectionField::Passphrase,
+            ]),
+            (SshAuthTab::ManagedKey, true) => fields.extend([
+                NewConnectionField::StandaloneSftpSecondaryManagedKeyId,
+                NewConnectionField::StandaloneSftpSecondaryPassphrase,
+            ]),
+            (SshAuthTab::Certificate, false) => fields.extend([
+                NewConnectionField::KeyPath,
+                NewConnectionField::CertPath,
+                NewConnectionField::Passphrase,
+            ]),
+            (SshAuthTab::Certificate, true) => fields.extend([
+                NewConnectionField::StandaloneSftpSecondaryKeyPath,
+                NewConnectionField::StandaloneSftpSecondaryCertPath,
+                NewConnectionField::StandaloneSftpSecondaryPassphrase,
+            ]),
+            (SshAuthTab::Agent, false) => fields.push(NewConnectionField::IdentityAgent),
+            (SshAuthTab::Agent, true) => {
+                fields.push(NewConnectionField::StandaloneSftpSecondaryIdentityAgent)
+            }
+            (SshAuthTab::TwoFactor, _) => {}
+        }
+    }
+
+    let mut fields = vec![
+        NewConnectionField::Name,
+        NewConnectionField::Group,
+        NewConnectionField::Notes,
+        NewConnectionField::Host,
+        NewConnectionField::Port,
+        NewConnectionField::Username,
+    ];
+    append_auth_fields(&mut fields, form.auth_tab, form.gssapi_enabled, false);
+    fields.push(NewConnectionField::InitialRemotePath);
+    fields.push(NewConnectionField::ConnectTimeoutSeconds);
+    if form.standalone_sftp_transfer_mode == StandaloneSftpTransferMode::RemoteRemote {
+        fields.extend([
+            NewConnectionField::StandaloneSftpSecondaryHost,
+            NewConnectionField::StandaloneSftpSecondaryPort,
+            NewConnectionField::StandaloneSftpSecondaryUsername,
+        ]);
+        append_auth_fields(
+            &mut fields,
+            form.standalone_sftp_secondary.auth_tab,
+            form.standalone_sftp_secondary.gssapi_enabled,
+            true,
+        );
+        fields.push(NewConnectionField::StandaloneSftpSecondaryInitialRemotePath);
+        fields.push(NewConnectionField::StandaloneSftpSecondaryConnectTimeoutSeconds);
+    }
+    let index = fields
+        .iter()
+        .position(|candidate| *candidate == form.focused_field)
         .unwrap_or(0);
     let next = if forward {
         (index + 1) % fields.len()
@@ -1255,9 +1871,64 @@ pub(in crate::workspace) fn current_connection_field_mut(
         NewConnectionField::ManagedKeyId => &mut form.managed_key_id,
         NewConnectionField::CertPath => &mut form.cert_path,
         NewConnectionField::Passphrase => &mut form.passphrase,
+        NewConnectionField::GssapiServerIdentity => &mut form.gssapi_server_identity,
         NewConnectionField::IdentityAgent => &mut form.identity_agent,
         NewConnectionField::Group => &mut form.group,
+        NewConnectionField::Notes => &mut form.notes,
+        NewConnectionField::InitialRemotePath => &mut form.sftp_initial_remote_path,
+        NewConnectionField::ConnectTimeoutSeconds => &mut form.connect_timeout_seconds_text,
+        NewConnectionField::StandaloneSftpSecondaryHost => &mut form.standalone_sftp_secondary.host,
+        NewConnectionField::StandaloneSftpSecondaryPort => &mut form.standalone_sftp_secondary.port,
+        NewConnectionField::StandaloneSftpSecondaryUsername => {
+            &mut form.standalone_sftp_secondary.username
+        }
+        NewConnectionField::StandaloneSftpSecondaryPassword => {
+            &mut form.standalone_sftp_secondary.password
+        }
+        NewConnectionField::StandaloneSftpSecondaryKeyPath => {
+            &mut form.standalone_sftp_secondary.key_path
+        }
+        NewConnectionField::StandaloneSftpSecondaryManagedKeyId => {
+            &mut form.standalone_sftp_secondary.managed_key_id
+        }
+        NewConnectionField::StandaloneSftpSecondaryCertPath => {
+            &mut form.standalone_sftp_secondary.cert_path
+        }
+        NewConnectionField::StandaloneSftpSecondaryPassphrase => {
+            &mut form.standalone_sftp_secondary.passphrase
+        }
+        NewConnectionField::StandaloneSftpSecondaryGssapiServerIdentity => {
+            &mut form.standalone_sftp_secondary.gssapi_server_identity
+        }
+        NewConnectionField::StandaloneSftpSecondaryIdentityAgent => {
+            &mut form.standalone_sftp_secondary.identity_agent
+        }
+        NewConnectionField::StandaloneSftpSecondaryInitialRemotePath => {
+            &mut form.standalone_sftp_secondary.initial_remote_path
+        }
+        NewConnectionField::StandaloneSftpSecondaryConnectTimeoutSeconds => {
+            &mut form.standalone_sftp_secondary.connect_timeout_seconds_text
+        }
+        NewConnectionField::StandaloneSftpSecondaryProxyCommand => {
+            &mut form.standalone_sftp_secondary.proxy_command
+        }
+        NewConnectionField::StandaloneSftpSecondaryUpstreamProxyHost => {
+            &mut form.standalone_sftp_secondary.upstream_proxy_host
+        }
+        NewConnectionField::StandaloneSftpSecondaryUpstreamProxyPort => {
+            &mut form.standalone_sftp_secondary.upstream_proxy_port
+        }
+        NewConnectionField::StandaloneSftpSecondaryUpstreamProxyNoProxy => {
+            &mut form.standalone_sftp_secondary.upstream_proxy_no_proxy
+        }
+        NewConnectionField::StandaloneSftpSecondaryUpstreamProxyUsername => {
+            &mut form.standalone_sftp_secondary.upstream_proxy_username
+        }
+        NewConnectionField::StandaloneSftpSecondaryUpstreamProxyPassword => {
+            &mut form.standalone_sftp_secondary.upstream_proxy_password
+        }
         NewConnectionField::PostConnectCommand => &mut form.post_connect_command,
+        NewConnectionField::ProxyCommand => &mut form.proxy_command,
         NewConnectionField::UpstreamProxyHost => &mut form.upstream_proxy_host,
         NewConnectionField::UpstreamProxyPort => &mut form.upstream_proxy_port,
         NewConnectionField::UpstreamProxyNoProxy => &mut form.upstream_proxy_no_proxy,
@@ -1321,6 +1992,13 @@ pub(in crate::workspace) fn current_connection_field_mut(
                 .expect("jump passphrase field without jump form")
                 .passphrase
         }
+        NewConnectionField::JumpGssapiServerIdentity => {
+            &mut form
+                .jump_server_form
+                .as_mut()
+                .expect("jump Kerberos server field without jump form")
+                .gssapi_server_identity
+        }
         NewConnectionField::JumpIdentityAgent => {
             &mut form
                 .jump_server_form
@@ -1350,9 +2028,64 @@ pub(in crate::workspace) fn current_connection_field(form: &NewConnectionForm) -
         NewConnectionField::ManagedKeyId => &form.managed_key_id,
         NewConnectionField::CertPath => &form.cert_path,
         NewConnectionField::Passphrase => &form.passphrase,
+        NewConnectionField::GssapiServerIdentity => &form.gssapi_server_identity,
         NewConnectionField::IdentityAgent => &form.identity_agent,
         NewConnectionField::Group => &form.group,
+        NewConnectionField::Notes => &form.notes,
+        NewConnectionField::InitialRemotePath => &form.sftp_initial_remote_path,
+        NewConnectionField::ConnectTimeoutSeconds => &form.connect_timeout_seconds_text,
+        NewConnectionField::StandaloneSftpSecondaryHost => &form.standalone_sftp_secondary.host,
+        NewConnectionField::StandaloneSftpSecondaryPort => &form.standalone_sftp_secondary.port,
+        NewConnectionField::StandaloneSftpSecondaryUsername => {
+            &form.standalone_sftp_secondary.username
+        }
+        NewConnectionField::StandaloneSftpSecondaryPassword => {
+            &form.standalone_sftp_secondary.password
+        }
+        NewConnectionField::StandaloneSftpSecondaryKeyPath => {
+            &form.standalone_sftp_secondary.key_path
+        }
+        NewConnectionField::StandaloneSftpSecondaryManagedKeyId => {
+            &form.standalone_sftp_secondary.managed_key_id
+        }
+        NewConnectionField::StandaloneSftpSecondaryCertPath => {
+            &form.standalone_sftp_secondary.cert_path
+        }
+        NewConnectionField::StandaloneSftpSecondaryPassphrase => {
+            &form.standalone_sftp_secondary.passphrase
+        }
+        NewConnectionField::StandaloneSftpSecondaryGssapiServerIdentity => {
+            &form.standalone_sftp_secondary.gssapi_server_identity
+        }
+        NewConnectionField::StandaloneSftpSecondaryIdentityAgent => {
+            &form.standalone_sftp_secondary.identity_agent
+        }
+        NewConnectionField::StandaloneSftpSecondaryInitialRemotePath => {
+            &form.standalone_sftp_secondary.initial_remote_path
+        }
+        NewConnectionField::StandaloneSftpSecondaryConnectTimeoutSeconds => {
+            &form.standalone_sftp_secondary.connect_timeout_seconds_text
+        }
+        NewConnectionField::StandaloneSftpSecondaryProxyCommand => {
+            &form.standalone_sftp_secondary.proxy_command
+        }
+        NewConnectionField::StandaloneSftpSecondaryUpstreamProxyHost => {
+            &form.standalone_sftp_secondary.upstream_proxy_host
+        }
+        NewConnectionField::StandaloneSftpSecondaryUpstreamProxyPort => {
+            &form.standalone_sftp_secondary.upstream_proxy_port
+        }
+        NewConnectionField::StandaloneSftpSecondaryUpstreamProxyNoProxy => {
+            &form.standalone_sftp_secondary.upstream_proxy_no_proxy
+        }
+        NewConnectionField::StandaloneSftpSecondaryUpstreamProxyUsername => {
+            &form.standalone_sftp_secondary.upstream_proxy_username
+        }
+        NewConnectionField::StandaloneSftpSecondaryUpstreamProxyPassword => {
+            &form.standalone_sftp_secondary.upstream_proxy_password
+        }
         NewConnectionField::PostConnectCommand => &form.post_connect_command,
+        NewConnectionField::ProxyCommand => &form.proxy_command,
         NewConnectionField::UpstreamProxyHost => &form.upstream_proxy_host,
         NewConnectionField::UpstreamProxyPort => &form.upstream_proxy_port,
         NewConnectionField::UpstreamProxyNoProxy => &form.upstream_proxy_no_proxy,
@@ -1416,6 +2149,13 @@ pub(in crate::workspace) fn current_connection_field(form: &NewConnectionForm) -
                 .expect("jump passphrase field without jump form")
                 .passphrase
         }
+        NewConnectionField::JumpGssapiServerIdentity => {
+            &form
+                .jump_server_form
+                .as_ref()
+                .expect("jump Kerberos server field without jump form")
+                .gssapi_server_identity
+        }
         NewConnectionField::JumpIdentityAgent => {
             &form
                 .jump_server_form
@@ -1457,18 +2197,21 @@ pub(in crate::workspace) fn insert_text_into_current_connection_field(
     form: &mut NewConnectionForm,
     text: &str,
 ) {
+    let focused_field = form.focused_field;
     let replacing_selection = form.selected_field == Some(form.focused_field);
     if replacing_selection {
         current_connection_field_mut(form).clear();
     }
     current_connection_field_mut(form).push_str(text);
     form.selected_field = None;
+    refresh_connection_timeout_seconds(form, focused_field);
     refresh_focused_identity_agent_availability(form);
 }
 
 pub(in crate::workspace) fn backspace_current_connection_field(
     form: &mut NewConnectionForm,
 ) -> bool {
+    let focused_field = form.focused_field;
     let selection_was_visible = form.selected_field.is_some();
     if form.selected_field == Some(form.focused_field) {
         // Clearing a selected field also clears visible selection state. Track
@@ -1478,6 +2221,7 @@ pub(in crate::workspace) fn backspace_current_connection_field(
         field.clear();
         form.selected_field = None;
         if text_changed {
+            refresh_connection_timeout_seconds(form, focused_field);
             refresh_focused_identity_agent_availability(form);
         }
         text_changed || selection_was_visible
@@ -1485,6 +2229,7 @@ pub(in crate::workspace) fn backspace_current_connection_field(
         let text_changed = current_connection_field_mut(form).pop().is_some();
         form.selected_field = None;
         if text_changed {
+            refresh_connection_timeout_seconds(form, focused_field);
             refresh_focused_identity_agent_availability(form);
         }
         text_changed || selection_was_visible
@@ -1492,9 +2237,59 @@ pub(in crate::workspace) fn backspace_current_connection_field(
 }
 
 pub(in crate::workspace) fn clear_current_connection_field(form: &mut NewConnectionForm) {
+    let focused_field = form.focused_field;
     current_connection_field_mut(form).clear();
     form.selected_field = None;
+    refresh_connection_timeout_seconds(form, focused_field);
     refresh_focused_identity_agent_availability(form);
+}
+
+pub(in crate::workspace) fn refresh_connection_timeout_seconds(
+    form: &mut NewConnectionForm,
+    field: NewConnectionField,
+) {
+    // Invalid drafts map to zero so keyboard submission cannot reuse a stale valid timeout.
+    let parsed = match field {
+        NewConnectionField::ConnectTimeoutSeconds => form
+            .connect_timeout_seconds_text
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|seconds| *seconds > 0),
+        NewConnectionField::StandaloneSftpSecondaryConnectTimeoutSeconds => form
+            .standalone_sftp_secondary
+            .connect_timeout_seconds_text
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|seconds| *seconds > 0),
+        _ => return,
+    }
+    .unwrap_or(0);
+    match field {
+        NewConnectionField::ConnectTimeoutSeconds => form.connect_timeout_seconds = parsed,
+        NewConnectionField::StandaloneSftpSecondaryConnectTimeoutSeconds => {
+            form.standalone_sftp_secondary.connect_timeout_seconds = parsed;
+        }
+        _ => {}
+    }
+}
+
+pub(in crate::workspace) fn connection_timeout_drafts_valid(form: &NewConnectionForm) -> bool {
+    let primary_valid = form
+        .connect_timeout_seconds_text
+        .trim()
+        .parse::<u64>()
+        .is_ok_and(|seconds| seconds > 0);
+    let secondary_valid = form
+        .standalone_sftp_secondary
+        .connect_timeout_seconds_text
+        .trim()
+        .parse::<u64>()
+        .is_ok_and(|seconds| seconds > 0);
+    primary_valid
+        && (form.standalone_sftp_transfer_mode != StandaloneSftpTransferMode::RemoteRemote
+            || secondary_valid)
 }
 
 pub(in crate::workspace) fn text_from_keystroke(keystroke: &gpui::Keystroke) -> Option<&str> {
@@ -1514,33 +2309,24 @@ mod tests {
     use gpui::{Keystroke, Modifiers};
     use oxideterm_connections::{
         AuthType, ConnectionInfo, MoshIpFamily, MoshPredictionMode, MoshProfile,
-        MoshUdpPortSelection, RemoteDesktopProfile, SavedAuth, SavedUpstreamProxyPolicy,
-        SerialFlowControl, SerialParity, SerialProfile, TelnetProfile,
+        MoshUdpPortSelection, RemoteDesktopProfile, SavedAuth, SavedProxyHop,
+        SavedUpstreamProxyPolicy, SerialFlowControl, SerialParity, SerialProfile, TelnetProfile,
     };
     use oxideterm_remote_desktop::{
         RemoteDesktopAudioOptions, RemoteDesktopClipboardOptions, RemoteDesktopDisplayOptions,
-        RemoteDesktopProtocol,
+        RemoteDesktopProtocol, RemoteDesktopRdpOptions,
     };
 
     use super::{
-        NewConnectionField, NewConnectionForm, NewConnectionFormMode, NewConnectionProxyHop,
-        NewConnectionTransport, NewConnectionUpstreamProxyAuth, NewConnectionUpstreamProxyPolicy,
-        RDP_DEFAULT_PORT_TEXT, RemoteDesktopSessionFeature, RemoteDesktopSessionOptions,
-        RemoteDesktopVncCompression, RemoteDesktopVncImageQuality, RemoteDesktopVncOptions,
-        RemoteDesktopVncPreference, RemoteDesktopVncSecurityPolicy, RemoteDesktopVncSessionMode,
-        SSH_DEFAULT_PORT_TEXT, SavedConnectionPromptAction, SshAuthFamily, SshAuthTab,
-        SshKeyAuthSource, TELNET_DEFAULT_PORT_TEXT, VNC_DEFAULT_PORT_TEXT,
-        apply_remote_desktop_vnc_preference, apply_transport_default_port,
-        apply_transport_default_username, auth_family_from_tab, auth_tab_from_key_source,
-        backspace_current_connection_field, connection_icon_field_visible,
-        connection_secret_field_visible, default_auth_tab_for_family, form_from_mosh_profile,
-        form_from_remote_desktop_profile, form_from_serial_profile, form_from_telnet_profile,
-        identity_agent_from_form, identity_agent_selector,
-        insert_text_into_current_connection_field, key_source_from_tab, new_connection_form_mode,
-        next_connection_field, next_jump_connection_field, remote_desktop_feature_supported,
-        remote_desktop_vnc_preference_selected, select_current_connection_field,
-        text_from_keystroke, toggle_connection_secret_field_visibility,
-        toggle_remote_desktop_feature,
+        NewConnectionField, NewConnectionForm, NewConnectionProxyHop, NewConnectionTransport,
+        RemoteDesktopSessionOptions, RemoteDesktopVncCompression, RemoteDesktopVncImageQuality,
+        RemoteDesktopVncOptions, RemoteDesktopVncSecurityPolicy, RemoteDesktopVncSessionMode,
+        SshAuthFamily, SshAuthTab, SshKeyAuthSource, StandaloneSftpTransferMode,
+        auth_family_from_tab, backspace_current_connection_field, connection_secret_field_visible,
+        form_from_mosh_profile, form_from_remote_desktop_profile, form_from_serial_profile,
+        form_from_telnet_profile, insert_text_into_current_connection_field, key_source_from_tab,
+        select_current_connection_field, text_from_keystroke,
+        toggle_connection_secret_field_visibility,
     };
 
     fn keystroke(key: &str, key_char: Option<&str>, modifiers: Modifiers) -> Keystroke {
@@ -1610,6 +2396,10 @@ mod tests {
         form.password = "password-value".to_string();
         form.passphrase = "passphrase-value".to_string();
         form.upstream_proxy_password = "proxy-password-value".to_string();
+        form.standalone_sftp_transfer_mode = StandaloneSftpTransferMode::RemoteRemote;
+        form.standalone_sftp_secondary.password = "secondary-password-value".to_string();
+        form.standalone_sftp_secondary.passphrase = "secondary-passphrase-value".to_string();
+        form.set_standalone_sftp_transfer_mode(StandaloneSftpTransferMode::LocalRemote);
         form.zeroize_secret_drafts();
 
         let mut proxy_hop = NewConnectionProxyHop::new();
@@ -1620,6 +2410,8 @@ mod tests {
         assert!(form.password.is_empty());
         assert!(form.passphrase.is_empty());
         assert!(form.upstream_proxy_password.is_empty());
+        assert!(form.standalone_sftp_secondary.password.is_empty());
+        assert!(form.standalone_sftp_secondary.passphrase.is_empty());
         assert!(proxy_hop.password.is_empty());
         assert!(proxy_hop.passphrase.is_empty());
     }
@@ -1639,6 +2431,9 @@ mod tests {
             display: RemoteDesktopDisplayOptions {
                 use_all_monitors: true,
             },
+            rdp: RemoteDesktopRdpOptions {
+                disable_graphics_pipeline: true,
+            },
             vnc: RemoteDesktopVncOptions {
                 security_policy: RemoteDesktopVncSecurityPolicy::AllowLegacy,
                 session_mode: RemoteDesktopVncSessionMode::Exclusive,
@@ -1651,6 +2446,7 @@ mod tests {
             id: "remote-1".to_string(),
             name: "Lab desktop".to_string(),
             group: Some("Lab".to_string()),
+            notes: Some("Shared display".to_string()),
             icon: Some("cloud".to_string()),
             color: Some("#7dd3fc".to_string()),
             icon_background_color: Some("#082f49".to_string()),
@@ -1677,6 +2473,7 @@ mod tests {
         assert_eq!(form.port, "3389");
         assert_eq!(form.username, "operator");
         assert_eq!(form.group, "Lab");
+        assert_eq!(form.notes, "Shared display");
         assert_eq!(form.icon, "cloud");
         assert_eq!(form.color, "#7dd3fc");
         assert_eq!(form.icon_background_color, "#082f49");
@@ -1707,6 +2504,7 @@ mod tests {
         );
         profile.id = "mosh-1".to_string();
         profile.group = Some("Mobile".to_string());
+        profile.notes = Some("Intermittent link".to_string());
         profile.icon = Some("wifi".to_string());
         profile.color = Some("#93c5fd".to_string());
         profile.server_executable = "/opt/mosh/bin/mosh-server".to_string();
@@ -1718,6 +2516,17 @@ mod tests {
         profile.ip_family = MoshIpFamily::Ipv4;
         profile.prediction = MoshPredictionMode::Always;
         profile.locale = Some("en_US.UTF-8".to_string());
+        profile.proxy_chain.push(SavedProxyHop {
+            host: "jump.example.com".to_string(),
+            port: 2200,
+            username: "jump".to_string(),
+            auth: SavedAuth::Agent,
+            agent_forwarding: false,
+            identity_agent: None,
+            agent_forwarding_socket: None,
+            legacy_ssh_compatibility: false,
+            ssh_algorithms: oxideterm_connections::SshAlgorithmPreferences::default(),
+        });
 
         let form = form_from_mosh_profile(&profile, "Ungrouped".to_string());
 
@@ -1728,6 +2537,7 @@ mod tests {
         assert_eq!(form.port, "2222");
         assert_eq!(form.username, "operator");
         assert_eq!(form.group, "Mobile");
+        assert_eq!(form.notes, "Intermittent link");
         assert_eq!(form.icon, "wifi");
         assert_eq!(form.color, "#93c5fd");
         assert_eq!(form.mosh_server_executable, "/opt/mosh/bin/mosh-server");
@@ -1743,6 +2553,10 @@ mod tests {
         );
         assert!(form.save_password);
         assert!(form.password.is_empty());
+        assert!(form.proxy_chain_expanded);
+        assert_eq!(form.proxy_hops.len(), 1);
+        assert_eq!(form.proxy_hops[0].host, "jump.example.com");
+        assert_eq!(form.proxy_hops[0].persisted_proxy_hop_index, Some(0));
     }
 
     #[test]
@@ -1750,6 +2564,7 @@ mod tests {
         let mut profile = SerialProfile::new("Console cable", "/dev/cu.usbserial-10");
         profile.id = "serial-1".to_string();
         profile.group = Some("Lab".to_string());
+        profile.notes = Some("Rack B".to_string());
         profile.icon = Some("radio".to_string());
         profile.color = Some("#fbbf24".to_string());
         profile.icon_background_color = Some("#451a03".to_string());
@@ -1765,6 +2580,7 @@ mod tests {
         assert_eq!(form.transport, NewConnectionTransport::Serial);
         assert_eq!(form.serial_profile_name, "Console cable");
         assert_eq!(form.group, "Lab");
+        assert_eq!(form.notes, "Rack B");
         assert_eq!(form.icon, "radio");
         assert_eq!(form.color, "#fbbf24");
         assert_eq!(form.icon_background_color, "#451a03");
@@ -1784,6 +2600,7 @@ mod tests {
         let mut profile = TelnetProfile::new("Router console", "router.example.com", 2323);
         profile.id = "telnet-1".to_string();
         profile.group = Some("Lab".to_string());
+        profile.notes = Some("Legacy management plane".to_string());
         profile.icon = Some("network".to_string());
         profile.color = Some("#86efac".to_string());
         profile.icon_background_color = Some("#052e16".to_string());
@@ -1797,51 +2614,13 @@ mod tests {
         assert_eq!(form.transport, NewConnectionTransport::Telnet);
         assert_eq!(form.telnet_profile_name, "Router console");
         assert_eq!(form.group, "Lab");
+        assert_eq!(form.notes, "Legacy management plane");
         assert_eq!(form.icon, "network");
         assert_eq!(form.color, "#86efac");
         assert_eq!(form.icon_background_color, "#052e16");
         assert_eq!(form.host, "router.example.com");
         assert_eq!(form.port, "2323");
         assert_eq!(form.terminal, profile.terminal);
-    }
-
-    #[test]
-    fn custom_icon_field_is_available_for_all_six_session_assets() {
-        for transport in [
-            NewConnectionTransport::Ssh,
-            NewConnectionTransport::Mosh,
-            NewConnectionTransport::Serial,
-            NewConnectionTransport::Telnet,
-            NewConnectionTransport::Rdp,
-            NewConnectionTransport::Vnc,
-        ] {
-            assert!(connection_icon_field_visible(
-                NewConnectionFormMode::NewConnection,
-                false,
-                transport
-            ));
-        }
-
-        assert!(!connection_icon_field_visible(
-            NewConnectionFormMode::NewConnection,
-            false,
-            NewConnectionTransport::WslGraphics
-        ));
-        assert!(!connection_icon_field_visible(
-            NewConnectionFormMode::NewConnection,
-            false,
-            NewConnectionTransport::LocalTerminal
-        ));
-        assert!(!connection_icon_field_visible(
-            NewConnectionFormMode::SavedConnectionPrompt,
-            false,
-            NewConnectionTransport::Ssh
-        ));
-        assert!(!connection_icon_field_visible(
-            NewConnectionFormMode::NewConnection,
-            true,
-            NewConnectionTransport::Ssh
-        ));
     }
 
     #[test]
@@ -1902,91 +2681,6 @@ mod tests {
     }
 
     #[test]
-    fn telnet_transport_tabs_between_endpoint_and_profile_name() {
-        assert_eq!(
-            next_connection_field(
-                NewConnectionField::Host,
-                super::SshAuthTab::Password,
-                NewConnectionTransport::Telnet,
-                super::NewConnectionUpstreamProxyPolicy::UseGlobal,
-                super::NewConnectionUpstreamProxyAuth::None,
-                true,
-            ),
-            NewConnectionField::Port
-        );
-        assert_eq!(
-            next_connection_field(
-                NewConnectionField::Port,
-                super::SshAuthTab::Password,
-                NewConnectionTransport::Telnet,
-                super::NewConnectionUpstreamProxyPolicy::UseGlobal,
-                super::NewConnectionUpstreamProxyAuth::None,
-                true,
-            ),
-            NewConnectionField::TelnetProfileName
-        );
-        assert_eq!(
-            next_connection_field(
-                NewConnectionField::TelnetProfileName,
-                super::SshAuthTab::Password,
-                NewConnectionTransport::Telnet,
-                super::NewConnectionUpstreamProxyPolicy::UseGlobal,
-                super::NewConnectionUpstreamProxyAuth::None,
-                true,
-            ),
-            NewConnectionField::Host
-        );
-    }
-
-    #[test]
-    fn remote_desktop_transport_tabs_through_rdp_login_fields() {
-        assert_eq!(
-            next_connection_field(
-                NewConnectionField::Name,
-                super::SshAuthTab::Password,
-                NewConnectionTransport::Rdp,
-                super::NewConnectionUpstreamProxyPolicy::UseGlobal,
-                super::NewConnectionUpstreamProxyAuth::None,
-                true,
-            ),
-            NewConnectionField::Host
-        );
-        assert_eq!(
-            next_connection_field(
-                NewConnectionField::Port,
-                super::SshAuthTab::Password,
-                NewConnectionTransport::Rdp,
-                super::NewConnectionUpstreamProxyPolicy::UseGlobal,
-                super::NewConnectionUpstreamProxyAuth::None,
-                true,
-            ),
-            NewConnectionField::Username
-        );
-        assert_eq!(
-            next_connection_field(
-                NewConnectionField::Port,
-                super::SshAuthTab::Password,
-                NewConnectionTransport::Vnc,
-                super::NewConnectionUpstreamProxyPolicy::UseGlobal,
-                super::NewConnectionUpstreamProxyAuth::None,
-                true,
-            ),
-            NewConnectionField::Password
-        );
-        assert_eq!(
-            next_connection_field(
-                NewConnectionField::Password,
-                super::SshAuthTab::Password,
-                NewConnectionTransport::Vnc,
-                super::NewConnectionUpstreamProxyPolicy::UseGlobal,
-                super::NewConnectionUpstreamProxyAuth::None,
-                true,
-            ),
-            NewConnectionField::Name
-        );
-    }
-
-    #[test]
     fn remote_desktop_form_uses_privacy_preserving_session_defaults() {
         let form = NewConnectionForm::default();
 
@@ -2015,163 +2709,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_desktop_feature_support_matches_builtin_providers() {
-        let rdp = oxideterm_remote_desktop::builtin_provider_manifest(
-            oxideterm_remote_desktop::RemoteDesktopProtocol::Rdp,
-        );
-        let vnc = oxideterm_remote_desktop::builtin_provider_manifest(
-            oxideterm_remote_desktop::RemoteDesktopProtocol::Vnc,
-        );
-
-        for feature in [
-            RemoteDesktopSessionFeature::ClipboardText,
-            RemoteDesktopSessionFeature::ClipboardImages,
-            RemoteDesktopSessionFeature::ClipboardFiles,
-            RemoteDesktopSessionFeature::AudioPlayback,
-            RemoteDesktopSessionFeature::AudioCapture,
-            RemoteDesktopSessionFeature::MultiMonitor,
-        ] {
-            assert!(remote_desktop_feature_supported(&rdp.capabilities, feature));
-        }
-        assert!(remote_desktop_feature_supported(
-            &vnc.capabilities,
-            RemoteDesktopSessionFeature::ClipboardText
-        ));
-        // VNC advertises client-side extension support here; the negotiated
-        // session capabilities still gate features unsupported by a server.
-        for feature in [
-            RemoteDesktopSessionFeature::ClipboardImages,
-            RemoteDesktopSessionFeature::ClipboardFiles,
-            RemoteDesktopSessionFeature::AudioPlayback,
-            RemoteDesktopSessionFeature::MultiMonitor,
-        ] {
-            assert!(remote_desktop_feature_supported(&vnc.capabilities, feature));
-        }
-        assert!(!remote_desktop_feature_supported(
-            &vnc.capabilities,
-            RemoteDesktopSessionFeature::AudioCapture
-        ));
-    }
-
-    #[test]
-    fn remote_desktop_feature_toggle_changes_only_the_selected_option() {
-        let mut options = RemoteDesktopSessionOptions::default();
-
-        toggle_remote_desktop_feature(&mut options, RemoteDesktopSessionFeature::ClipboardFiles);
-
-        assert!(options.clipboard.files);
-        assert!(options.clipboard.text);
-        assert!(options.clipboard.images);
-        assert!(options.audio.playback);
-        assert!(!options.audio.capture);
-        assert!(!options.display.use_all_monitors);
-    }
-
-    #[test]
-    fn vnc_preference_selection_changes_only_the_selected_policy() {
-        let mut options = RemoteDesktopVncOptions::default();
-
-        apply_remote_desktop_vnc_preference(
-            &mut options,
-            RemoteDesktopVncPreference::Security(RemoteDesktopVncSecurityPolicy::AllowLegacy),
-        );
-
-        assert!(remote_desktop_vnc_preference_selected(
-            &options,
-            RemoteDesktopVncPreference::Security(RemoteDesktopVncSecurityPolicy::AllowLegacy)
-        ));
-        assert_eq!(options.session_mode, RemoteDesktopVncSessionMode::Shared);
-        assert_eq!(
-            options.image_quality,
-            RemoteDesktopVncImageQuality::Balanced
-        );
-        assert_eq!(options.compression, RemoteDesktopVncCompression::Balanced);
-    }
-
-    #[test]
-    fn transport_default_port_changes_only_for_untouched_defaults() {
-        let mut form = NewConnectionForm::default();
-        apply_transport_default_port(
-            &mut form,
-            NewConnectionTransport::Ssh,
-            NewConnectionTransport::Telnet,
-        );
-        assert_eq!(form.port, TELNET_DEFAULT_PORT_TEXT);
-
-        apply_transport_default_port(
-            &mut form,
-            NewConnectionTransport::Telnet,
-            NewConnectionTransport::Ssh,
-        );
-        assert_eq!(form.port, SSH_DEFAULT_PORT_TEXT);
-
-        apply_transport_default_port(
-            &mut form,
-            NewConnectionTransport::Ssh,
-            NewConnectionTransport::Rdp,
-        );
-        assert_eq!(form.port, RDP_DEFAULT_PORT_TEXT);
-
-        apply_transport_default_port(
-            &mut form,
-            NewConnectionTransport::Rdp,
-            NewConnectionTransport::Vnc,
-        );
-        assert_eq!(form.port, VNC_DEFAULT_PORT_TEXT);
-
-        form.port = SSH_DEFAULT_PORT_TEXT.to_string();
-        apply_transport_default_port(
-            &mut form,
-            NewConnectionTransport::Serial,
-            NewConnectionTransport::Rdp,
-        );
-        assert_eq!(form.port, RDP_DEFAULT_PORT_TEXT);
-
-        form.port = "2323".to_string();
-        apply_transport_default_port(
-            &mut form,
-            NewConnectionTransport::Vnc,
-            NewConnectionTransport::Rdp,
-        );
-        assert_eq!(form.port, "2323");
-    }
-
-    #[test]
-    fn transport_default_username_changes_only_for_protocol_defaults() {
-        let mut form = NewConnectionForm::default();
-
-        apply_transport_default_username(
-            &mut form,
-            NewConnectionTransport::Ssh,
-            NewConnectionTransport::Rdp,
-        );
-        assert_eq!(form.username, "Administrator");
-
-        apply_transport_default_username(
-            &mut form,
-            NewConnectionTransport::Rdp,
-            NewConnectionTransport::Vnc,
-        );
-        assert!(form.username.is_empty());
-
-        apply_transport_default_username(
-            &mut form,
-            NewConnectionTransport::Vnc,
-            NewConnectionTransport::Ssh,
-        );
-        assert_eq!(form.username, "root");
-
-        form.username = "custom".to_string();
-        apply_transport_default_username(
-            &mut form,
-            NewConnectionTransport::Ssh,
-            NewConnectionTransport::Rdp,
-        );
-        assert_eq!(form.username, "custom");
-    }
-
-    #[test]
-    fn backspace_clears_selected_field() {
+    fn backspace_handles_selection_and_empty_fields() {
         let mut form = NewConnectionForm::default();
         form.username = "root".to_string();
         form.focused_field = NewConnectionField::Username;
@@ -2179,142 +2717,23 @@ mod tests {
         assert!(backspace_current_connection_field(&mut form));
         assert!(form.username.is_empty());
         assert_eq!(form.selected_field, None);
-    }
 
-    #[test]
-    fn backspace_reports_text_changes_without_selection() {
-        let mut form = NewConnectionForm::default();
+        // Unselected text is edited one character at a time.
         form.username = "root".to_string();
-        form.focused_field = NewConnectionField::Username;
-
         assert!(backspace_current_connection_field(&mut form));
         assert_eq!(form.username, "roo");
         assert_eq!(form.selected_field, None);
-    }
 
-    #[test]
-    fn backspace_reports_false_for_empty_unselected_field() {
-        let mut form = NewConnectionForm::default();
+        // Empty fields report no change and stale selections are discarded.
+        form.username.clear();
         form.focused_field = NewConnectionField::Name;
-
         assert!(!backspace_current_connection_field(&mut form));
         assert_eq!(form.selected_field, None);
-    }
 
-    #[test]
-    fn backspace_clears_stale_selection_state() {
-        let mut form = NewConnectionForm::default();
         form.focused_field = NewConnectionField::Username;
         form.selected_field = Some(NewConnectionField::Host);
-
         assert!(backspace_current_connection_field(&mut form));
         assert_eq!(form.selected_field, None);
-    }
-
-    #[test]
-    fn identity_agent_form_values_trim_and_preserve_automatic_detection() {
-        assert_eq!(identity_agent_selector(" \t "), None);
-        assert_eq!(
-            identity_agent_selector("  $YUBIKEY_AGENT  "),
-            Some("$YUBIKEY_AGENT")
-        );
-        assert_eq!(
-            identity_agent_from_form("  /tmp/yubikey-agent.sock  "),
-            Some("/tmp/yubikey-agent.sock".to_string())
-        );
-    }
-
-    #[test]
-    fn agent_tab_navigation_reaches_identity_agent_fields() {
-        assert_eq!(
-            next_connection_field(
-                NewConnectionField::Username,
-                SshAuthTab::Agent,
-                NewConnectionTransport::Ssh,
-                NewConnectionUpstreamProxyPolicy::UseGlobal,
-                NewConnectionUpstreamProxyAuth::None,
-                true,
-            ),
-            NewConnectionField::IdentityAgent
-        );
-        assert_eq!(
-            next_jump_connection_field(NewConnectionField::JumpUsername, SshAuthTab::Agent, true,),
-            NewConnectionField::JumpIdentityAgent
-        );
-    }
-
-    #[test]
-    fn form_mode_keeps_prompt_edit_and_new_submission_paths_distinct() {
-        assert_eq!(
-            new_connection_form_mode(None, None, None),
-            NewConnectionFormMode::NewConnection
-        );
-        assert_eq!(
-            new_connection_form_mode(Some("conn-1"), None, None),
-            NewConnectionFormMode::EditProperties
-        );
-        assert_eq!(
-            new_connection_form_mode(None, Some("conn-1"), None),
-            NewConnectionFormMode::DuplicateTemplate
-        );
-        assert_eq!(
-            new_connection_form_mode(
-                Some("conn-1"),
-                Some("conn-2"),
-                Some(SavedConnectionPromptAction::Connect)
-            ),
-            NewConnectionFormMode::SavedConnectionPrompt
-        );
-
-        assert!(NewConnectionFormMode::EditProperties.submits_saved_connection_properties());
-        assert!(NewConnectionFormMode::DuplicateTemplate.submits_saved_connection_properties());
-        assert!(
-            !NewConnectionFormMode::SavedConnectionPrompt.submits_saved_connection_properties()
-        );
-    }
-
-    #[test]
-    fn auth_family_groups_all_key_tabs() {
-        for tab in [
-            SshAuthTab::DefaultKey,
-            SshAuthTab::SshKey,
-            SshAuthTab::ManagedKey,
-            SshAuthTab::Certificate,
-        ] {
-            assert_eq!(auth_family_from_tab(tab), SshAuthFamily::Key);
-        }
-        assert_eq!(
-            auth_family_from_tab(SshAuthTab::Password),
-            SshAuthFamily::Password
-        );
-        assert_eq!(
-            auth_family_from_tab(SshAuthTab::Agent),
-            SshAuthFamily::Agent
-        );
-        assert_eq!(
-            auth_family_from_tab(SshAuthTab::TwoFactor),
-            SshAuthFamily::TwoFactor
-        );
-        assert_eq!(
-            default_auth_tab_for_family(SshAuthFamily::Key),
-            SshAuthTab::SshKey
-        );
-    }
-
-    #[test]
-    fn key_source_round_trips_to_auth_tab() {
-        for (source, tab) in [
-            (SshKeyAuthSource::DefaultKey, SshAuthTab::DefaultKey),
-            (SshKeyAuthSource::SshKey, SshAuthTab::SshKey),
-            (SshKeyAuthSource::ManagedKey, SshAuthTab::ManagedKey),
-            (SshKeyAuthSource::Certificate, SshAuthTab::Certificate),
-        ] {
-            assert_eq!(auth_tab_from_key_source(source), tab);
-            assert_eq!(key_source_from_tab(tab), Some(source));
-        }
-        assert_eq!(key_source_from_tab(SshAuthTab::Password), None);
-        assert_eq!(key_source_from_tab(SshAuthTab::Agent), None);
-        assert_eq!(key_source_from_tab(SshAuthTab::TwoFactor), None);
     }
 
     #[test]
@@ -2323,6 +2742,7 @@ mod tests {
             id: "conn-1".to_string(),
             name: "Bastion".to_string(),
             group: Some("Prod".to_string()),
+            notes: None,
             host: "bastion.example.com".to_string(),
             port: 2222,
             username: "jump".to_string(),
@@ -2331,6 +2751,9 @@ mod tests {
             cert_path: Some("~/.ssh/id_ed25519-cert.pub".to_string()),
             managed_key_id: None,
             managed_key_name: None,
+            gssapi_authentication: false,
+            gssapi_server_identity: None,
+            gssapi_delegate_credentials: false,
             proxy_chain: Vec::new(),
             upstream_proxy: SavedUpstreamProxyPolicy::UseGlobal,
             created_at: "2026-06-15T00:00:00Z".to_string(),
@@ -2343,6 +2766,7 @@ mod tests {
             identity_agent: None,
             agent_forwarding_socket: None,
             legacy_ssh_compatibility: true,
+            ssh_algorithms: oxideterm_connections::SshAlgorithmPreferences::default(),
             post_connect_command: None,
         };
         let mut hop = NewConnectionProxyHop::new();

@@ -1,7 +1,12 @@
 use super::*;
-use crate::workspace::new_connection::SshTerminalConnectionOptions;
+use crate::workspace::new_connection::{MoshConnectionOptions, SshTerminalConnectionOptions};
 use crate::workspace::root::init::terminal_preference_overrides;
+use oxideterm_remote_desktop::{
+    RemoteDesktopConnectionProfile, RemoteDesktopEndpoint, RemoteDesktopProtocol,
+    RemoteDesktopSecret,
+};
 use oxideterm_session_adapter::managed_key_resolver_from_store;
+use oxideterm_ssh_launch::{RemoteDesktopLaunchProtocol, TemporaryRemoteDesktopLaunch};
 
 fn attach_saved_owner_to_reused_ssh_node(
     node: &mut WorkspaceSshNode,
@@ -62,6 +67,62 @@ fn saved_node_route_matches_config(
 }
 
 impl WorkspaceApp {
+    pub(crate) fn open_native_connection_launch(
+        &mut self,
+        launch: NativeConnectionLaunch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        match launch {
+            NativeConnectionLaunch::SavedConnection(launch) => {
+                self.open_saved_connection(&launch.saved_connection_id, window, cx);
+                Ok(())
+            }
+            NativeConnectionLaunch::Ssh(launch) => self.open_temporary_ssh_launch(launch, cx),
+            NativeConnectionLaunch::Telnet(launch) => {
+                self.open_temporary_telnet_launch(launch, window, cx)
+            }
+            NativeConnectionLaunch::Mosh(launch) => self.open_temporary_mosh_launch(launch, cx),
+            NativeConnectionLaunch::RemoteDesktop(launch) => {
+                self.open_temporary_remote_desktop_launch(launch, window, cx);
+                Ok(())
+            }
+        }
+    }
+
+    fn open_temporary_remote_desktop_launch(
+        &mut self,
+        launch: TemporaryRemoteDesktopLaunch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let protocol = match launch.protocol {
+            RemoteDesktopLaunchProtocol::Rdp => RemoteDesktopProtocol::Rdp,
+            RemoteDesktopLaunchProtocol::Vnc => RemoteDesktopProtocol::Vnc,
+        };
+        let endpoint = RemoteDesktopEndpoint::new(launch.host, launch.port);
+        let profile = RemoteDesktopConnectionProfile {
+            id: format!("native-remote-desktop-{}", uuid::Uuid::new_v4()),
+            label: format!(
+                "{}://{}",
+                launch.protocol.scheme(),
+                endpoint.format_authority()
+            ),
+            protocol,
+            endpoint,
+            transport_endpoint: None,
+            username: launch.username,
+            domain: launch.domain,
+            credential_ref: None,
+            read_only: false,
+            session_options: Default::default(),
+        };
+        // The remote-desktop tab becomes the sole runtime owner of the URI
+        // password; it is never copied into the ephemeral profile or a store.
+        let password = launch.password.map(RemoteDesktopSecret::from);
+        self.open_remote_desktop_connection_tab(profile, password, window, cx);
+    }
+
     pub(in crate::workspace) fn create_local_terminal_tab(
         &mut self,
         window: &mut Window,
@@ -95,8 +156,11 @@ impl WorkspaceApp {
         let tab_id = self.alloc_tab_id(cx);
         let pane_id = self.alloc_pane_id(cx);
         let session_id = self.alloc_session_id(cx);
-        let preferences =
+        let preference_overrides =
+            self.terminal_preference_overrides_for_local_shell(terminal_config.shell.as_ref());
+        let mut preferences =
             self.prepare_terminal_preferences_for_tab_kind(&TabKind::LocalTerminal, cx);
+        preference_overrides.apply_to(&mut preferences);
         let pane = cx.new(|cx| {
             TerminalPane::new_local_with_config_and_preferences(
                 terminal_config,
@@ -105,6 +169,7 @@ impl WorkspaceApp {
                 cx,
             )
             .expect("failed to initialize terminal pane")
+            .with_preference_overrides(preference_overrides)
         });
         let shared_session = pane.read(cx).shared_session();
 
@@ -150,18 +215,52 @@ impl WorkspaceApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<TerminalSessionId> {
+        self.create_telnet_terminal_tab_with_login(
+            config,
+            None,
+            terminal_options,
+            title,
+            window,
+            cx,
+        )
+    }
+
+    fn create_telnet_terminal_tab_with_login(
+        &mut self,
+        config: TelnetSessionConfig,
+        login: Option<oxideterm_terminal::TelnetLoginCredentials>,
+        terminal_options: ConnectionTerminalOptions,
+        title: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<TerminalSessionId> {
         let tab_id = self.alloc_tab_id(cx);
         let pane_id = self.alloc_pane_id(cx);
         let session_id = self.alloc_session_id(cx);
-        let preference_overrides = terminal_preference_overrides(terminal_options);
+        let mut preference_overrides = terminal_preference_overrides(
+            terminal_options,
+            &self.settings_store.settings().terminal,
+        );
+        preference_overrides.session_log_context = Some(TerminalSessionLogContext {
+            session: title.clone(),
+            host: config.host.clone(),
+            username: String::new(),
+            protocol: "telnet".to_string(),
+        });
         let mut preferences =
             self.prepare_terminal_preferences_for_tab_kind(&TabKind::LocalTerminal, cx);
         preference_overrides.apply_to(&mut preferences);
         let pane_config = config;
         let pane = cx.new(|cx| {
-            TerminalPane::new_telnet_with_preferences(pane_config, preferences, window, cx)
-                .expect("failed to initialize Telnet terminal pane")
-                .with_preference_overrides(preference_overrides)
+            TerminalPane::new_telnet_with_login_preferences(
+                pane_config,
+                login,
+                preferences,
+                window,
+                cx,
+            )
+            .expect("failed to initialize Telnet terminal pane")
+            .with_preference_overrides(preference_overrides)
         });
 
         // Telnet is a local transport in the plugin API: it owns no SSH node,
@@ -192,16 +291,18 @@ impl WorkspaceApp {
     pub(in crate::workspace) fn create_serial_terminal_tab(
         &mut self,
         config: SerialSessionConfig,
+        terminal_options: ConnectionTerminalOptions,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<TerminalSessionId> {
         let title = format!("Serial {}", config.port_path);
-        self.create_serial_terminal_tab_with_title(config, title, window, cx)
+        self.create_serial_terminal_tab_with_title(config, terminal_options, title, window, cx)
     }
 
     pub(in crate::workspace) fn create_serial_terminal_tab_with_title(
         &mut self,
         config: SerialSessionConfig,
+        terminal_options: ConnectionTerminalOptions,
         title: String,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -209,12 +310,24 @@ impl WorkspaceApp {
         let tab_id = self.alloc_tab_id(cx);
         let pane_id = self.alloc_pane_id(cx);
         let session_id = self.alloc_session_id(cx);
-        let preferences =
+        let mut preferences =
             self.prepare_terminal_preferences_for_tab_kind(&TabKind::LocalTerminal, cx);
+        let mut preference_overrides = terminal_preference_overrides(
+            terminal_options,
+            &self.settings_store.settings().terminal,
+        );
+        preference_overrides.session_log_context = Some(TerminalSessionLogContext {
+            session: title.clone(),
+            host: config.port_path.clone(),
+            username: String::new(),
+            protocol: "serial".to_string(),
+        });
+        preference_overrides.apply_to(&mut preferences);
         let pane_config = config.clone();
         let pane = cx.new(|cx| {
             TerminalPane::new_serial_with_preferences(pane_config, preferences, window, cx)
                 .expect("failed to initialize Serial terminal pane")
+                .with_preference_overrides(preference_overrides)
         });
 
         // Serial mirrors Tauri local-terminal transport semantics: it is not
@@ -246,6 +359,7 @@ impl WorkspaceApp {
     pub(in crate::workspace) fn create_mosh_terminal_tab(
         &mut self,
         mut config: MoshTerminalConfig,
+        terminal_options: ConnectionTerminalOptions,
         title: String,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -255,11 +369,23 @@ impl WorkspaceApp {
         let session_id = self.alloc_session_id(cx);
         // The bootstrap consumer identifier is local runtime metadata, not a remote session name.
         config.bootstrap.session_id = format!("mosh-{}", session_id.0);
-        let preferences =
+        let mut preferences =
             self.prepare_terminal_preferences_for_tab_kind(&TabKind::MoshTerminal, cx);
+        let mut preference_overrides = terminal_preference_overrides(
+            terminal_options,
+            &self.settings_store.settings().terminal,
+        );
+        preference_overrides.session_log_context = Some(TerminalSessionLogContext {
+            session: title.clone(),
+            host: String::new(),
+            username: String::new(),
+            protocol: "mosh".to_string(),
+        });
+        preference_overrides.apply_to(&mut preferences);
         let pane = cx.new(|cx| {
             TerminalPane::new_mosh_with_preferences(config, preferences, window, cx)
                 .expect("failed to initialize Mosh terminal pane")
+                .with_preference_overrides(preference_overrides)
         });
 
         // Mosh owns one UDP terminal and deliberately has no SSH node capabilities.
@@ -299,7 +425,7 @@ impl WorkspaceApp {
             .get(&saved_connection_id)
             .map(|connection| {
                 (
-                    connection.options.terminal,
+                    connection.options.terminal.clone(),
                     connection.options.dedicated_new_terminal_connection,
                 )
             })
@@ -315,7 +441,7 @@ impl WorkspaceApp {
         }) {
             self.associate_existing_node_with_saved_connection(&node_id, &saved_connection_id);
             if let Some(node) = self.ssh_nodes.get_mut(&node_id) {
-                node.terminal_options = saved_terminal_options;
+                node.terminal_options = saved_terminal_options.clone();
                 node.dedicated_new_terminal_connection = saved_dedicated_new_terminal_connection;
             }
             if let Some(session_id) = self
@@ -405,7 +531,7 @@ impl WorkspaceApp {
                     &saved_connection_id,
                 );
                 if let Some(node) = self.ssh_nodes.get_mut(&existing_node_id) {
-                    node.terminal_options = saved_terminal_options;
+                    node.terminal_options = saved_terminal_options.clone();
                     node.dedicated_new_terminal_connection =
                         saved_dedicated_new_terminal_connection;
                 }
@@ -462,7 +588,7 @@ impl WorkspaceApp {
                 Some(saved_connection_id.clone()),
             );
             if let Some(node) = self.ssh_nodes.get_mut(&node_id) {
-                node.terminal_options = saved_terminal_options;
+                node.terminal_options = saved_terminal_options.clone();
                 node.dedicated_new_terminal_connection = saved_dedicated_new_terminal_connection;
             }
             let cleanup_node_id = node_id.clone();
@@ -716,6 +842,73 @@ impl WorkspaceApp {
         Ok(())
     }
 
+    fn open_temporary_telnet_launch(
+        &mut self,
+        launch: TemporaryTelnetLaunch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let title = launch.title();
+        let config = TelnetSessionConfig {
+            host: launch.host,
+            port: launch.port,
+        };
+        let login = launch.username.map(|username| {
+            // URI user information is consumed by the Telnet worker and never enters the store.
+            oxideterm_terminal::TelnetLoginCredentials {
+                username,
+                password: launch.password,
+            }
+        });
+        self.create_telnet_terminal_tab_with_login(
+            config,
+            login,
+            ConnectionTerminalOptions::default(),
+            title,
+            window,
+            cx,
+        )?;
+        Ok(())
+    }
+
+    fn open_temporary_mosh_launch(
+        &mut self,
+        launch: TemporaryMoshLaunch,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let title = launch.title();
+        let auth = match launch.password {
+            Some(password) => AuthMethod::password_secret(password),
+            None => AuthMethod::Agent,
+        };
+        let config = SshConfig {
+            host: launch.host,
+            port: launch.ssh_port,
+            username: launch.username,
+            auth,
+            strict_host_key_checking: true,
+            ..SshConfig::default()
+        };
+        self.start_ssh_preflight(
+            config,
+            title,
+            SshConnectionIntent::Mosh(MoshConnectionOptions {
+                saved_profile_id: None,
+                server_executable: oxideterm_mosh::DEFAULT_MOSH_SERVER_EXECUTABLE.to_string(),
+                udp_host_override: None,
+                udp_port: SavedMoshUdpPortSelection::Automatic,
+                ip_family: SavedMoshIpFamily::Auto,
+                prediction: MoshPredictionMode::Adaptive,
+                locale: None,
+                terminal: ConnectionTerminalOptions::default(),
+                public_mcp_open_token: None,
+            }),
+            cx,
+        );
+        cx.notify();
+        Ok(())
+    }
+
     pub(in crate::workspace) fn expand_saved_connection_tree(
         &mut self,
         saved_connection_id: &str,
@@ -911,6 +1104,14 @@ impl WorkspaceApp {
                 .with_preference_overrides(preference_overrides)
         });
         self.register_terminal_pane(pane_id, session_id, pane, window, cx);
+        if let Some(saved_connection_id) = saved_connection_id {
+            self.register_terminal_saved_connection(
+                session_id,
+                oxideterm_terminal_triggers::SavedConnectionKind::Ssh,
+                saved_connection_id,
+                cx,
+            );
+        }
         self.refresh_native_plugin_terminal_hooks(cx);
         self.persist_session_tree_snapshot();
         Ok((pane_id, session_id))
@@ -1114,7 +1315,7 @@ impl WorkspaceApp {
                     let terminal_options = self
                         .ssh_nodes
                         .get(&node_id)
-                        .map(|node| node.terminal_options)
+                        .map(|node| node.terminal_options.clone())
                         .unwrap_or_default();
                     SshConnectionIntent::Connect(SshTerminalConnectionOptions {
                         terminal: terminal_options,
@@ -1282,6 +1483,7 @@ fn ssh_config_from_proxy_hop(hop: ProxyHopConfig, connect_timeout_seconds: u64) 
         identity_agent,
         agent_forwarding_socket,
         legacy_ssh_compatibility,
+        ssh_algorithms,
         strict_host_key_checking,
         trust_host_key,
         expected_host_key_fingerprint,
@@ -1297,6 +1499,7 @@ fn ssh_config_from_proxy_hop(hop: ProxyHopConfig, connect_timeout_seconds: u64) 
         identity_agent,
         agent_forwarding_socket,
         legacy_ssh_compatibility,
+        ssh_algorithms,
         strict_host_key_checking,
         trust_host_key,
         expected_host_key_fingerprint,
@@ -1321,6 +1524,7 @@ mod create_tests {
                 identity_agent: Some("/tmp/identity-agent.sock".to_string()),
                 agent_forwarding_socket: Some("/tmp/forward-agent.sock".to_string()),
                 legacy_ssh_compatibility: true,
+                ssh_algorithms: oxideterm_connections::SshAlgorithmPreferences::default(),
                 strict_host_key_checking: true,
                 trust_host_key: Some(false),
                 expected_host_key_fingerprint: Some("SHA256:test".to_string()),
@@ -1457,6 +1661,7 @@ mod create_tests {
                 identity_agent: None,
                 agent_forwarding_socket: None,
                 legacy_ssh_compatibility: false,
+                ssh_algorithms: oxideterm_connections::SshAlgorithmPreferences::default(),
                 strict_host_key_checking: true,
                 trust_host_key: None,
                 expected_host_key_fingerprint: None,

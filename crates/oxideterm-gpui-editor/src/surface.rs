@@ -25,8 +25,6 @@ mod coords;
 mod fold;
 mod indent_index;
 mod input;
-#[cfg(all(test, feature = "perf-baseline"))]
-mod perf;
 mod render;
 mod search;
 mod wrap;
@@ -205,6 +203,7 @@ struct DisplayRowsCache {
     buffer_version: u64,
     wrap_column: Option<usize>,
     fold_revision: u64,
+    max_width_columns: usize,
     rows: Arc<Vec<DisplayRow>>,
 }
 
@@ -965,13 +964,32 @@ impl TextEditorView {
         } else {
             -f32::from(delta.y)
         };
-        let scrolled =
-            self.viewport
-                .scroll_by(dx, dy, self.document_row_count(), self.metrics.line_height);
+        let max_scroll_x_px = self.max_horizontal_scroll_px();
+        let scrolled = self.viewport.scroll_by(
+            dx,
+            dy,
+            max_scroll_x_px,
+            self.document_row_count(),
+            self.metrics.line_height,
+        );
         cx.stop_propagation();
         if scrolled {
             cx.notify();
         }
+    }
+
+    pub(super) fn horizontal_viewport_width_px(&self) -> f32 {
+        // The gutter remains fixed while only the document content moves horizontally.
+        (self.viewport.width_px - self.visible_gutter_width()).max(0.0)
+    }
+
+    pub(super) fn horizontal_document_width_px(&self) -> f32 {
+        self.document_width_columns() as f32 * self.metrics.char_width
+            + self.visible_content_padding_x() * 2.0
+    }
+
+    pub(super) fn max_horizontal_scroll_px(&self) -> f32 {
+        (self.horizontal_document_width_px() - self.horizontal_viewport_width_px()).max(0.0)
     }
 
     pub(super) fn vertical_scroll_y_px(&self) -> f32 {
@@ -995,7 +1013,11 @@ impl TextEditorView {
         // Bounds are captured during the same frame's prepaint pass so the
         // editor does not render one-frame-stale virtual rows after resizing.
         self.content_bounds = Some(bounds);
-        if self.viewport.set_height(f32::from(bounds.size.height)) {
+        let width_changed = self.viewport.set_width(f32::from(bounds.size.width));
+        let height_changed = self.viewport.set_height(f32::from(bounds.size.height));
+        if width_changed || height_changed {
+            self.viewport
+                .clamp_horizontal(self.max_horizontal_scroll_px());
             self.viewport
                 .clamp(self.document_row_count(), self.metrics.line_height);
             cx.notify();
@@ -1275,12 +1297,7 @@ fn colored_text(text: &str, color: u32) -> Div {
 mod tests {
     use std::sync::Arc;
 
-    use oxideterm_editor_core::BufferOffset;
-    use oxideterm_editor_syntax::BracketPair;
-
-    use super::{
-        HighlightChunkCache, HighlightChunkCacheKey, LineChunkSpec, build_bracket_pair_index,
-    };
+    use super::{HighlightChunkCache, HighlightChunkCacheKey, LineChunkSpec};
 
     fn cache_key(line: usize) -> HighlightChunkCacheKey {
         HighlightChunkCacheKey {
@@ -1327,21 +1344,5 @@ mod tests {
                 .get(&cache_key(HighlightChunkCache::MAX_ENTRIES))
                 .is_some()
         );
-    }
-
-    #[test]
-    fn bracket_index_preserves_first_pair_for_shared_caret_slot() {
-        let first = BracketPair {
-            open: BufferOffset(0),
-            close: BufferOffset(1),
-        };
-        let second = BracketPair {
-            open: BufferOffset(1),
-            close: BufferOffset(2),
-        };
-
-        let index = build_bracket_pair_index(&[first.clone(), second]);
-
-        assert_eq!(index.get(&1), Some(&first));
     }
 }

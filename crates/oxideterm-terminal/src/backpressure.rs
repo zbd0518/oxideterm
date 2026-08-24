@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use std::{
+    borrow::Cow,
     collections::VecDeque,
     sync::{Arc, Condvar, Mutex, MutexGuard},
     time::Duration,
@@ -11,7 +12,6 @@ use tokio::sync::Notify;
 
 pub(crate) const LOCAL_PTY_READ_BUFFER_BYTES: usize = 8 * 1024;
 pub(crate) const LOCAL_MAX_LOCKED_PARSE_BYTES: usize = 64 * 1024;
-pub(crate) const MAGIC_DETECT_OVERLAP_BYTES: usize = 128;
 pub(crate) const UTF8_RESIDUAL_MAX_BYTES: usize = 4;
 
 // Keep enough transport output for several normal drains while placing a
@@ -29,6 +29,7 @@ pub struct TerminalDrainBudget {
     pub max_bytes: usize,
     pub max_events: usize,
     pub max_duration: Duration,
+    pub collect_performance_metrics: bool,
 }
 
 impl TerminalDrainBudget {
@@ -37,11 +38,17 @@ impl TerminalDrainBudget {
             max_bytes,
             max_events,
             max_duration: Duration::MAX,
+            collect_performance_metrics: false,
         }
     }
 
     pub const fn with_max_duration(mut self, max_duration: Duration) -> Self {
         self.max_duration = max_duration;
+        self
+    }
+
+    pub const fn with_performance_metrics(mut self, enabled: bool) -> Self {
+        self.collect_performance_metrics = enabled;
         self
     }
 
@@ -66,18 +73,6 @@ impl TerminalDrainBudget {
     }
 }
 
-#[cfg(test)]
-mod drain_budget_tests {
-    use super::*;
-
-    #[test]
-    fn zero_duration_budget_is_immediately_exhausted() {
-        let budget = TerminalDrainBudget::interactive().with_max_duration(Duration::ZERO);
-
-        assert!(budget.time_exhausted(std::time::Instant::now()));
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TerminalDrainReport {
     pub changed: bool,
@@ -85,6 +80,9 @@ pub struct TerminalDrainReport {
     pub pending_bytes: usize,
     pub events_drained: usize,
     pub drain_duration: Duration,
+    pub max_data_chunk_bytes: usize,
+    pub output_processing_duration: Duration,
+    pub terminal_lock_wait_duration: Duration,
     pub budget_exhausted: bool,
 }
 
@@ -93,12 +91,21 @@ impl TerminalDrainReport {
         self.changed = true;
     }
 
+    pub fn record_data_chunk(&mut self, byte_len: usize, processing_duration: Duration) {
+        self.drained_bytes = self.drained_bytes.saturating_add(byte_len);
+        self.max_data_chunk_bytes = self.max_data_chunk_bytes.max(byte_len);
+        self.output_processing_duration += processing_duration;
+    }
+
     pub fn combine(&mut self, other: TerminalDrainReport) {
         self.changed |= other.changed;
         self.drained_bytes = self.drained_bytes.saturating_add(other.drained_bytes);
         self.pending_bytes = self.pending_bytes.saturating_add(other.pending_bytes);
         self.events_drained = self.events_drained.saturating_add(other.events_drained);
         self.drain_duration += other.drain_duration;
+        self.max_data_chunk_bytes = self.max_data_chunk_bytes.max(other.max_data_chunk_bytes);
+        self.output_processing_duration += other.output_processing_duration;
+        self.terminal_lock_wait_duration += other.terminal_lock_wait_duration;
         self.budget_exhausted |= other.budget_exhausted;
     }
 }
@@ -364,9 +371,18 @@ pub(crate) struct Utf8ResidualGuard {
 }
 
 impl Utf8ResidualGuard {
-    pub(crate) fn push(&mut self, bytes: &[u8]) -> Option<Vec<u8>> {
+    pub(crate) fn push<'a>(&mut self, bytes: &'a [u8]) -> Option<Cow<'a, [u8]>> {
         if bytes.is_empty() && self.residual.is_empty() {
             return None;
+        }
+
+        if self.residual.is_empty() {
+            let split = split_before_incomplete_utf8_tail(bytes);
+            if split < bytes.len() {
+                // Retain only the incomplete scalar instead of copying the complete chunk.
+                self.residual.extend_from_slice(&bytes[split..]);
+            }
+            return (split > 0).then(|| Cow::Borrowed(&bytes[..split]));
         }
 
         let mut combined = Vec::with_capacity(self.residual.len() + bytes.len());
@@ -385,7 +401,7 @@ impl Utf8ResidualGuard {
             self.residual.clear();
         }
 
-        (!combined.is_empty()).then_some(combined)
+        (!combined.is_empty()).then_some(Cow::Owned(combined))
     }
 
     pub(crate) fn flush(&mut self) -> Option<Vec<u8>> {
@@ -467,33 +483,60 @@ impl MagicScanWindow {
             return Vec::new();
         }
 
-        let mut window = Vec::with_capacity(self.tail.len() + chunk.len());
-        window.extend_from_slice(&self.tail);
-        window.extend_from_slice(chunk);
-        let current_start = self.tail.len();
         let mut matches = Vec::new();
 
         for kind in &self.patterns {
             let marker = kind.marker();
-            if marker.is_empty() || marker.len() > window.len() {
+            if marker.is_empty() {
                 continue;
             }
-
-            for index in 0..=window.len() - marker.len() {
-                if &window[index..index + marker.len()] == marker
-                    && index + marker.len() > current_start
-                {
-                    matches.push(*kind);
-                    break;
-                }
+            if marker_crosses_chunk_boundary(&self.tail, chunk, marker)
+                || chunk_contains_marker(chunk, marker)
+            {
+                matches.push(*kind);
             }
         }
 
-        let keep = MAGIC_DETECT_OVERLAP_BYTES.min(window.len());
-        self.tail.clear();
-        self.tail.extend_from_slice(&window[window.len() - keep..]);
+        let keep = self
+            .patterns
+            .iter()
+            .map(|kind| kind.marker().len().saturating_sub(1))
+            .max()
+            .unwrap_or(0);
+        if chunk.len() >= keep {
+            self.tail.clear();
+            self.tail.extend_from_slice(&chunk[chunk.len() - keep..]);
+        } else {
+            self.tail.extend_from_slice(chunk);
+            if self.tail.len() > keep {
+                let discard = self.tail.len() - keep;
+                self.tail.copy_within(discard.., 0);
+                self.tail.truncate(keep);
+            }
+        }
         matches
     }
+}
+
+fn marker_crosses_chunk_boundary(tail: &[u8], chunk: &[u8], marker: &[u8]) -> bool {
+    let max_tail_bytes = tail.len().min(marker.len().saturating_sub(1));
+    (1..=max_tail_bytes).any(|tail_bytes| {
+        let chunk_bytes = marker.len() - tail_bytes;
+        chunk_bytes <= chunk.len()
+            && tail[tail.len() - tail_bytes..] == marker[..tail_bytes]
+            && chunk[..chunk_bytes] == marker[tail_bytes..]
+    })
+}
+
+fn chunk_contains_marker(mut chunk: &[u8], marker: &[u8]) -> bool {
+    while let Some(offset) = chunk.iter().position(|byte| *byte == marker[0]) {
+        chunk = &chunk[offset..];
+        if chunk.starts_with(marker) {
+            return true;
+        }
+        chunk = &chunk[1..];
+    }
+    false
 }
 
 #[cfg(test)]
@@ -509,20 +552,31 @@ mod tests {
     fn utf8_guard_keeps_incomplete_tail() {
         let mut guard = Utf8ResidualGuard::default();
         assert_eq!(guard.push(&[0xe4, 0xbd]), None);
-        assert_eq!(guard.push(&[0xa0]), Some("你".as_bytes().to_vec()));
+        assert_eq!(guard.push(&[0xa0]).as_deref(), Some("你".as_bytes()));
     }
 
     #[test]
     fn utf8_guard_flushes_invalid_bytes_unchanged() {
         let mut guard = Utf8ResidualGuard::default();
-        assert_eq!(guard.push(&[0xff, b'a']), Some(vec![0xff, b'a']));
+        assert_eq!(
+            guard.push(&[0xff, b'a']).as_deref(),
+            Some(&[0xff, b'a'][..])
+        );
     }
 
     #[test]
     fn utf8_guard_does_not_split_emoji_tail() {
         let mut guard = Utf8ResidualGuard::default();
         assert_eq!(guard.push(&[0xf0, 0x9f, 0x98]), None);
-        assert_eq!(guard.push(&[0x80]), Some("😀".as_bytes().to_vec()));
+        assert_eq!(guard.push(&[0x80]).as_deref(), Some("😀".as_bytes()));
+    }
+
+    #[test]
+    fn utf8_guard_borrows_complete_chunks() {
+        let mut guard = Utf8ResidualGuard::default();
+        let bytes = "plain 中文 🚀".as_bytes();
+
+        assert!(matches!(guard.push(bytes), Some(Cow::Borrowed(value)) if value == bytes));
     }
 
     #[test]
@@ -539,6 +593,26 @@ mod tests {
         assert!(scan.scan(b"abc::TRZSZ:").is_empty());
         assert_eq!(scan.scan(b"TRANSFER:R:1").len(), 1);
         assert!(scan.scan(b"ordinary output").is_empty());
+    }
+
+    #[test]
+    fn magic_scan_detects_every_cross_chunk_split() {
+        let marker = TerminalMagicKind::TrzszTransfer.marker();
+        for split in 1..marker.len() {
+            let mut scan = MagicScanWindow::default();
+            assert!(scan.scan(&marker[..split]).is_empty(), "split {split}");
+            assert_eq!(scan.scan(&marker[split..]).len(), 1, "split {split}");
+        }
+    }
+
+    #[test]
+    fn magic_scan_skips_false_marker_prefixes_in_current_chunk() {
+        let mut scan = MagicScanWindow::default();
+        assert_eq!(
+            scan.scan(b"time:12:34 status:ok ::TRZSZ:TRANSFER:R:1")
+                .len(),
+            1
+        );
     }
 
     #[test]

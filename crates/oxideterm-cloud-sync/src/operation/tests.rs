@@ -12,6 +12,7 @@ fn connection_sync_record(
             id: "conn-1".to_string(),
             name: "Production".to_string(),
             group: None,
+            notes: None,
             host: "example.test".to_string(),
             port: 22,
             username: "ops".to_string(),
@@ -20,6 +21,9 @@ fn connection_sync_record(
             cert_path: None,
             managed_key_id: None,
             managed_key_name: None,
+            gssapi_authentication: false,
+            gssapi_server_identity: None,
+            gssapi_delegate_credentials: false,
             proxy_chain: Vec::new(),
             upstream_proxy: oxideterm_connections::SavedUpstreamProxyPolicy::UseGlobal,
             created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -32,6 +36,7 @@ fn connection_sync_record(
             identity_agent: None,
             agent_forwarding_socket: None,
             legacy_ssh_compatibility: false,
+            ssh_algorithms: oxideterm_connections::SshAlgorithmPreferences::default(),
             post_connect_command: None,
         }),
         options: Some(options),
@@ -40,8 +45,6 @@ fn connection_sync_record(
 
 fn dirty_snapshot() -> CloudSyncLocalSnapshot {
     CloudSyncLocalSnapshot {
-        metadata: crate::LocalSyncMetadata::default(),
-        scope: crate::SyncScope::default(),
         dirty: crate::StructuredDirtyInfo {
             current_state: crate::StructuredLocalState::default(),
             dirty_sections: crate::StructuredDirtySections {
@@ -50,15 +53,7 @@ fn dirty_snapshot() -> CloudSyncLocalSnapshot {
             },
             has_dirty: true,
         },
-        upload_units: 0,
-        connections_record_count: 0,
-        forwards_record_count: 0,
-        quick_commands_record_count: 0,
-        serial_profiles_record_count: 0,
-        telnet_profiles_record_count: 0,
-        mosh_profiles_record_count: 0,
-        remote_desktop_profiles_record_count: 0,
-        sensitive_credentials_record_count: 0,
+        ..CloudSyncLocalSnapshot::default()
     }
 }
 
@@ -211,8 +206,12 @@ fn connection_merge_preserves_independent_full_option_changes() {
     let base_record = connection_sync_record(oxideterm_connections::ConnectionOptions::default());
     let mut local_record = base_record.clone();
     local_record.options.as_mut().unwrap().compression = true;
+    local_record.options.as_mut().unwrap().ssh_algorithms.cipher =
+        vec!["aes256-gcm@openssh.com".to_string()];
     let mut remote_record = base_record.clone();
     remote_record.options.as_mut().unwrap().keep_alive_interval = 45;
+    remote_record.options.as_mut().unwrap().ssh_algorithms.mac =
+        vec!["hmac-sha2-512-etm@openssh.com".to_string()];
     let base = SavedConnectionsSyncSnapshot {
         revision: "base".to_string(),
         exported_at: "2026-01-01T00:00:00Z".to_string(),
@@ -244,6 +243,14 @@ fn connection_merge_preserves_independent_full_option_changes() {
     let merged_options = merged_record.options.as_ref().unwrap();
     assert!(merged_options.compression);
     assert_eq!(merged_options.keep_alive_interval, 45);
+    assert_eq!(
+        merged_options.ssh_algorithms.cipher,
+        ["aes256-gcm@openssh.com"]
+    );
+    assert_eq!(
+        merged_options.ssh_algorithms.mac,
+        ["hmac-sha2-512-etm@openssh.com"]
+    );
     assert_eq!(merged_record.updated_at, "2026-01-02T00:00:00Z");
     assert_eq!(
         merged_record.revision,
@@ -340,7 +347,6 @@ fn upload_conflict_check_allows_unchanged_legacy_snapshot_like_tauri() {
 #[test]
 fn upload_conflict_check_rejects_changed_sensitive_credentials_section() {
     let local_snapshot = CloudSyncLocalSnapshot {
-        metadata: crate::LocalSyncMetadata::default(),
         scope: crate::SyncScope {
             sync_sensitive_credentials: true,
             ..crate::SyncScope::default()
@@ -357,14 +363,8 @@ fn upload_conflict_check_rejects_changed_sensitive_credentials_section() {
             has_dirty: true,
         },
         upload_units: 1,
-        connections_record_count: 0,
-        forwards_record_count: 0,
-        quick_commands_record_count: 0,
-        serial_profiles_record_count: 0,
-        telnet_profiles_record_count: 0,
-        mosh_profiles_record_count: 0,
-        remote_desktop_profiles_record_count: 0,
         sensitive_credentials_record_count: 1,
+        ..CloudSyncLocalSnapshot::default()
     };
     let metadata = RemoteMetadata {
         exists: true,

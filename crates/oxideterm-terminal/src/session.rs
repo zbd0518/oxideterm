@@ -3,7 +3,7 @@ use std::{
     collections::VecDeque,
     io::{Read, Write},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use alacritty_terminal::{
@@ -43,7 +43,8 @@ use crate::{
     TerminalProcessInfo, TerminalProcessProbe, TerminalSearchMatch, TerminalSize, TerminalSnapshot,
     append_grid_line_text, backpressure::MagicScanWindow, focus_report_sequence,
     graphics_cursor_from_term, incremental_snapshot_from_term, interactive_terminal_config,
-    local_event_channel, privilege_prompt::TerminalPrivilegePromptStream, search_matches_from_term,
+    local_event_channel, privilege_prompt::TerminalPrivilegePromptStream,
+    scroll_snapshot_from_term, search_matches_from_term,
     shell_integration::TerminalShellIntegration, snapshot_from_term,
     snapshot_from_term_with_display_offset,
 };
@@ -281,6 +282,67 @@ mod tests {
                 .take_events()
                 .into_iter()
                 .any(|event| matches!(event, TerminalEvent::Output(bytes) if bytes == b"recorded"))
+        );
+    }
+
+    #[test]
+    fn ssh_trigger_matches_do_not_enable_full_output_events() {
+        use oxideterm_terminal_triggers::{
+            TERMINAL_TRIGGERS_SCHEMA_VERSION, TerminalTrigger, TerminalTriggerAction,
+            TerminalTriggerDispatch, TerminalTriggerMatch, TerminalTriggerMatchMode,
+            TerminalTriggerScope, TerminalTriggerTiming, TerminalTriggersSnapshot, compile_active,
+        };
+
+        let snapshot = TerminalTriggersSnapshot {
+            version: TERMINAL_TRIGGERS_SCHEMA_VERSION,
+            triggers: vec![TerminalTrigger {
+                id: "ready".to_string(),
+                name: "ready".to_string(),
+                description: None,
+                enabled: true,
+                matcher: TerminalTriggerMatch {
+                    pattern: "READY".to_string(),
+                    mode: TerminalTriggerMatchMode::Literal,
+                    case_sensitive: true,
+                    whole_word: false,
+                },
+                action: TerminalTriggerAction::SendText {
+                    text: "continue".to_string(),
+                    append_enter: true,
+                },
+                timing: TerminalTriggerTiming {
+                    dispatch: TerminalTriggerDispatch::Immediate,
+                    delay_ms: 0,
+                    cooldown_ms: 100,
+                },
+                scope: TerminalTriggerScope::AllTerminals,
+                created_at: 1,
+                updated_at: 1,
+            }],
+            updated_at: 1,
+        };
+        let rules = compile_active(&snapshot, 7).unwrap();
+        let mut session = SshPtySession::new_disconnected_for_test(
+            SshSessionConfig::new("127.0.0.1", 9, "nobody"),
+            80,
+            24,
+            GraphicsOptions::default(),
+            TerminalEncoding::Utf8,
+            1000,
+        );
+        TerminalSessionBackend::set_trigger_rules(&mut session, rules);
+
+        session.feed_plain_transport_output_to_terminal(b"RE");
+        session.feed_plain_transport_output_to_terminal(b"ADY");
+        let events = session.take_events();
+
+        assert!(events.iter().any(|event| {
+            matches!(event, TerminalEvent::TriggerMatched(matched) if matched.trigger_id() == "ready")
+        }));
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, TerminalEvent::Output(_)))
         );
     }
 }

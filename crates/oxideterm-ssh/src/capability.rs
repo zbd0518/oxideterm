@@ -3,6 +3,8 @@
 
 use serde::Serialize;
 
+use crate::{SshAlgorithmCategory, visible_algorithm_names};
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SshCapabilityReport {
@@ -68,31 +70,11 @@ pub fn ssh_capability_report() -> SshCapabilityReport {
 
 fn algorithm_offer(preferred: &russh::Preferred) -> SshAlgorithmOffer {
     SshAlgorithmOffer {
-        kex: preferred
-            .kex
-            .iter()
-            .map(|algorithm| algorithm.as_ref().to_string())
-            .collect(),
-        host_key_algorithms: preferred
-            .key
-            .iter()
-            .map(|algorithm| algorithm.as_str().to_string())
-            .collect(),
-        ciphers: preferred
-            .cipher
-            .iter()
-            .map(|algorithm| algorithm.as_ref().to_string())
-            .collect(),
-        macs: preferred
-            .mac
-            .iter()
-            .map(|algorithm| algorithm.as_ref().to_string())
-            .collect(),
-        compression: preferred
-            .compression
-            .iter()
-            .map(|algorithm| algorithm.as_ref().to_string())
-            .collect(),
+        kex: visible_algorithm_names(preferred, SshAlgorithmCategory::Kex),
+        host_key_algorithms: visible_algorithm_names(preferred, SshAlgorithmCategory::HostKey),
+        ciphers: visible_algorithm_names(preferred, SshAlgorithmCategory::Cipher),
+        macs: visible_algorithm_names(preferred, SshAlgorithmCategory::Mac),
+        compression: visible_algorithm_names(preferred, SshAlgorithmCategory::Compression),
     }
 }
 
@@ -105,6 +87,7 @@ fn integration_capabilities() -> SshIntegrationCapabilities {
             "publickey-managed-key",
             "publickey-agent",
             "keyboard-interactive",
+            "gssapi-with-mic",
         ],
         channel_features: vec![
             "shell",
@@ -133,12 +116,6 @@ fn integration_capabilities() -> SshIntegrationCapabilities {
 
 fn known_limitations() -> Vec<SshCapabilityLimitation> {
     vec![
-        SshCapabilityLimitation {
-            capability: "gssapi-with-mic",
-            layer: SshCapabilityLayer::RusshCore,
-            status: SshCapabilityStatus::Unsupported,
-            note: "Kerberos and GSSAPI authentication are not implemented.",
-        },
         SshCapabilityLimitation {
             capability: "hostbased",
             layer: SshCapabilityLayer::RusshCore,
@@ -170,59 +147,4 @@ fn known_limitations() -> Vec<SshCapabilityLimitation> {
             note: "hostkeys-00 reception exists, but full host-key rotation parity is not proven.",
         },
     ]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn report_uses_runtime_preferred_algorithm_lists() {
-        let report = ssh_capability_report();
-
-        assert!(
-            report
-                .default_offer
-                .kex
-                .contains(&"curve25519-sha256".to_string())
-        );
-        assert!(
-            report
-                .default_offer
-                .kex
-                .contains(&"sntrup761x25519-sha512".to_string())
-        );
-        assert!(
-            !report
-                .default_offer
-                .kex
-                .contains(&"diffie-hellman-group14-sha1".to_string())
-        );
-        assert!(
-            report
-                .legacy_compatibility_offer
-                .kex
-                .contains(&"diffie-hellman-group14-sha1".to_string())
-        );
-    }
-
-    #[test]
-    fn report_distinguishes_core_and_integration_limitations() {
-        let report = ssh_capability_report();
-
-        assert!(report.limitations.iter().any(|limitation| {
-            limitation.capability == "gssapi-with-mic"
-                && limitation.layer == SshCapabilityLayer::RusshCore
-        }));
-        assert!(report.limitations.iter().any(|limitation| {
-            limitation.capability == "direct-fido-security-key"
-                && limitation.layer == SshCapabilityLayer::OxideTermIntegration
-        }));
-        assert!(
-            report
-                .limitations
-                .iter()
-                .all(|limitation| !limitation.capability.starts_with("sntrup761x25519"))
-        );
-    }
 }

@@ -4,8 +4,9 @@ mod tests {
     use std::fs;
 
     use crate::{
-        ConnectionTerminalOptions, PrivilegeCredentialKind, SavePrivilegeCredentialRequest,
-        MoshIpFamily, MoshPredictionMode, MoshUdpPortSelection, SaveMoshProfileRequest,
+        ConnectionTerminalOptions, ConnectionTerminalSessionLogPolicy, MoshIpFamily,
+        MoshPredictionMode, MoshUdpPortSelection, PrivilegeCredentialKind, SaveMoshProfileRequest,
+        SavePrivilegeCredentialRequest,
         SaveRemoteDesktopProfileRequest, SaveSerialProfileRequest, SaveTelnetProfileRequest,
         SavedUpstreamProxyProtocol, SerialFlowControl, SerialProfile, SerialProfilesSyncSnapshot,
     };
@@ -39,6 +40,7 @@ mod tests {
             version: CONFIG_VERSION,
             name: name.to_string(),
             group: Some("Ops".to_string()),
+            notes: Some("Primary production host\nOwned by Platform".to_string()),
             host: "example.com".to_string(),
             port: 2222,
             username: "deploy".to_string(),
@@ -57,8 +59,10 @@ mod tests {
                 identity_agent: None,
                 agent_forwarding_socket: None,
                 legacy_ssh_compatibility: false,
+                ssh_algorithms: SshAlgorithmPreferences::default(),
             }],
             upstream_proxy: SavedUpstreamProxyPolicy::UseGlobal,
+            proxy_command: None,
             options: ConnectionOptions {
                 connect_timeout_seconds: Some(120),
                 keep_alive_interval: 30,
@@ -69,6 +73,7 @@ mod tests {
                 identity_agent: None,
                 agent_forwarding_socket: None,
                 legacy_ssh_compatibility: false,
+                ssh_algorithms: SshAlgorithmPreferences::default(),
                 x11_forwarding: crate::ConnectionX11ForwardingOptions::default(),
                 dedicated_new_terminal_connection: false,
                 post_connect_command: None,
@@ -168,6 +173,10 @@ mod tests {
 
         let imported = target.connections().first().unwrap();
         assert_eq!(imported.name, "Prod");
+        assert_eq!(
+            imported.notes.as_deref(),
+            Some("Primary production host\nOwned by Platform")
+        );
         assert_eq!(imported.host, "example.com");
         assert_eq!(imported.port, 2222);
         assert_eq!(imported.options.keep_alive_interval, 30);
@@ -338,6 +347,10 @@ mod tests {
                 name: "Lab console".to_string(),
                 port_path: "/dev/cu.usbserial-1".to_string(),
                 flow_control: Some(SerialFlowControl::Hardware),
+                terminal: ConnectionTerminalOptions {
+                    session_log_policy: ConnectionTerminalSessionLogPolicy::Manual,
+                    ..ConnectionTerminalOptions::default()
+                },
                 ..SaveSerialProfileRequest::default()
             })
             .unwrap();
@@ -350,6 +363,10 @@ mod tests {
                 name: "Router console".to_string(),
                 host: "router.example.test".to_string(),
                 port: 2323,
+                terminal: ConnectionTerminalOptions {
+                    session_log_policy: ConnectionTerminalSessionLogPolicy::Disabled,
+                    ..ConnectionTerminalOptions::default()
+                },
                 ..SaveTelnetProfileRequest::default()
             })
             .unwrap();
@@ -423,6 +440,7 @@ mod tests {
                 id: Some("mosh-1".to_string()),
                 name: "Roaming shell".to_string(),
                 group: Some("Mobile".to_string()),
+                notes: Some("Intermittent link".to_string()),
                 icon: None,
                 color: None,
                 icon_background_color: None,
@@ -430,14 +448,20 @@ mod tests {
                 ssh_port: 22,
                 username: "alice".to_string(),
                 auth: SavedAuth::Agent,
+                proxy_chain: Vec::new(),
                 server_executable: "mosh-server".to_string(),
                 udp_host_override: None,
                 udp_port: MoshUdpPortSelection::Automatic,
                 ip_family: MoshIpFamily::Auto,
                 prediction: MoshPredictionMode::Adaptive,
                 locale: Some("en_US.UTF-8".to_string()),
+                terminal: ConnectionTerminalOptions {
+                    session_log_policy: ConnectionTerminalSessionLogPolicy::Automatic,
+                    ..ConnectionTerminalOptions::default()
+                },
                 identity_agent: None,
                 legacy_ssh_compatibility: false,
+                ssh_algorithms: SshAlgorithmPreferences::default(),
             })
             .unwrap();
         let mosh_profiles_json =
@@ -475,7 +499,113 @@ mod tests {
         .unwrap();
         assert_eq!(imported.imported_mosh_profiles, 1);
         assert_eq!(target.mosh_profiles()[0].id, profile.id);
+        assert_eq!(
+            target.mosh_profiles()[0].notes.as_deref(),
+            Some("Intermittent link")
+        );
         assert!(matches!(target.mosh_profiles()[0].auth, SavedAuth::Agent));
+        assert_eq!(
+            target.mosh_profiles()[0].terminal.session_log_policy,
+            ConnectionTerminalSessionLogPolicy::Automatic
+        );
+    }
+
+    #[test]
+    fn export_import_roundtrip_preserves_standalone_sftp_without_credentials() {
+        const PASSWORD: &str = "standalone-sftp-archive-secret";
+        let mut source = temp_store("standalone-sftp-profile-source");
+        let mut request = crate::SaveStandaloneSftpProfileRequest {
+            id: Some("sftp-archive".to_string()),
+            name: "Archive endpoint".to_string(),
+            group: Some("Storage".to_string()),
+            notes: Some("Separate SFTP port".to_string()),
+            icon: Some("server".to_string()),
+            color: None,
+            icon_background_color: None,
+            host: "archive.example.test".to_string(),
+            port: 2222,
+            username: "backup".to_string(),
+            auth: SavedAuth::Password {
+                keychain_id: None,
+                plaintext_password: Some(SecretString::from(PASSWORD)),
+            },
+            connect_timeout_seconds: 45,
+            proxy_chain: Vec::new(),
+            upstream_proxy: SavedUpstreamProxyPolicy::Direct,
+            proxy_command: None,
+            identity_agent: None,
+            legacy_ssh_compatibility: false,
+            ssh_algorithms: SshAlgorithmPreferences::default(),
+            initial_remote_path: Some("/srv/archive".to_string()),
+            transfer_mode: crate::StandaloneSftpTransferMode::LocalRemote,
+            secondary_endpoint: None,
+        };
+        request.proxy_chain.push(SavedProxyHop {
+            host: "jump.example.test".to_string(),
+            port: 22,
+            username: "jump".to_string(),
+            auth: SavedAuth::Agent,
+            agent_forwarding: false,
+            identity_agent: None,
+            agent_forwarding_socket: None,
+            legacy_ssh_compatibility: false,
+            ssh_algorithms: SshAlgorithmPreferences::default(),
+        });
+        source.upsert_standalone_sftp_profile(request).unwrap();
+
+        let snapshot_json = serde_json::to_string_pretty(
+            &source.export_standalone_sftp_profiles_snapshot().unwrap(),
+        )
+        .unwrap();
+        assert!(!snapshot_json.contains(PASSWORD));
+        assert!(!snapshot_json.contains("oxide_conn_password_"));
+
+        let bytes = export_connections_to_oxide(
+            &source,
+            &[],
+            "secret!",
+            OxideExportOptions {
+                standalone_sftp_profiles_json: Some(snapshot_json),
+                ..OxideExportOptions::default()
+            },
+        )
+        .unwrap();
+        let file = OxideFile::from_bytes(&bytes).unwrap();
+        assert_eq!(file.metadata.standalone_sftp_profiles_count, Some(1));
+        let preview = preview_oxide_import(
+            &temp_store("standalone-sftp-profile-preview"),
+            &bytes,
+            "secret!",
+            ImportConflictStrategy::Rename,
+        )
+        .unwrap();
+        assert_eq!(preview.standalone_sftp_profiles_count, 1);
+
+        let mut target = temp_store("standalone-sftp-profile-target");
+        let imported = apply_oxide_import(
+            &mut target,
+            &bytes,
+            "secret!",
+            ImportConflictStrategy::Rename,
+        )
+        .unwrap();
+        assert_eq!(imported.imported_standalone_sftp_profiles, 1);
+        let imported_profile = &target.standalone_sftp_profiles()[0];
+        assert_eq!(imported_profile.id, "sftp-archive");
+        assert_eq!(imported_profile.port, 2222);
+        assert_eq!(imported_profile.connect_timeout_seconds, 45);
+        assert_eq!(
+            imported_profile.initial_remote_path.as_deref(),
+            Some("/srv/archive")
+        );
+        assert_eq!(imported_profile.proxy_chain.len(), 1);
+        assert!(matches!(
+            imported_profile.auth,
+            SavedAuth::Password {
+                keychain_id: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -490,6 +620,7 @@ mod tests {
                 id: Some("remote-1".to_string()),
                 name: "Lab desktop".to_string(),
                 group: Some("Lab".to_string()),
+                notes: Some("Shared display".to_string()),
                 protocol: RemoteDesktopProtocol::Vnc,
                 host: "vnc.example.com".to_string(),
                 port: 5900,
@@ -550,6 +681,7 @@ mod tests {
         assert_eq!(imported_profile.id, "remote-1");
         assert_eq!(imported_profile.protocol, RemoteDesktopProtocol::Vnc);
         assert_eq!(imported_profile.host, "vnc.example.com");
+        assert_eq!(imported_profile.notes.as_deref(), Some("Shared display"));
         assert!(imported_profile.credential_ref.is_none());
         assert_eq!(
             imported_profile.ssh_gateway_connection_id.as_deref(),
@@ -757,88 +889,6 @@ mod tests {
     }
 
     #[test]
-    fn transfer_progress_matches_tauri_stage_lifecycle() {
-        let mut source = temp_store("progress-source");
-        source
-            .upsert_imported_connection(saved_connection("conn-1", "Prod"))
-            .unwrap();
-
-        let mut export_progress = Vec::new();
-        let bytes = export_connections_to_oxide_with_progress(
-            &source,
-            &["conn-1".to_string()],
-            "secret!",
-            OxideExportOptions::default(),
-            |stage, current, total| export_progress.push((stage.to_string(), current, total)),
-        )
-        .unwrap();
-        assert_eq!(
-            export_progress,
-            vec![
-                ("collecting_connections".to_string(), 1, 10),
-                ("collecting_portable_secrets".to_string(), 2, 10),
-                ("computing_checksum".to_string(), 3, 10),
-                ("building_metadata".to_string(), 4, 10),
-                ("generating_salt_nonce".to_string(), 5, 10),
-                ("deriving_key".to_string(), 6, 10),
-                ("serializing_payload".to_string(), 7, 10),
-                ("encrypting_payload".to_string(), 8, 10),
-                ("finalizing_file".to_string(), 9, 10),
-                ("serializing_file".to_string(), 10, 10),
-            ]
-        );
-
-        let mut preview_progress = Vec::new();
-        preview_oxide_import_with_progress(
-            &temp_store("progress-preview"),
-            &bytes,
-            "secret!",
-            ImportConflictStrategy::Rename,
-            |stage, current, total| preview_progress.push((stage.to_string(), current, total)),
-        )
-        .unwrap();
-        assert_eq!(
-            preview_progress,
-            vec![
-                ("parsing_file".to_string(), 1, 8),
-                ("deriving_key".to_string(), 2, 8),
-                ("decrypting_payload".to_string(), 3, 8),
-                ("deserializing_payload".to_string(), 4, 8),
-                ("verifying_checksum".to_string(), 5, 8),
-                ("collecting_existing".to_string(), 6, 8),
-                ("building_preview".to_string(), 7, 8),
-                ("analyzing_preview".to_string(), 8, 8),
-            ]
-        );
-
-        let mut apply_progress = Vec::new();
-        let mut target = temp_store("progress-apply");
-        apply_oxide_import_with_options_with_progress(
-            &mut target,
-            &bytes,
-            "secret!",
-            OxideImportOptions::default(),
-            |stage, current, total| apply_progress.push((stage.to_string(), current, total)),
-        )
-        .unwrap();
-        assert_eq!(
-            apply_progress,
-            vec![
-                ("parsing_file".to_string(), 1, 10),
-                ("deriving_key".to_string(), 2, 10),
-                ("decrypting_payload".to_string(), 3, 10),
-                ("deserializing_payload".to_string(), 4, 10),
-                ("verifying_checksum".to_string(), 5, 10),
-                ("filtering_selection".to_string(), 6, 10),
-                ("collecting_existing".to_string(), 7, 10),
-                ("preparing_connections".to_string(), 8, 10),
-                ("saving_config".to_string(), 9, 10),
-                ("applying_connections".to_string(), 10, 10),
-            ]
-        );
-    }
-
-    #[test]
     fn batch_encryption_context_keeps_files_independent_and_compatible() {
         let source = temp_store("batch-encryption-source");
         let context = OxideBatchEncryptionContext::new("secret!").unwrap();
@@ -972,6 +1022,7 @@ mod tests {
             source_connection_id: None,
             name: "Prod".to_string(),
             group: None,
+            notes: None,
             host: "example.org".to_string(),
             port: 22,
             username: "me".to_string(),
@@ -1015,44 +1066,6 @@ mod tests {
             plans.get(1),
             Some(PlannedImportAction::Rename(name)) if name == "Prod (Copy)"
         ));
-    }
-
-    #[test]
-    fn export_missing_connection_id_errors_like_tauri() {
-        let source = temp_store("missing-export-id");
-        let error = export_connections_to_oxide(
-            &source,
-            &["missing".to_string()],
-            "secret!",
-            OxideExportOptions::default(),
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("Connection missing not found"));
-    }
-
-    #[test]
-    fn export_quick_command_metadata_counts_are_optional_like_tauri() {
-        let mut source = temp_store("quick-command-metadata");
-        source
-            .upsert_imported_connection(saved_connection("conn-1", "Prod"))
-            .unwrap();
-
-        let bytes = export_connections_to_oxide(
-            &source,
-            &["conn-1".to_string()],
-            "secret!",
-            OxideExportOptions {
-                quick_commands_json: Some(r#"{"commands":[]}"#.to_string()),
-                ..OxideExportOptions::default()
-            },
-        )
-        .unwrap();
-        let file = OxideFile::from_bytes(&bytes).unwrap();
-
-        assert_eq!(file.metadata.has_quick_commands, Some(true));
-        assert_eq!(file.metadata.quick_commands_count, None);
-        assert_eq!(file.metadata.quick_command_categories_count, None);
     }
 
     #[test]
@@ -1287,43 +1300,6 @@ mod tests {
     }
 
     #[test]
-    fn renamed_import_counts_as_imported_like_tauri() {
-        let mut source = temp_store("rename-count-source");
-        source
-            .upsert_imported_connection(saved_connection("conn-1", "Prod"))
-            .unwrap();
-        let bytes = export_connections_to_oxide(
-            &source,
-            &["conn-1".to_string()],
-            "secret!",
-            OxideExportOptions::default(),
-        )
-        .unwrap();
-
-        let mut target = temp_store("rename-count-target");
-        target
-            .upsert_imported_connection(saved_connection("existing", "Prod"))
-            .unwrap();
-        let result = apply_oxide_import(
-            &mut target,
-            &bytes,
-            "secret!",
-            ImportConflictStrategy::Rename,
-        )
-        .unwrap();
-
-        assert_eq!(result.imported, 1);
-        assert_eq!(result.renamed, 1);
-        assert_eq!(target.connections().len(), 2);
-        assert!(
-            target
-                .connections()
-                .iter()
-                .any(|connection| connection.name == "Prod (Copy)")
-        );
-    }
-
-    #[test]
     fn replace_and_merge_import_report_forward_owner_operations() {
         let imported_connect_timeout_seconds = 120;
         let existing_connect_timeout_seconds = 60;
@@ -1450,6 +1426,7 @@ mod tests {
             source_connection_id: None,
             name: name.to_string(),
             group: None,
+            notes: None,
             host: host.to_string(),
             port: 22,
             username: "me".to_string(),

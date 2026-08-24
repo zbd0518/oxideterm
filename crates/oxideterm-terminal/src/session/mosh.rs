@@ -28,6 +28,7 @@ pub struct MoshTerminalSession {
     output_queue: VecDeque<crate::backpressure::ByteBoundedItem<MoshTerminalWorkerEvent>>,
     output_processor: Option<TerminalOutputProcessor>,
     output_events_enabled: bool,
+    trigger_stream: Option<oxideterm_terminal_triggers::TerminalTriggerStream>,
     shell_integration: TerminalShellIntegration,
     predictor: PredictionOverlay,
     next_prediction_id: u64,
@@ -134,6 +135,7 @@ impl MoshTerminalSession {
             output_queue: VecDeque::new(),
             output_processor: None,
             output_events_enabled: false,
+            trigger_stream: None,
             shell_integration: TerminalShellIntegration::default(),
             predictor: PredictionOverlay::new(prediction_display, false),
             next_prediction_id: 0,
@@ -170,9 +172,13 @@ impl MoshTerminalSession {
                 let MoshTerminalWorkerEvent::Output(bytes) = event.into_inner() else {
                     unreachable!("only Mosh output enters the local drain queue");
                 };
-                report.drained_bytes = report.drained_bytes.saturating_add(bytes.len());
                 report.events_drained += 1;
+                let processing_started = budget.collect_performance_metrics.then(Instant::now);
                 self.feed_transport_output(&bytes);
+                report.record_data_chunk(
+                    bytes.len(),
+                    processing_started.map_or(Duration::ZERO, |started| started.elapsed()),
+                );
                 report.mark_changed();
                 continue;
             }
@@ -210,9 +216,13 @@ impl MoshTerminalSession {
                     report.mark_changed();
                 }
                 MoshTerminalWorkerEvent::Output(bytes) => {
+                    let processing_started = budget.collect_performance_metrics.then(Instant::now);
                     self.reconcile_prediction();
-                    report.drained_bytes = report.drained_bytes.saturating_add(bytes.len());
                     self.feed_transport_output(&bytes);
+                    report.record_data_chunk(
+                        bytes.len(),
+                        processing_started.map_or(Duration::ZERO, |started| started.elapsed()),
+                    );
                     report.mark_changed();
                 }
                 MoshTerminalWorkerEvent::RemoteResize { columns, rows } => {
@@ -284,6 +294,12 @@ impl MoshTerminalSession {
             bytes,
             |segment| match segment {
                 TerminalGraphicsSegment::Terminal(terminal_bytes) => {
+                    if let Some(stream) = self.trigger_stream.as_mut() {
+                        stream.observe_bytes(&terminal_bytes, |matched| {
+                            self.pending_events
+                                .push(TerminalEvent::TriggerMatched(matched));
+                        });
+                    }
                     if self.output_events_enabled {
                         let (_, recordable) = self.shell_integration.advance_with_recording(
                             &mut self.parser,
@@ -512,6 +528,13 @@ impl TerminalSessionBackend for MoshTerminalSession {
         self.output_events_enabled = enabled;
     }
 
+    fn set_trigger_rules(
+        &mut self,
+        rules: Option<Arc<oxideterm_terminal_triggers::CompiledTriggerSet>>,
+    ) {
+        self.trigger_stream = rules.map(oxideterm_terminal_triggers::TerminalTriggerStream::new);
+    }
+
     fn mosh_connection_status(&self) -> Option<MoshConnectionStatus> {
         Some(self.connection_status)
     }
@@ -557,6 +580,26 @@ impl TerminalSessionBackend for MoshTerminalSession {
         if delta != 0 {
             self.term.lock().scroll_display(Scroll::Delta(delta));
         }
+    }
+
+    fn scroll_lines_snapshot_incremental(
+        &mut self,
+        delta: i32,
+        previous: &TerminalSnapshot,
+    ) -> TerminalSnapshot {
+        let mut term = self.term.lock();
+        scroll_snapshot_from_term(
+            &mut term,
+            TerminalSize {
+                cols: self.resize.cols,
+                rows: self.resize.rows,
+                cell_width: self.resize.cell_width,
+                cell_height: self.resize.cell_height,
+            },
+            &self.graphics,
+            delta,
+            previous,
+        )
     }
 
     fn page_up(&mut self) { self.term.lock().scroll_display(Scroll::PageUp); }

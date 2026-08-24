@@ -7,19 +7,21 @@ use gpui::{
 use super::{
     ConnectionFormState,
     form_state::{
-        NewConnectionField, NewConnectionForm, NewConnectionFormMode, NewConnectionProxyHop,
-        NewConnectionSelect, NewConnectionSubmitAction, NewConnectionTransport,
-        NewConnectionUpstreamProxyAuth, NewConnectionUpstreamProxyPolicy, RDP_DEFAULT_PORT_TEXT,
-        RemoteDesktopSessionFeature, RemoteDesktopVncPreference, SSH_DEFAULT_PORT_TEXT,
-        SavedConnectionPromptAction, SshAuthFamily, SshAuthTab, SshKeyAuthSource,
-        TELNET_DEFAULT_PORT_TEXT, VNC_DEFAULT_PORT_TEXT, apply_remote_desktop_vnc_preference,
-        apply_transport_default_port, apply_transport_default_username, auth_family_from_tab,
-        auth_tab_from_key_source, backspace_current_connection_field, clear_connection_selection,
+        CONNECTION_NOTES_LINE_HEIGHT, CONNECTION_NOTES_MIN_HEIGHT,
+        CONNECTION_NOTES_VERTICAL_PADDING, ConnectionRouteTarget, NewConnectionField,
+        NewConnectionForm, NewConnectionFormMode, NewConnectionProxyHop, NewConnectionSelect,
+        NewConnectionSubmitAction, NewConnectionTransport, NewConnectionUpstreamProxyAuth,
+        NewConnectionUpstreamProxyPolicy, RDP_DEFAULT_PORT_TEXT, RemoteDesktopSessionFeature,
+        RemoteDesktopVncPreference, SSH_DEFAULT_PORT_TEXT, SavedConnectionPromptAction,
+        SshAuthFamily, SshAuthTab, SshKeyAuthSource, TELNET_DEFAULT_PORT_TEXT,
+        VNC_DEFAULT_PORT_TEXT, apply_remote_desktop_vnc_preference, apply_transport_default_port,
+        apply_transport_default_username, auth_family_from_tab, auth_tab_from_key_source,
+        backspace_current_connection_field, clear_connection_selection,
         clear_current_connection_field, connection_field_is_selected,
         connection_icon_field_visible, connection_secret_field_visible, current_connection_field,
         default_auth_tab_for_family, insert_text_into_current_connection_field,
         key_source_from_tab, new_connection_form_mode, next_connection_field,
-        next_jump_connection_field, remote_desktop_feature_selected,
+        next_jump_connection_field, next_standalone_sftp_field, remote_desktop_feature_selected,
         remote_desktop_feature_supported, remote_desktop_vnc_preference_selected,
         select_current_connection_field, text_from_keystroke,
         toggle_connection_secret_field_visibility, toggle_remote_desktop_feature,
@@ -38,13 +40,14 @@ use gpui::Div;
 use oxideterm_connections::{
     ConnectionTerminalBackspaceSequence, ConnectionTerminalDeleteSequence,
     ConnectionTerminalEncoding, ConnectionX11ForwardingMode, MoshIpFamily, MoshPredictionMode,
-    SavedUpstreamProxyProtocol,
+    SavedUpstreamProxyProtocol, StandaloneSftpTransferMode,
 };
 use oxideterm_gpui_settings_view::{
     terminal_backspace_sequence_label, terminal_delete_sequence_label, terminal_encoding_label,
 };
 use oxideterm_gpui_ui::{
-    ButtonTone, CheckboxOptions, TextInputView, button,
+    ActionChipOptions, ButtonTone, CheckboxOptions, ScrollableElement, StatusPillOptions,
+    StatusTone, TextInputView, action_chip, button,
     button::{
         ButtonOptions, ButtonRadius, ButtonSize, ButtonVariant, IconButtonOptions,
         ToolbarButtonOptions,
@@ -56,19 +59,26 @@ use oxideterm_gpui_ui::{
         SelectAnchorId, select_anchor_probe, select_option, select_option_action,
         select_overlay_popup_with_max_height, select_trigger_with_focus_visible,
     },
-    text_input, text_input_anchor_probe,
+    status_pill, text_input,
+    text_input::{
+        text_caret, text_input_value_segments, text_input_value_segments_with_marked_range,
+    },
+    text_input_anchor_probe,
 };
 use oxideterm_remote_desktop::{
     RemoteDesktopVncCompression, RemoteDesktopVncImageQuality, RemoteDesktopVncSecurityPolicy,
     RemoteDesktopVncSessionMode,
 };
+use oxideterm_settings_model::{settings_multiline_line_ranges, settings_multiline_line_selection};
 // Keep the modal, proxy-chain, and field-control implementations in explicit
 // submodules so their dependencies and visibility remain locally auditable.
 mod field_controls;
 mod form_modal;
 mod proxy_chain_view;
+mod ssh_algorithm_editor;
+mod standalone_sftp_modal;
 
-use field_controls::{AuthSelectorContext, serial_port_display_label};
+use field_controls::{AuthSelectorContext, ConnectionFormSection, serial_port_display_label};
 
 const TAURI_EDIT_MODAL_WIDTH: f32 = 500.0; // Tauri sm:max-w-[500px]
 const TAURI_EDIT_COLOR_FALLBACK: u32 = 0x22d3ee;
@@ -88,8 +98,10 @@ const TAURI_PROXY_CHAIN_LINE_WIDTH: f32 = 32.0; // Tauri w-8
 const TAURI_PROXY_CHAIN_CONNECTOR_THICKNESS: f32 = 2.0; // Tauri w-0.5 h-0.5
 const TAURI_PROXY_CHAIN_CARD_PADDING: f32 = 12.0; // Tauri p-3
 const TAURI_SERIAL_GRID_GAP: f32 = 16.0; // Tauri serial grid gap-4
-const TAURI_CONNECTION_PANEL_BG_ALPHA: u32 = 0x66; // Tauri connection panel bg-theme-bg/40
 const NEW_CONNECTION_TYPE_SIDEBAR_WIDTH: f32 = 160.0;
+const SSH_ALGORITHM_CATEGORY_COLUMN_WIDTH: f32 = 208.0;
+const SSH_ALGORITHM_DETAIL_COLUMN_WIDTH: f32 = 420.0;
+const NEW_CONNECTION_MODAL_VIEWPORT_MARGIN: f32 = 32.0;
 const CONNECTION_TERMINAL_CONTROL_MIN_WIDTH: f32 = 220.0;
 const CONNECTION_ICON_COLOR_CONTROL_MIN_WIDTH: f32 = 220.0;
 
@@ -193,11 +205,19 @@ impl WorkspaceApp {
                 };
             }
 
-            let password_locked = saved_connection_form_uses_unloaded_secret
+            let password_uses_saved_value = saved_connection_form_uses_unloaded_secret
                 && form.focused_field == NewConnectionField::Password
                 && !form.password_loaded;
-            if password_locked && !matches!(key, "escape" | "enter" | "tab") {
-                return (ConnectionFormKeyResult::Handled, false);
+            if password_uses_saved_value {
+                if uses_text_edit_modifier && key == "v" {
+                    return (ConnectionFormKeyResult::Paste, false);
+                }
+                if text_input.is_some() || key == "space" {
+                    // The protected value stays in the keychain; only new input becomes UI-owned.
+                    form.password_loaded = true;
+                } else if !matches!(key, "escape" | "enter" | "tab") {
+                    return (ConnectionFormKeyResult::Handled, false);
+                }
             }
 
             let focused_field_accepts_ime = matches!(
@@ -206,6 +226,13 @@ impl WorkspaceApp {
                     | NewConnectionField::Host
                     | NewConnectionField::Username
                     | NewConnectionField::Group
+                    | NewConnectionField::Notes
+                    | NewConnectionField::InitialRemotePath
+                    | NewConnectionField::StandaloneSftpSecondaryHost
+                    | NewConnectionField::StandaloneSftpSecondaryUsername
+                    | NewConnectionField::StandaloneSftpSecondaryInitialRemotePath
+                    | NewConnectionField::StandaloneSftpSecondaryIdentityAgent
+                    | NewConnectionField::ProxyCommand
                     | NewConnectionField::Color
                     | NewConnectionField::IdentityAgent
                     | NewConnectionField::TelnetProfileName
@@ -237,6 +264,10 @@ impl WorkspaceApp {
                             current_connection_field(form).to_string(),
                         ));
                         clear_current_connection_field(form);
+                        restore_saved_password_placeholder_if_empty(
+                            form,
+                            saved_connection_form_uses_unloaded_secret,
+                        );
                         form.error = None;
                         show_caret = true;
                     }
@@ -263,12 +294,16 @@ impl WorkspaceApp {
                         next_jump_connection_field(
                             form.focused_field,
                             jump_form.auth_tab,
+                            jump_form.gssapi_enabled,
                             !modifiers.shift,
                         )
+                    } else if form.transport == NewConnectionTransport::StandaloneSftp {
+                        next_standalone_sftp_field(form, !modifiers.shift)
                     } else {
                         next_connection_field(
                             form.focused_field,
                             form.auth_tab,
+                            form.gssapi_enabled,
                             form.transport,
                             form.upstream_proxy_policy,
                             form.upstream_proxy_auth,
@@ -281,9 +316,13 @@ impl WorkspaceApp {
                     (ConnectionFormKeyResult::Handled, true)
                 }
                 "backspace" => {
-                    let changed = backspace_current_connection_field(form)
-                        || form.error.take().is_some()
-                        || !caret_was_visible;
+                    let field_changed = backspace_current_connection_field(form);
+                    restore_saved_password_placeholder_if_empty(
+                        form,
+                        saved_connection_form_uses_unloaded_secret,
+                    );
+                    let changed =
+                        field_changed || form.error.take().is_some() || !caret_was_visible;
                     if changed {
                         cx.notify();
                     }
@@ -345,23 +384,28 @@ impl WorkspaceApp {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
-        let single_line = text
-            .replace("\r\n", "\n")
-            .replace('\r', "\n")
-            .lines()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
         let pasted = self.update_connection_form_state(cx, |state| {
             let Some(form) = state.form.as_mut() else {
                 return false;
             };
-            if saved_connection_form_uses_unloaded_secret
-                && form.focused_field == NewConnectionField::Password
-                && !form.password_loaded
-            {
-                return false;
+            if form.focused_field == NewConnectionField::Notes {
+                insert_text_into_current_connection_field(form, &normalized);
+            } else {
+                // All other connection form controls remain single-line inputs.
+                let single_line = normalized.lines().collect::<Vec<_>>().join(" ");
+                if saved_connection_form_uses_unloaded_secret
+                    && form.focused_field == NewConnectionField::Password
+                    && !form.password_loaded
+                {
+                    if single_line.is_empty() {
+                        return false;
+                    }
+                    // A pasted replacement is owned by the form; the saved value is never loaded.
+                    form.password_loaded = true;
+                }
+                insert_text_into_current_connection_field(form, &single_line);
             }
-            insert_text_into_current_connection_field(form, &single_line);
             form.error = None;
             true
         });
@@ -369,5 +413,19 @@ impl WorkspaceApp {
             self.show_active_input_caret(cx);
             cx.notify();
         }
+    }
+}
+
+fn restore_saved_password_placeholder_if_empty(
+    form: &mut NewConnectionForm,
+    editing_saved_connection: bool,
+) {
+    if editing_saved_connection
+        && form.focused_field == NewConnectionField::Password
+        && form.saved_password_keychain_id.is_some()
+        && form.password.is_empty()
+    {
+        form.password_loaded = false;
+        form.password_visible = false;
     }
 }

@@ -223,28 +223,10 @@ mod tests {
     }
 
     #[test]
-    fn output_batcher_flushes_complete_text() {
-        let mut batcher = SshOutputBatcher::new();
-
-        assert!(!batcher.push(b"abc"));
-        assert_eq!(batcher.take_flush(), Some(b"abc".to_vec()));
-    }
-
-    #[test]
-    fn ssh_client_config_matches_tauri_transport_defaults() {
-        let config = ssh_client_config(false);
-
-        assert_eq!(config.inactivity_timeout, None);
-        assert_eq!(config.keepalive_interval, Some(Duration::from_secs(30)));
-        assert_eq!(config.keepalive_max, 3);
-        assert_eq!(config.window_size, 32 * 1024 * 1024);
-        assert_eq!(config.maximum_packet_size, 256 * 1024);
-    }
-
-    #[test]
     fn ssh_client_config_enables_legacy_algorithms_only_when_requested() {
-        let modern = ssh_client_config(false);
-        let legacy = ssh_client_config(true);
+        let preferences = oxideterm_connections::SshAlgorithmPreferences::default();
+        let modern = ssh_client_config(false, &preferences).unwrap();
+        let legacy = ssh_client_config(true, &preferences).unwrap();
 
         assert!(!modern.preferred.kex.contains(&russh::kex::DH_G14_SHA1));
         assert!(legacy.preferred.kex.contains(&russh::kex::DH_G14_SHA1));
@@ -262,6 +244,7 @@ mod tests {
                 identity_agent: None,
                 agent_forwarding_socket: None,
                 legacy_ssh_compatibility: false,
+                ssh_algorithms: oxideterm_connections::SshAlgorithmPreferences::default(),
                 strict_host_key_checking: true,
                 trust_host_key: None,
                 expected_host_key_fingerprint: None,

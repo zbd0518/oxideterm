@@ -21,12 +21,16 @@ pub struct SshConfigHost {
     pub connect_timeout_seconds: Option<u64>,
     pub identity_file: Option<String>,
     pub certificate_file: Option<String>,
+    pub gssapi_authentication: bool,
+    pub gssapi_server_identity: Option<String>,
+    pub gssapi_delegate_credentials: bool,
     pub identity_agent: Option<String>,
     pub agent_forwarding: bool,
     pub agent_forwarding_socket: Option<String>,
     pub x11_forwarding: ConnectionX11ForwardingOptions,
     pub proxy_chain: Vec<SshConfigProxyHop>,
     pub proxy_command: Option<Vec<SecretString>>,
+    pub remote_command: Option<SecretString>,
     pub already_imported: bool,
 }
 
@@ -37,6 +41,9 @@ pub struct SshConfigProxyHop {
     pub port: Option<u16>,
     pub identity_file: Option<String>,
     pub certificate_file: Option<String>,
+    pub gssapi_authentication: bool,
+    pub gssapi_server_identity: Option<String>,
+    pub gssapi_delegate_credentials: bool,
     pub identity_agent: Option<String>,
     pub agent_forwarding: bool,
     pub agent_forwarding_socket: Option<String>,
@@ -69,6 +76,9 @@ struct SshHostOptions {
     connect_timeout_seconds: Option<u64>,
     identity_file: Option<String>,
     certificate_file: Option<String>,
+    gssapi_authentication: Option<String>,
+    gssapi_server_identity: Option<String>,
+    gssapi_delegate_credentials: Option<String>,
     identity_agent: Option<String>,
     forward_agent: Option<String>,
     forward_x11: Option<String>,
@@ -76,6 +86,7 @@ struct SshHostOptions {
     forward_x11_timeout: Option<String>,
     proxy_jump: Option<String>,
     proxy_command: Option<Vec<SecretString>>,
+    remote_command: Option<SecretString>,
 }
 
 const MAX_PROXY_JUMP_DEPTH: usize = 16;
@@ -129,6 +140,29 @@ pub fn resolve_ssh_config_alias(alias: &str) -> Result<Option<SshConfigHost>> {
     }
     let blocks = parse_ssh_config_file(&path)?;
     resolve_ssh_config_alias_from_blocks(alias, &blocks)
+}
+
+pub fn resolve_proxy_command(
+    command: SecretString,
+    alias: &str,
+    hostname: &str,
+    user: Option<&str>,
+    port: Option<u16>,
+) -> Vec<SecretString> {
+    // Tokenize directly into zeroizing owners before expanding OpenSSH placeholders.
+    split_ssh_words(command.expose_secret())
+        .into_iter()
+        .map(SecretString::from)
+        .map(|word| {
+            SecretString::new(expand_proxy_command_tokens(
+                word.expose_secret(),
+                alias,
+                hostname,
+                user,
+                port,
+            ))
+        })
+        .collect()
 }
 
 /// Resolves and imports one literal SSH config alias as one store transaction.
@@ -209,6 +243,18 @@ fn parse_ssh_config_file_into(
     let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
 
     for raw_line in source.lines() {
+        if let Some(remote_command) = remote_command_value(raw_line) {
+            if blocks[*current_block].options.remote_command.is_none() {
+                // Keep imported commands redacted until the existing persisted
+                // post-connect field takes ownership of the resolved value.
+                blocks[*current_block].options.remote_command = Some(SecretString::new(
+                    (!remote_command.eq_ignore_ascii_case("none"))
+                        .then_some(remote_command)
+                        .unwrap_or_default(),
+                ));
+            }
+            continue;
+        }
         let line = strip_comment(raw_line).trim();
         if line.is_empty() {
             continue;
@@ -277,6 +323,15 @@ fn apply_option(options: &mut SshHostOptions, key: &str, values: &[String]) {
         "certificatefile" if options.certificate_file.is_none() => {
             options.certificate_file = Some(value.clone())
         }
+        "gssapiauthentication" if options.gssapi_authentication.is_none() => {
+            options.gssapi_authentication = Some(value.clone())
+        }
+        "gssapiserveridentity" if options.gssapi_server_identity.is_none() => {
+            options.gssapi_server_identity = Some(value.clone())
+        }
+        "gssapidelegatecredentials" if options.gssapi_delegate_credentials.is_none() => {
+            options.gssapi_delegate_credentials = Some(value.clone())
+        }
         "identityagent" if options.identity_agent.is_none() => {
             options.identity_agent = Some(value.clone())
         }
@@ -321,6 +376,18 @@ fn merge_first_options(base: &mut SshHostOptions, update: &SshHostOptions) {
         .certificate_file
         .clone()
         .or_else(|| update.certificate_file.clone());
+    base.gssapi_authentication = base
+        .gssapi_authentication
+        .clone()
+        .or_else(|| update.gssapi_authentication.clone());
+    base.gssapi_server_identity = base
+        .gssapi_server_identity
+        .clone()
+        .or_else(|| update.gssapi_server_identity.clone());
+    base.gssapi_delegate_credentials = base
+        .gssapi_delegate_credentials
+        .clone()
+        .or_else(|| update.gssapi_delegate_credentials.clone());
     base.identity_agent = base
         .identity_agent
         .clone()
@@ -345,6 +412,10 @@ fn merge_first_options(base: &mut SshHostOptions, update: &SshHostOptions) {
         base.proxy_jump = update.proxy_jump.clone();
         base.proxy_command = update.proxy_command.clone();
     }
+    base.remote_command = base
+        .remote_command
+        .clone()
+        .or_else(|| update.remote_command.clone());
 }
 
 fn resolve_ssh_config_alias_from_blocks(
@@ -387,6 +458,22 @@ fn resolve_ssh_config_host(alias: &str, blocks: &[SshHostBlock]) -> Result<SshCo
         ))
     });
     let resolved_hostname = hostname.as_deref().unwrap_or(alias);
+    let gssapi_authentication = options
+        .gssapi_authentication
+        .as_deref()
+        .map(parse_yes_no)
+        .transpose()?
+        .unwrap_or(false);
+    let gssapi_server_identity = options
+        .gssapi_server_identity
+        .as_deref()
+        .map(|value| expand_connection_tokens(value, alias, options.user.as_deref(), options.port));
+    let gssapi_delegate_credentials = options
+        .gssapi_delegate_credentials
+        .as_deref()
+        .map(parse_yes_no)
+        .transpose()?
+        .unwrap_or(false);
     let identity_agent = options
         .identity_agent
         .as_deref()
@@ -438,6 +525,20 @@ fn resolve_ssh_config_host(alias: &str, blocks: &[SshHostBlock]) -> Result<SshCo
                 })
                 .collect()
         });
+    let remote_command = options.remote_command.as_ref().map(|command| {
+        if command.is_empty() {
+            SecretString::default()
+        } else {
+            SecretString::new(expand_remote_command_tokens(
+                command.expose_secret(),
+                alias,
+                resolved_hostname,
+                options.user.as_deref(),
+                options.port,
+                options.proxy_jump.as_deref(),
+            ))
+        }
+    });
 
     Ok(SshConfigHost {
         alias: alias.to_string(),
@@ -447,12 +548,16 @@ fn resolve_ssh_config_host(alias: &str, blocks: &[SshHostBlock]) -> Result<SshCo
         connect_timeout_seconds: options.connect_timeout_seconds,
         identity_file,
         certificate_file,
+        gssapi_authentication,
+        gssapi_server_identity,
+        gssapi_delegate_credentials,
         identity_agent,
         agent_forwarding,
         agent_forwarding_socket,
         x11_forwarding,
         proxy_chain,
         proxy_command,
+        remote_command,
         already_imported: false,
     })
 }
@@ -625,6 +730,26 @@ fn resolved_proxy_jump_hop(
             jump_options.port,
         ))
     });
+    let jump_gssapi_authentication = jump_options
+        .gssapi_authentication
+        .as_deref()
+        .map(parse_yes_no)
+        .transpose()?
+        .unwrap_or(false);
+    let jump_gssapi_server_identity = jump_options.gssapi_server_identity.as_deref().map(|value| {
+        expand_connection_tokens(
+            value,
+            &target.host,
+            jump_options.user.as_deref(),
+            jump_options.port,
+        )
+    });
+    let jump_gssapi_delegate_credentials = jump_options
+        .gssapi_delegate_credentials
+        .as_deref()
+        .map(parse_yes_no)
+        .transpose()?
+        .unwrap_or(false);
     let jump_identity_agent = jump_options
         .identity_agent
         .as_deref()
@@ -651,6 +776,9 @@ fn resolved_proxy_jump_hop(
         port: target.port.or(jump_options.port),
         identity_file: jump_identity,
         certificate_file: jump_certificate,
+        gssapi_authentication: jump_gssapi_authentication,
+        gssapi_server_identity: jump_gssapi_server_identity,
+        gssapi_delegate_credentials: jump_gssapi_delegate_credentials,
         identity_agent: jump_identity_agent,
         agent_forwarding: jump_agent_forwarding,
         agent_forwarding_socket: jump_agent_forwarding_socket,
@@ -934,6 +1062,76 @@ fn expand_proxy_command_tokens(
     expanded
 }
 
+fn expand_remote_command_tokens(
+    value: &str,
+    alias: &str,
+    hostname: &str,
+    remote_user: Option<&str>,
+    port: Option<u16>,
+    proxy_jump: Option<&str>,
+) -> String {
+    let home = dirs::home_dir().unwrap_or_default();
+    let local_user = whoami::username();
+    let local_hostname = whoami::fallible::hostname().unwrap_or_default();
+    let short_local_hostname = local_hostname
+        .split_once('.')
+        .map(|(name, _)| name)
+        .unwrap_or(&local_hostname);
+    #[cfg(unix)]
+    let local_uid = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&home)
+            .map(|metadata| metadata.uid().to_string())
+            .unwrap_or_default()
+    };
+    #[cfg(not(unix))]
+    let local_uid = String::new();
+
+    let mut expanded = String::with_capacity(value.len());
+    let mut characters = value.chars();
+    while let Some(character) = characters.next() {
+        if character != '%' {
+            expanded.push(character);
+            continue;
+        }
+        match characters.next() {
+            Some('%') => expanded.push('%'),
+            Some('d') => expanded.push_str(&home.to_string_lossy()),
+            Some('h') => expanded.push_str(hostname),
+            Some('i') => expanded.push_str(&local_uid),
+            Some('j') => expanded.push_str(proxy_jump.unwrap_or_default()),
+            Some('k' | 'n') => expanded.push_str(alias),
+            Some('L') => expanded.push_str(short_local_hostname),
+            Some('l') => expanded.push_str(&local_hostname),
+            Some('p') => expanded.push_str(&port.unwrap_or(22).to_string()),
+            Some('r') => expanded.push_str(remote_user.unwrap_or_default()),
+            Some('u') => expanded.push_str(&local_user),
+            Some(token) => {
+                expanded.push('%');
+                expanded.push(token);
+            }
+            None => expanded.push('%'),
+        }
+    }
+    expanded
+}
+
+fn remote_command_value(line: &str) -> Option<&str> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let keyword_end = line
+        .find(|character: char| character.is_whitespace() || character == '=')
+        .unwrap_or(line.len());
+    if !line[..keyword_end].eq_ignore_ascii_case("remotecommand") {
+        return None;
+    }
+    let value = line[keyword_end..].trim_start();
+    let value = value.strip_prefix('=').unwrap_or(value).trim();
+    (!value.is_empty()).then_some(value)
+}
+
 fn strip_comment(line: &str) -> &str {
     let mut in_quotes = false;
     for (index, ch) in line.char_indices() {
@@ -950,15 +1148,21 @@ fn split_ssh_words(line: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut in_quotes = false;
-    let mut escaped = false;
-    for ch in line.chars() {
-        if escaped {
-            current.push(ch);
-            escaped = false;
-            continue;
-        }
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
         match ch {
-            '\\' => escaped = true,
+            '\\' => {
+                // OpenSSH escaping is meaningful only for token delimiters here.
+                // Preserve Windows drive and UNC path separators verbatim.
+                if chars
+                    .peek()
+                    .is_some_and(|next| next.is_whitespace() || matches!(*next, '"' | '#'))
+                {
+                    current.push(chars.next().expect("peeked SSH config character"));
+                } else {
+                    current.push('\\');
+                }
+            }
             '"' => in_quotes = !in_quotes,
             ch if ch.is_whitespace() && !in_quotes => {
                 if !current.is_empty() {
@@ -1038,6 +1242,14 @@ mod tests {
             split_ssh_words(strip_comment("HostName \"dev box\" # comment")),
             vec!["HostName", "dev box"]
         );
+        assert_eq!(
+            split_ssh_words(r"IdentityFile C:\Users\alice\.ssh\id_ed25519"),
+            vec!["IdentityFile", r"C:\Users\alice\.ssh\id_ed25519"]
+        );
+        assert_eq!(
+            split_ssh_words(r"IdentityFile C:\Users\alice\My\ Key"),
+            vec!["IdentityFile", r"C:\Users\alice\My Key"]
+        );
     }
 
     #[test]
@@ -1062,6 +1274,76 @@ mod tests {
         assert_eq!(host.hostname.as_deref(), Some("prod.example.com"));
         assert_eq!(host.port, Some(2200));
         assert_eq!(host.connect_timeout_seconds, Some(120));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn parser_preserves_explicit_gssapi_policy() {
+        let directory = std::env::temp_dir().join(format!(
+            "oxideterm-ssh-config-gssapi-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("config"),
+            concat!(
+                "Host production\n",
+                "  HostName prod.example.com\n",
+                "  GSSAPIAuthentication yes\n",
+                "  GSSAPIServerIdentity host/service.example.com@EXAMPLE.COM\n",
+                "  GSSAPIDelegateCredentials yes\n",
+            ),
+        )
+        .unwrap();
+
+        let blocks = parse_ssh_config_file(&directory.join("config")).unwrap();
+        let host = resolve_ssh_config_alias_from_blocks("production", &blocks)
+            .unwrap()
+            .unwrap();
+
+        assert!(host.gssapi_authentication);
+        assert_eq!(
+            host.gssapi_server_identity.as_deref(),
+            Some("host/service.example.com@EXAMPLE.COM")
+        );
+        assert!(host.gssapi_delegate_credentials);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn remote_command_preserves_shell_text_and_expands_connection_tokens() {
+        let directory = std::env::temp_dir().join(format!(
+            "oxideterm-ssh-config-remote-command-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("config"),
+            concat!(
+                "Host production\n",
+                "  HostName prod.example.com\n",
+                "  User deploy\n",
+                "  Port 2200\n",
+                "  RemoteCommand printf '\"%h\" %n %p %r %% # preserved'\n",
+                "Host *\n",
+                "  RemoteCommand echo ignored\n",
+            ),
+        )
+        .unwrap();
+
+        let blocks = parse_ssh_config_file(&directory.join("config")).unwrap();
+        let host = resolve_ssh_config_alias_from_blocks("production", &blocks)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            host.remote_command
+                .as_ref()
+                .map(SecretString::expose_secret),
+            Some("printf '\"prod.example.com\" production 2200 deploy % # preserved'")
+        );
         let _ = fs::remove_dir_all(directory);
     }
 

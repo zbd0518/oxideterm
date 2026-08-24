@@ -385,22 +385,35 @@ pub(crate) fn paint_text_run(
             px(run.col as f32 * metrics.cell_width_f32()),
             px(run.row as f32 * metrics.line_height_f32()),
         );
-    let _ = window
-        .text_system()
-        .shape_line(
-            SharedString::from(run.text.clone()),
-            metrics.font_size,
-            std::slice::from_ref(&run.style),
-            Some(metrics.cell_width),
-        )
-        .paint(
-            position,
-            metrics.line_height,
-            TextAlign::Left,
-            None,
-            window,
-            cx,
-        );
+    if let Some(shaped) = &run.shaped {
+        // Stable terminal rows retain their shaped glyph layout with the row-layout cache.
+        // Transient runs keep using GPUI's frame cache through the fallback below.
+        let shaped = shaped.get_or_init(|| {
+            window.text_system().shape_line(
+                run.text.clone(),
+                metrics.font_size,
+                std::slice::from_ref(&run.style),
+                Some(metrics.cell_width),
+            )
+        });
+        let _ = shaped.paint_cached(position, metrics.line_height, window, cx);
+        return;
+    }
+
+    let shaped = window.text_system().shape_line(
+        run.text.clone(),
+        metrics.font_size,
+        std::slice::from_ref(&run.style),
+        Some(metrics.cell_width),
+    );
+    let _ = shaped.paint(
+        position,
+        metrics.line_height,
+        TextAlign::Left,
+        None,
+        window,
+        cx,
+    );
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -504,17 +517,27 @@ fn paint_powerline_separators(
     metrics: &TerminalMetrics,
     window: &mut Window,
 ) -> bool {
-    let chars = run.text.chars().collect::<Vec<_>>();
-    if chars.is_empty()
-        || chars.len() != run.cells
-        || !chars.iter().all(|ch| powerline_separator(*ch).is_some())
+    let mut run_chars = run.text.chars();
+    let Some(first) = run_chars.next() else {
+        return false;
+    };
+    // Avoid collecting ordinary text runs that cannot contain Powerline separators.
+    if powerline_separator(first).is_none() {
+        return false;
+    }
+
+    let chars = std::iter::once(first).chain(run_chars);
+    if chars.clone().count() != run.cells
+        || !chars.clone().all(|ch| powerline_separator(ch).is_some())
     {
         return false;
     }
 
+    // Separator runs are short, so validating twice is cheaper than allocating
+    // a character buffer while still preventing partially painted mixed runs.
     let paint_metrics = PowerlinePaintMetrics::for_scale_factor(window.scale_factor());
 
-    for (offset, ch) in chars.into_iter().enumerate() {
+    for (offset, ch) in chars.enumerate() {
         let raw_bounds = Bounds::new(
             origin
                 + point(

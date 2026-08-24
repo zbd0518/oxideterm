@@ -1,4 +1,5 @@
 use super::*;
+use oxideterm_connections::ConnectionTerminalSessionLogPolicy;
 
 struct JumpServerRenderSnapshot {
     saved_connection_id: String,
@@ -10,6 +11,9 @@ struct JumpServerRenderSnapshot {
     managed_key_id: String,
     cert_path: String,
     identity_agent: String,
+    gssapi_enabled: bool,
+    gssapi_server_identity: String,
+    gssapi_delegate_credentials: bool,
     agent_forwarding: bool,
     legacy_ssh_compatibility: bool,
     complete: bool,
@@ -27,6 +31,9 @@ impl JumpServerRenderSnapshot {
             managed_key_id: hop.managed_key_id.clone(),
             cert_path: hop.cert_path.clone(),
             identity_agent: hop.identity_agent.clone(),
+            gssapi_enabled: hop.gssapi_enabled,
+            gssapi_server_identity: hop.gssapi_server_identity.clone(),
+            gssapi_delegate_credentials: hop.gssapi_delegate_credentials,
             agent_forwarding: hop.agent_forwarding,
             legacy_ssh_compatibility: hop.legacy_ssh_compatibility,
             complete: hop.complete(),
@@ -219,12 +226,17 @@ impl WorkspaceApp {
                     ));
                 }
             }
-            NewConnectionSelect::KeyAuthSource | NewConnectionSelect::JumpKeyAuthSource => {
+            NewConnectionSelect::KeyAuthSource
+            | NewConnectionSelect::StandaloneSftpSecondaryKeyAuthSource
+            | NewConnectionSelect::JumpKeyAuthSource => {
                 let context = match select_id {
                     NewConnectionSelect::KeyAuthSource => {
                         self.current_main_auth_selector_context(cx)
                     }
                     NewConnectionSelect::JumpKeyAuthSource => AuthSelectorContext::Jump,
+                    NewConnectionSelect::StandaloneSftpSecondaryKeyAuthSource => {
+                        AuthSelectorContext::StandaloneSftpSecondary
+                    }
                     _ => unreachable!("matched only key auth source selects"),
                 };
                 let active_tab = self
@@ -233,6 +245,9 @@ impl WorkspaceApp {
                     .as_ref()
                     .and_then(|form| match select_id {
                         NewConnectionSelect::KeyAuthSource => Some(form.auth_tab),
+                        NewConnectionSelect::StandaloneSftpSecondaryKeyAuthSource => {
+                            Some(form.standalone_sftp_secondary.auth_tab)
+                        }
                         NewConnectionSelect::JumpKeyAuthSource => form
                             .jump_server_form
                             .as_ref()
@@ -255,13 +270,18 @@ impl WorkspaceApp {
                     ));
                 }
             }
-            NewConnectionSelect::ManagedKey | NewConnectionSelect::JumpManagedKey => {
+            NewConnectionSelect::ManagedKey
+            | NewConnectionSelect::StandaloneSftpSecondaryManagedKey
+            | NewConnectionSelect::JumpManagedKey => {
                 let current_key_id = self
                     .connection_form_state(cx)
                     .form
                     .as_ref()
                     .and_then(|form| match select_id {
                         NewConnectionSelect::ManagedKey => Some(form.managed_key_id.as_str()),
+                        NewConnectionSelect::StandaloneSftpSecondaryManagedKey => {
+                            Some(form.standalone_sftp_secondary.managed_key_id.as_str())
+                        }
                         NewConnectionSelect::JumpManagedKey => form
                             .jump_server_form
                             .as_ref()
@@ -285,12 +305,21 @@ impl WorkspaceApp {
                     ));
                 }
             }
-            NewConnectionSelect::UpstreamProxyPolicy => {
+            NewConnectionSelect::UpstreamProxyPolicy
+            | NewConnectionSelect::StandaloneSftpSecondaryUpstreamProxyPolicy => {
+                let secondary =
+                    select_id == NewConnectionSelect::StandaloneSftpSecondaryUpstreamProxyPolicy;
                 let selected = self
                     .connection_form_state(cx)
                     .form
                     .as_ref()
-                    .map(|form| form.upstream_proxy_policy)
+                    .map(|form| {
+                        if secondary {
+                            form.standalone_sftp_secondary.upstream_proxy_policy
+                        } else {
+                            form.upstream_proxy_policy
+                        }
+                    })
                     .unwrap_or(NewConnectionUpstreamProxyPolicy::UseGlobal);
                 for (policy, label_key) in [
                     (
@@ -312,18 +341,27 @@ impl WorkspaceApp {
                         false,
                         cx.listener(move |this, _event, _window, cx| {
                             this.close_new_connection_select(cx);
-                            this.set_new_connection_upstream_proxy_policy(policy, cx);
+                            this.set_new_connection_upstream_proxy_policy(policy, secondary, cx);
                             cx.stop_propagation();
                         }),
                     ));
                 }
             }
-            NewConnectionSelect::UpstreamProxyProtocol => {
+            NewConnectionSelect::UpstreamProxyProtocol
+            | NewConnectionSelect::StandaloneSftpSecondaryUpstreamProxyProtocol => {
+                let secondary =
+                    select_id == NewConnectionSelect::StandaloneSftpSecondaryUpstreamProxyProtocol;
                 let selected = self
                     .connection_form_state(cx)
                     .form
                     .as_ref()
-                    .map(|form| form.upstream_proxy_protocol)
+                    .map(|form| {
+                        if secondary {
+                            form.standalone_sftp_secondary.upstream_proxy_protocol
+                        } else {
+                            form.upstream_proxy_protocol
+                        }
+                    })
                     .unwrap_or(SavedUpstreamProxyProtocol::Socks5);
                 for (protocol, label_key) in [
                     (
@@ -341,18 +379,29 @@ impl WorkspaceApp {
                         false,
                         cx.listener(move |this, _event, _window, cx| {
                             this.close_new_connection_select(cx);
-                            this.set_new_connection_upstream_proxy_protocol(protocol, cx);
+                            this.set_new_connection_upstream_proxy_protocol(
+                                protocol, secondary, cx,
+                            );
                             cx.stop_propagation();
                         }),
                     ));
                 }
             }
-            NewConnectionSelect::UpstreamProxyAuth => {
+            NewConnectionSelect::UpstreamProxyAuth
+            | NewConnectionSelect::StandaloneSftpSecondaryUpstreamProxyAuth => {
+                let secondary =
+                    select_id == NewConnectionSelect::StandaloneSftpSecondaryUpstreamProxyAuth;
                 let selected = self
                     .connection_form_state(cx)
                     .form
                     .as_ref()
-                    .map(|form| form.upstream_proxy_auth)
+                    .map(|form| {
+                        if secondary {
+                            form.standalone_sftp_secondary.upstream_proxy_auth
+                        } else {
+                            form.upstream_proxy_auth
+                        }
+                    })
                     .unwrap_or(NewConnectionUpstreamProxyAuth::None);
                 for (auth, label_key) in [
                     (
@@ -370,7 +419,7 @@ impl WorkspaceApp {
                         false,
                         cx.listener(move |this, _event, _window, cx| {
                             this.close_new_connection_select(cx);
-                            this.set_new_connection_upstream_proxy_auth(auth, cx);
+                            this.set_new_connection_upstream_proxy_auth(auth, secondary, cx);
                             cx.stop_propagation();
                         }),
                     ));
@@ -514,6 +563,218 @@ impl WorkspaceApp {
                             this.close_new_connection_select(cx);
                             this.set_new_connection_terminal_delete_sequence(Some(sequence), cx);
                             cx.stop_propagation();
+                        }),
+                    ));
+                }
+            }
+            NewConnectionSelect::TerminalSemanticScheme => {
+                let selected = self
+                    .connection_form_state(cx)
+                    .form
+                    .as_ref()
+                    .and_then(|form| form.terminal.semantic_scheme.clone());
+                let terminal = &self.settings_store.settings().terminal;
+                let default_name = terminal
+                    .active_custom_semantic_scheme()
+                    .map(|scheme| scheme.name.clone())
+                    .unwrap_or_else(|| match terminal.semantic_scheme {
+                        oxideterm_settings::TerminalSemanticScheme::Balanced => self
+                            .i18n
+                            .t("settings_view.terminal.highlight_rules.semantic_scheme_balanced"),
+                        oxideterm_settings::TerminalSemanticScheme::Conservative => self.i18n.t(
+                            "settings_view.terminal.highlight_rules.semantic_scheme_conservative",
+                        ),
+                    });
+                let default_label = self
+                    .i18n
+                    .t("ssh.form.terminal_use_application_default")
+                    .replace("{{value}}", &default_name);
+                popup = popup.child(select_option_action(
+                    select_option(&self.tokens, default_label, selected.is_none()),
+                    false,
+                    false,
+                    cx.listener(|this, _event, _window, cx| {
+                        this.close_new_connection_select(cx);
+                        this.set_new_connection_terminal_semantic_scheme(None, cx);
+                        cx.stop_propagation();
+                    }),
+                ));
+                let mut schemes = vec![
+                    (
+                        "balanced".to_string(),
+                        self.i18n
+                            .t("settings_view.terminal.highlight_rules.semantic_scheme_balanced"),
+                    ),
+                    (
+                        "conservative".to_string(),
+                        self.i18n.t(
+                            "settings_view.terminal.highlight_rules.semantic_scheme_conservative",
+                        ),
+                    ),
+                ];
+                schemes.extend(
+                    terminal
+                        .custom_semantic_schemes
+                        .iter()
+                        .map(|scheme| (scheme.id.clone(), scheme.name.clone())),
+                );
+                for (id, name) in schemes {
+                    let is_selected = selected.as_deref() == Some(id.as_str());
+                    popup = popup.child(select_option_action(
+                        select_option(&self.tokens, name, is_selected),
+                        false,
+                        false,
+                        cx.listener(move |this, _event, _window, cx| {
+                            this.close_new_connection_select(cx);
+                            this.set_new_connection_terminal_semantic_scheme(Some(id.clone()), cx);
+                            cx.stop_propagation();
+                        }),
+                    ));
+                }
+            }
+            NewConnectionSelect::TerminalHighlightRuleSet => {
+                let selected = self
+                    .connection_form_state(cx)
+                    .form
+                    .as_ref()
+                    .and_then(|form| form.terminal.highlight_rule_set.clone());
+                let terminal = &self.settings_store.settings().terminal;
+                let default_name = terminal
+                    .default_highlight_rule_set_name()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        self.i18n
+                            .t("settings_view.terminal.highlight_rules.rule_set_global_base")
+                    });
+                let default_label = self
+                    .i18n
+                    .t("ssh.form.terminal_use_application_default")
+                    .replace("{{value}}", &default_name);
+                popup = popup.child(select_option_action(
+                    select_option(&self.tokens, default_label, selected.is_none()),
+                    false,
+                    false,
+                    cx.listener(|this, _event, _window, cx| {
+                        this.close_new_connection_select(cx);
+                        this.set_new_connection_terminal_highlight_rule_set(None, cx);
+                        cx.stop_propagation();
+                    }),
+                ));
+                for rule_set in &terminal.highlight_rule_sets {
+                    let id = rule_set.id.clone();
+                    let is_selected = selected.as_deref() == Some(id.as_str());
+                    popup = popup.child(select_option_action(
+                        select_option(&self.tokens, rule_set.name.clone(), is_selected),
+                        false,
+                        false,
+                        cx.listener(move |this, _event, _window, cx| {
+                            this.close_new_connection_select(cx);
+                            this.set_new_connection_terminal_highlight_rule_set(
+                                Some(id.clone()),
+                                cx,
+                            );
+                            cx.stop_propagation();
+                        }),
+                    ));
+                }
+            }
+            NewConnectionSelect::TerminalSessionLogPolicy => {
+                let selected = self
+                    .connection_form_state(cx)
+                    .form
+                    .as_ref()
+                    .map(|form| form.terminal.session_log_policy)
+                    .unwrap_or_default();
+                let inherited_mode = if self
+                    .settings_store
+                    .settings()
+                    .terminal
+                    .session_log
+                    .automatic
+                {
+                    self.i18n.t("ssh.form.terminal_session_log_automatic")
+                } else {
+                    self.i18n.t("ssh.form.terminal_session_log_manual")
+                };
+                for (policy, label) in [
+                    (
+                        ConnectionTerminalSessionLogPolicy::Inherit,
+                        self.i18n
+                            .t("ssh.form.terminal_use_application_default")
+                            .replace("{{value}}", &inherited_mode),
+                    ),
+                    (
+                        ConnectionTerminalSessionLogPolicy::Automatic,
+                        self.i18n.t("ssh.form.terminal_session_log_automatic"),
+                    ),
+                    (
+                        ConnectionTerminalSessionLogPolicy::Manual,
+                        self.i18n.t("ssh.form.terminal_session_log_manual"),
+                    ),
+                    (
+                        ConnectionTerminalSessionLogPolicy::Disabled,
+                        self.i18n.t("ssh.form.terminal_session_log_disabled"),
+                    ),
+                ] {
+                    popup = popup.child(select_option_action(
+                        select_option(&self.tokens, label, selected == policy),
+                        false,
+                        false,
+                        cx.listener(move |this, _event, _window, cx| {
+                            this.close_new_connection_select(cx);
+                            this.set_new_connection_terminal_session_log_policy(policy, cx);
+                            cx.stop_propagation();
+                        }),
+                    ));
+                }
+            }
+            NewConnectionSelect::LocalShell => {
+                let selected_shell_id = self
+                    .connection_form_state(cx)
+                    .form
+                    .as_ref()
+                    .and_then(|form| form.local_shell_id.as_deref());
+                let resolved_shell = self.resolved_local_shell(selected_shell_id);
+                let resolved_shell_id = resolved_shell.as_ref().map(|shell| shell.id.as_str());
+                let default_shell_id = self
+                    .settings_store
+                    .settings()
+                    .local_terminal
+                    .default_shell_id
+                    .as_deref();
+                let default_label = self.i18n.t("settings_view.local_terminal.default");
+
+                // The modal uses the same select surface as the other connection
+                // fields, while the selected shell still controls only this launch.
+                for shell in
+                    self.effective_local_shells_for_settings(self.settings_store.settings())
+                {
+                    let shell_id = shell.id.clone();
+                    let label = if default_shell_id == Some(shell.id.as_str()) {
+                        format!("{} · {default_label}", shell.label)
+                    } else {
+                        shell.label
+                    };
+                    popup = popup.child(select_option_action(
+                        select_option(
+                            &self.tokens,
+                            label,
+                            resolved_shell_id == Some(shell.id.as_str()),
+                        ),
+                        false,
+                        false,
+                        cx.listener(move |this, _event, _window, cx| {
+                            this.close_new_connection_select(cx);
+                            this.update_connection_form_state(cx, |state| {
+                                if let Some(form) = state.form.as_mut() {
+                                    form.local_shell_id = Some(shell_id.clone());
+                                    form.field_focused = false;
+                                    clear_connection_selection(form);
+                                    form.error = None;
+                                }
+                            });
+                            cx.stop_propagation();
+                            cx.notify();
                         }),
                     ));
                 }
@@ -693,6 +954,14 @@ impl WorkspaceApp {
         else {
             return div().into_any_element();
         };
+        let gssapi_credentials_available = self
+            .connection_form_state(cx)
+            .form
+            .as_ref()
+            .and_then(|form| form.gssapi_credentials_available);
+        if jump_form.gssapi_enabled && gssapi_credentials_available.is_none() {
+            self.ensure_kerberos_credentials_availability(cx);
+        }
         let add_disabled = !jump_form.complete
             || (jump_form.auth_tab == SshAuthTab::ManagedKey
                 && jump_form.managed_key_id.trim().is_empty());
@@ -792,6 +1061,57 @@ impl WorkspaceApp {
                             .child(self.render_connection_hint(
                                 self.i18n.t("ssh.form.proxy_jump_kbi_hint"),
                             ))
+                            .child(self.render_connection_checkbox(
+                                self.i18n.t("ssh.form.kerberos_preferred"),
+                                jump_form.gssapi_enabled,
+                                |form| {
+                                    if let Some(jump) = form.jump_server_form.as_mut() {
+                                        jump.gssapi_enabled = !jump.gssapi_enabled;
+                                    }
+                                },
+                                cx,
+                            ))
+                            .when(jump_form.gssapi_enabled, |content| {
+                                content
+                                    .child(self.render_connection_hint(
+                                        self.i18n.t("ssh.form.gssapi_desc"),
+                                    ))
+                                    .child(self.render_connection_field(
+                                        self.i18n.t("ssh.form.gssapi_server_identity"),
+                                        &jump_form.gssapi_server_identity,
+                                        self.i18n.t("ssh.form.gssapi_server_identity_placeholder"),
+                                        NewConnectionField::JumpGssapiServerIdentity,
+                                        false,
+                                        cx,
+                                    ))
+                                    .child(self.render_connection_hint(
+                                        self.i18n.t("ssh.form.gssapi_server_identity_hint"),
+                                    ))
+                                    .child(self.render_kerberos_credentials_status(
+                                        gssapi_credentials_available,
+                                    ))
+                                    .child(self.render_connection_checkbox_with_warning(
+                                        "jump-kerberos-delegation-help",
+                                        "jump-kerberos-delegation-tooltip",
+                                        "ssh.form.gssapi_delegate_credentials",
+                                        "ssh.form.gssapi_delegation_warning",
+                                        jump_form.gssapi_delegate_credentials,
+                                        |form| {
+                                            if let Some(jump) = form.jump_server_form.as_mut() {
+                                                jump.gssapi_delegate_credentials =
+                                                    !jump.gssapi_delegate_credentials;
+                                            }
+                                        },
+                                        cx,
+                                    ))
+                            })
+                            .child(
+                                div()
+                                    .text_size(px(self.tokens.metrics.ui_text_sm))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(rgb(self.tokens.ui.text))
+                                    .child(self.i18n.t("ssh.form.fallback_authentication")),
+                            )
                             .child(self.render_auth_selector(
                                 jump_form.auth_tab,
                                 AuthSelectorContext::Jump,
@@ -956,22 +1276,41 @@ impl WorkspaceApp {
         true
     }
 
-    pub(super) fn render_proxy_chain_section(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_proxy_chain_section(
+        &self,
+        secondary: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let (hop_count, expanded) = self
             .connection_form_state(cx)
             .form
             .as_ref()
-            .map(|form| (form.proxy_hops.len(), form.proxy_chain_expanded))
+            .map(|form| {
+                if secondary {
+                    (
+                        form.standalone_sftp_secondary.proxy_hops.len(),
+                        form.standalone_sftp_secondary.proxy_chain_expanded,
+                    )
+                } else {
+                    (form.proxy_hops.len(), form.proxy_chain_expanded)
+                }
+            })
             .unwrap_or_default();
         let mut list = div()
-            .id("new-connection-proxy-chain-scroll")
+            .id(if secondary {
+                "new-connection-secondary-proxy-chain-scroll"
+            } else {
+                "new-connection-proxy-chain-scroll"
+            })
             .flex()
             .flex_col()
             .gap_2()
             .max_h(px(TAURI_PROXY_CHAIN_MAX_HEIGHT))
-            .selectable_overflow_y_scroll(
-                &self.selectable_text_scroll_handle("new-connection-proxy-chain-scroll"),
-            );
+            .selectable_overflow_y_scroll(&self.selectable_text_scroll_handle(if secondary {
+                "new-connection-secondary-proxy-chain-scroll"
+            } else {
+                "new-connection-proxy-chain-scroll"
+            }));
         if hop_count == 0 {
             list = list.child(
                 div()
@@ -987,7 +1326,12 @@ impl WorkspaceApp {
                 .form
                 .as_ref()
                 .map(|form| {
-                    form.proxy_hops
+                    let proxy_hops = if secondary {
+                        &form.standalone_sftp_secondary.proxy_hops
+                    } else {
+                        &form.proxy_hops
+                    };
+                    proxy_hops
                         .iter()
                         .map(|hop| ProxyHopSummarySnapshot {
                             saved_connection_name: self
@@ -1003,7 +1347,7 @@ impl WorkspaceApp {
                 })
                 .unwrap_or_default();
             for (index, hop) in summaries.iter().enumerate() {
-                list = list.child(self.render_proxy_hop_summary(index, hop, cx));
+                list = list.child(self.render_proxy_hop_summary(index, hop, secondary, cx));
             }
         }
 
@@ -1032,9 +1376,9 @@ impl WorkspaceApp {
                             .items_center()
                             .gap_2()
                             .when(hop_count > 0, |row| {
-                                row.child(self.render_proxy_chain_toggle(expanded, cx))
+                                row.child(self.render_proxy_chain_toggle(expanded, secondary, cx))
                             })
-                            .child(self.render_add_jump_button(cx)),
+                            .child(self.render_add_jump_button(secondary, cx)),
                     ),
             )
             .child(if expanded {
@@ -1057,14 +1401,26 @@ impl WorkspaceApp {
             .into_any_element()
     }
 
-    fn render_proxy_chain_toggle(&self, expanded: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn render_proxy_chain_toggle(
+        &self,
+        expanded: bool,
+        secondary: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         // Proxy-chain expand/collapse is an icon-only toolbar action in the
         // Tauri form. Use the shared primitive so hover and future focus state
         // stay aligned with other new-connection toolbar controls.
         oxideterm_gpui_ui::button::icon_button(
             &self.tokens,
             self.render_animated_chevron(
-                ("proxy-chain-chevron", expanded as usize),
+                (
+                    if secondary {
+                        "secondary-proxy-chain-chevron"
+                    } else {
+                        "proxy-chain-chevron"
+                    },
+                    expanded as usize,
+                ),
                 expanded,
                 16.0,
                 rgb(self.tokens.ui.text),
@@ -1079,10 +1435,15 @@ impl WorkspaceApp {
         )
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(|this, _event, _window, cx| {
+            cx.listener(move |this, _event, _window, cx| {
                 this.update_connection_form_state(cx, |state| {
                     if let Some(form) = state.form.as_mut() {
-                        form.proxy_chain_expanded = !form.proxy_chain_expanded;
+                        if secondary {
+                            let route = &mut form.standalone_sftp_secondary;
+                            route.proxy_chain_expanded = !route.proxy_chain_expanded;
+                        } else {
+                            form.proxy_chain_expanded = !form.proxy_chain_expanded;
+                        }
                         form.field_focused = false;
                     }
                 });
@@ -1093,7 +1454,7 @@ impl WorkspaceApp {
         .into_any_element()
     }
 
-    fn render_add_jump_button(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_add_jump_button(&self, secondary: bool, cx: &mut Context<Self>) -> AnyElement {
         // The outer "add jump" command is the same small outline action
         // pattern used by settings toolbars, so keep its chrome shared.
         self.workspace_toolbar_action_button(
@@ -1116,10 +1477,16 @@ impl WorkspaceApp {
                 hover_background: Some(rgb(self.tokens.ui.bg_hover)),
                 ..ToolbarButtonOptions::default()
             },
-            cx.listener(|this, _event, window, cx| {
+            cx.listener(move |this, _event, window, cx| {
                 this.update_connection_form_state(cx, |state| {
                     if let Some(form) = state.form.as_mut() {
                         form.jump_server_form = Some(NewConnectionProxyHop::new());
+                        form.jump_server_edit_index = None;
+                        form.jump_server_target = if secondary {
+                            ConnectionRouteTarget::StandaloneSftpSecondary
+                        } else {
+                            ConnectionRouteTarget::Primary
+                        };
                         form.field_focused = true;
                         form.focused_field = NewConnectionField::JumpHost;
                         form.selected_field = None;
@@ -1184,6 +1551,7 @@ impl WorkspaceApp {
         &self,
         index: usize,
         hop: &ProxyHopSummarySnapshot,
+        secondary: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let hop_title = hop
@@ -1268,7 +1636,16 @@ impl WorkspaceApp {
                                         .text_color(rgb(self.tokens.ui.text_muted))
                                         .child(format!("{}. {}", index + 1, hop_title)),
                                 )
-                                .child(self.render_remove_jump_button(index, cx)),
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(self.render_edit_jump_button(index, secondary, cx))
+                                        .child(
+                                            self.render_remove_jump_button(index, secondary, cx),
+                                        ),
+                                ),
                         )
                         .child(self.render_proxy_hop_line(
                             self.i18n.t("ssh.form.proxy_chain_host"),
@@ -1327,7 +1704,12 @@ impl WorkspaceApp {
             .into_any_element()
     }
 
-    fn render_remove_jump_button(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn render_remove_jump_button(
+        &self,
+        index: usize,
+        secondary: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         self.workspace_icon_action_button(
             LucideIcon::Trash2,
             14.0,
@@ -1338,12 +1720,71 @@ impl WorkspaceApp {
             },
             move |this, _event, _window, cx| {
                 this.update_connection_form_state(cx, |state| {
-                    if let Some(form) = state.form.as_mut()
-                        && index < form.proxy_hops.len()
-                    {
-                        form.proxy_hops.remove(index);
+                    if let Some(form) = state.form.as_mut() {
+                        let proxy_hops = if secondary {
+                            &mut form.standalone_sftp_secondary.proxy_hops
+                        } else {
+                            &mut form.proxy_hops
+                        };
+                        if index < proxy_hops.len() {
+                            proxy_hops.remove(index);
+                        }
                     }
                 });
+                cx.stop_propagation();
+                cx.notify();
+            },
+            cx,
+        )
+        .into_any_element()
+    }
+
+    fn render_edit_jump_button(
+        &self,
+        index: usize,
+        secondary: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.workspace_icon_action_button(
+            LucideIcon::Pencil,
+            14.0,
+            rgb(self.tokens.ui.text_muted),
+            IconButtonOptions {
+                hover_background: Some(rgb(self.tokens.ui.bg_hover)),
+                ..IconButtonOptions::opaque_toolbar(24.0, ButtonRadius::Sm)
+            },
+            move |this, _event, window, cx| {
+                this.update_connection_form_state(cx, |state| {
+                    let Some(form) = state.form.as_mut() else {
+                        return;
+                    };
+                    let jump_server = {
+                        let proxy_hops = if secondary {
+                            &mut form.standalone_sftp_secondary.proxy_hops
+                        } else {
+                            &mut form.proxy_hops
+                        };
+                        if index >= proxy_hops.len() {
+                            return;
+                        }
+                        proxy_hops.remove(index)
+                    };
+                    // Move instead of clone so temporary secret drafts have one owner.
+                    form.jump_server_form = Some(jump_server);
+                    form.jump_server_edit_index = Some(index);
+                    form.jump_server_target = if secondary {
+                        ConnectionRouteTarget::StandaloneSftpSecondary
+                    } else {
+                        ConnectionRouteTarget::Primary
+                    };
+                    form.field_focused = true;
+                    form.focused_field = NewConnectionField::JumpHost;
+                    form.selected_field = None;
+                    state.jump_server_presence.reopen();
+                });
+                this.close_new_connection_select(cx);
+                this.show_active_input_caret(cx);
+                window.focus(&this.focus_handle, cx);
                 cx.stop_propagation();
                 cx.notify();
             },

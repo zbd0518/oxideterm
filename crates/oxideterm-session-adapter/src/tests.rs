@@ -5,8 +5,8 @@ use chrono::Utc;
 use oxideterm_connections::{
     ConnectionOptions, ConnectionStore, ConnectionTerminalBackspaceSequence,
     ConnectionTerminalDeleteSequence, ConnectionTerminalEncoding, SavedAuth, SavedConnection,
-    SavedProxyHop, SavedUpstreamProxyAuth, SavedUpstreamProxyConfig, SavedUpstreamProxyPolicy,
-    SavedUpstreamProxyProtocol, SecretString,
+    SavedConnectionRuntimeSecrets, SavedProxyCommand, SavedProxyHop, SavedUpstreamProxyAuth,
+    SavedUpstreamProxyConfig, SavedUpstreamProxyPolicy, SavedUpstreamProxyProtocol, SecretString,
 };
 use oxideterm_settings::{
     PersistedSettings, SettingsUpstreamProxyAuth, SettingsUpstreamProxyConfig,
@@ -23,7 +23,7 @@ use crate::{
 };
 use crate::{
     ssh_config_for_saved_connection_hop, ssh_config_from_saved_connection,
-    upstream_proxy_config_from_saved_policy,
+    ssh_config_from_saved_connection_with_runtime_secrets, upstream_proxy_config_from_saved_policy,
 };
 
 fn temp_connection_store(name: &str) -> (ConnectionStore, std::path::PathBuf) {
@@ -42,12 +42,14 @@ fn saved_connection(auth: SavedAuth) -> SavedConnection {
         version: oxideterm_connections::CONFIG_VERSION,
         name: "Home".to_string(),
         group: None,
+        notes: None,
         host: "target.example.com".to_string(),
         port: 22,
         username: "me".to_string(),
         auth,
         proxy_chain: Vec::new(),
         upstream_proxy: SavedUpstreamProxyPolicy::UseGlobal,
+        proxy_command: None,
         options: ConnectionOptions::default(),
         created_at: now,
         last_used_at: None,
@@ -121,6 +123,59 @@ fn proxy_command_requires_authorization_before_runtime_hydration() {
 }
 
 #[test]
+fn manual_proxy_command_uses_runtime_secret_and_overrides_other_routes() {
+    let (store, path) = temp_connection_store("manual-proxy-command");
+    let mut connection = saved_connection(SavedAuth::Agent);
+    connection.proxy_command = Some(SavedProxyCommand {
+        keychain_id: Some("proxy-command-owner".to_string()),
+        plaintext_command: None,
+    });
+    connection.proxy_chain.push(SavedProxyHop {
+        host: "unused-jump.example.com".to_string(),
+        port: 22,
+        username: "jump".to_string(),
+        auth: SavedAuth::Password {
+            keychain_id: None,
+            plaintext_password: None,
+        },
+        agent_forwarding: false,
+        identity_agent: None,
+        agent_forwarding_socket: None,
+        legacy_ssh_compatibility: false,
+        ssh_algorithms: oxideterm_connections::SshAlgorithmPreferences::default(),
+    });
+    let mut settings = PersistedSettings::default();
+    settings.ssh_config.allow_proxy_command = true;
+
+    let config = ssh_config_from_saved_connection_with_runtime_secrets(
+        &store,
+        &settings,
+        &connection,
+        SavedConnectionRuntimeSecrets {
+            auth: None,
+            proxy_chain: vec![None],
+            upstream_proxy: None,
+            proxy_command: Some(SecretString::from(
+                "helper --token secret-value --target %h:%p",
+            )),
+        },
+        None,
+    )
+    .unwrap();
+
+    assert!(config.proxy_chain.is_none());
+    assert!(!format!("{config:?}").contains("secret-value"));
+    let ProxyCommandConfig::Direct { args, .. } = config.proxy_command.unwrap() else {
+        panic!("manual ProxyCommand should hydrate a direct runtime command");
+    };
+    assert!(
+        args.iter()
+            .any(|argument| argument.as_str() == "target.example.com:22")
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn saved_proxy_chain_becomes_ssh_config_chain() {
     let (store, path) = temp_connection_store("proxy-chain");
     let mut conn = saved_connection(SavedAuth::Agent);
@@ -133,6 +188,7 @@ fn saved_proxy_chain_becomes_ssh_config_chain() {
         identity_agent: Some("/tmp/jump-agent.sock".to_string()),
         agent_forwarding_socket: Some("/tmp/jump-forward.sock".to_string()),
         legacy_ssh_compatibility: true,
+        ssh_algorithms: oxideterm_connections::SshAlgorithmPreferences::default(),
     }];
 
     let settings = PersistedSettings::default();
@@ -158,6 +214,29 @@ fn saved_proxy_chain_becomes_ssh_config_chain() {
 }
 
 #[test]
+fn legacy_jump_host_becomes_runtime_proxy_chain() {
+    let (mut store, path) = temp_connection_store("legacy-jump-host");
+    let mut jump = saved_connection(SavedAuth::Agent);
+    jump.id = "jump-1".to_string();
+    jump.host = "jump.example.com".to_string();
+    jump.port = 2200;
+    jump.username = "jump".to_string();
+    store.upsert_imported_connection(jump).unwrap();
+
+    let mut target = saved_connection(SavedAuth::Agent);
+    target.options.jump_host = Some("jump-1".to_string());
+    let config = ssh_config_from_saved_connection(&store, &PersistedSettings::default(), &target)
+        .expect("legacy jump host should resolve");
+
+    let chain = config.proxy_chain.expect("one legacy jump host");
+    assert_eq!(chain.len(), 1);
+    assert_eq!(chain[0].host, "jump.example.com");
+    assert_eq!(chain[0].port, 2200);
+    assert_eq!(chain[0].username, "jump");
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn saved_connection_hops_become_independent_runtime_configs() {
     let (store, path) = temp_connection_store("materialized-hops");
     let mut connection = saved_connection(SavedAuth::Agent);
@@ -171,6 +250,7 @@ fn saved_connection_hops_become_independent_runtime_configs() {
         identity_agent: Some("/tmp/jump-agent.sock".to_string()),
         agent_forwarding_socket: Some("/tmp/jump-forward.sock".to_string()),
         legacy_ssh_compatibility: true,
+        ssh_algorithms: oxideterm_connections::SshAlgorithmPreferences::default(),
     }];
     let settings = PersistedSettings::default();
 

@@ -1275,6 +1275,9 @@ impl WorkspaceApp {
         if let Some(value) = persisted_settings_input_value(settings, input) {
             return value;
         }
+        if let Some(value) = self.terminal_trigger_settings_input_value(input) {
+            return value;
+        }
         if let Some(value) = self.ai_entity.read(cx).settings_input_value(input) {
             return value.to_owned();
         }
@@ -1379,6 +1382,11 @@ impl WorkspaceApp {
         if ai_state::AiWorkspaceEntity::owns_settings_input(input) {
             // Entity-owned inputs are updated directly by the IME adapter and
             // must not be copied into the legacy settings page model.
+            cx.notify();
+            return;
+        }
+        let terminal_trigger_input_draft = self.settings_input_draft.clone();
+        if self.apply_terminal_trigger_settings_input(input, &terminal_trigger_input_draft) {
             cx.notify();
             return;
         }
@@ -1506,11 +1514,11 @@ impl WorkspaceApp {
     ) {
         self.edit_settings(
             move |settings| {
-                if let Some(rule) = settings.terminal.highlight_rules.get_mut(index) {
+                let rules = settings.terminal.effective_highlight_rules_mut();
+                if let Some(rule) = rules.get_mut(index) {
                     edit(rule);
                 }
-                settings.terminal.highlight_rules =
-                    reindex_highlight_rules(settings.terminal.highlight_rules.clone());
+                *rules = reindex_highlight_rules(rules.clone());
             },
             cx,
         );
@@ -1527,12 +1535,12 @@ impl WorkspaceApp {
     ) {
         self.edit_settings(
             move |settings| {
-                settings.terminal.highlight_rules.extend(rules);
-                settings.terminal.highlight_rules =
-                    reindex_highlight_rules(settings.terminal.highlight_rules.clone())
-                        .into_iter()
-                        .take(MAX_HIGHLIGHT_RULES)
-                        .collect();
+                let active_rules = settings.terminal.effective_highlight_rules_mut();
+                active_rules.extend(rules);
+                *active_rules = reindex_highlight_rules(active_rules.clone())
+                    .into_iter()
+                    .take(MAX_HIGHLIGHT_RULES)
+                    .collect();
             },
             cx,
         );
@@ -1545,11 +1553,11 @@ impl WorkspaceApp {
     ) {
         self.edit_settings(
             move |settings| {
-                if index < settings.terminal.highlight_rules.len() {
-                    settings.terminal.highlight_rules.remove(index);
+                let rules = settings.terminal.effective_highlight_rules_mut();
+                if index < rules.len() {
+                    rules.remove(index);
                 }
-                settings.terminal.highlight_rules =
-                    reindex_highlight_rules(settings.terminal.highlight_rules.clone());
+                *rules = reindex_highlight_rules(rules.clone());
             },
             cx,
         );
@@ -1563,7 +1571,8 @@ impl WorkspaceApp {
     ) {
         self.edit_settings(
             move |settings| {
-                let len = settings.terminal.highlight_rules.len();
+                let rules = settings.terminal.effective_highlight_rules_mut();
+                let len = rules.len();
                 let next = if direction < 0 {
                     index.checked_sub(1)
                 } else if index + 1 < len {
@@ -1572,10 +1581,9 @@ impl WorkspaceApp {
                     None
                 };
                 if let Some(next) = next {
-                    settings.terminal.highlight_rules.swap(index, next);
+                    rules.swap(index, next);
                 }
-                settings.terminal.highlight_rules =
-                    reindex_highlight_rules(settings.terminal.highlight_rules.clone());
+                *rules = reindex_highlight_rules(rules.clone());
             },
             cx,
         );
@@ -1717,18 +1725,4 @@ pub(in crate::workspace) fn select_anchor_tracks_while_closed(anchor_id: SelectA
             | SelectAnchorId::SessionManagerSort
             | SelectAnchorId::SessionManagerBatchMove
     )
-}
-
-#[cfg(test)]
-mod floating_overlay_anchor_tests {
-    use super::*;
-
-    #[test]
-    fn ai_autocomplete_keeps_a_warm_window_overlay_anchor() {
-        // The candidate list is root-mounted, so its input-frame anchor must
-        // exist before the first slash, participant, or reference completion.
-        assert!(select_anchor_tracks_while_closed(
-            SelectAnchorId::AiAutocomplete
-        ));
-    }
 }

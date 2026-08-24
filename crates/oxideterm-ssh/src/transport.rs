@@ -43,8 +43,9 @@ use tokio::{
 use zeroize::Zeroizing;
 
 use crate::{
-    AuthMethod, ConnectionConsumer, ConnectionState, ConnectionTransportStatus,
-    KeepaliveProbeResult, ProxyHopConfig, SshConfig, SshConnectionHandle, SshConnectionRegistry,
+    AuthMethod, ConnectionConsumer, ConnectionProgressReporter, ConnectionState,
+    ConnectionTraceStage, ConnectionTransportStatus, KeepaliveProbeResult, ProxyHopConfig,
+    SshConfig, SshConnectionHandle, SshConnectionRegistry,
     agent_endpoint::{
         SshAgentEndpoint, resolve_ssh_agent_endpoint, resolve_ssh_agent_forwarding_endpoint,
     },
@@ -54,6 +55,12 @@ use crate::{
     },
     upstream_proxy::{UpstreamProxyConfig, UpstreamProxyProtocol, dial_initial_tcp},
 };
+
+mod gssapi;
+
+pub fn kerberos_credentials_available() -> bool {
+    gssapi::credentials_available()
+}
 
 pub const DEFAULT_PTY_MODES: &[(Pty, u32)] = &[
     (Pty::VINTR, 0x03),
@@ -92,6 +99,7 @@ pub const DEFAULT_PTY_MODES: &[(Pty, u32)] = &[
 const NONE_AUTH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const PASSWORD_RETRY_DELAY: Duration = Duration::from_millis(500);
 const PASSWORD_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
+const GSSAPI_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 const KBI_USER_PROMPT_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_PASSWORD_KBI_FALLBACK_ROUNDS: usize = 5;
 const RSA_AUTH_ALGORITHMS: [Option<HashAlg>; 3] =
@@ -207,6 +215,7 @@ pub enum SshTransportError {
         host: String,
         port: u16,
         fingerprint: String,
+        key_type: String,
     },
     #[error(
         "SSH host key changed for {host}:{port}: expected {expected_fingerprint}, got {actual_fingerprint}"
@@ -216,6 +225,7 @@ pub enum SshTransportError {
         port: u16,
         expected_fingerprint: String,
         actual_fingerprint: String,
+        key_type: String,
     },
     #[error("SSH host key check failed: {0}")]
     HostKeyCheckFailed(String),
@@ -692,6 +702,7 @@ pub struct SshTransportClient {
     config: SshConfig,
     prompt_handler: Option<Arc<dyn SshPromptHandler>>,
     managed_key_resolver: Option<ManagedKeyResolver>,
+    connection_progress: Option<ConnectionProgressReporter>,
 }
 
 include!("transport/connection.rs");
@@ -842,20 +853,12 @@ mod auth_banner_tests {
     };
 
     #[test]
-    fn sanitize_auth_banner_strips_control_chars() {
+    fn auth_banner_pipeline_sanitizes_formats_and_consumes_once() {
         assert_eq!(
             sanitize_auth_banner("hello\u{0007}\nworld"),
             Some("hello\nworld".to_string())
         );
-    }
-
-    #[test]
-    fn sanitize_auth_banner_drops_empty_banner() {
         assert_eq!(sanitize_auth_banner("\u{0007}\r\n"), None);
-    }
-
-    #[test]
-    fn auth_banners_are_consumed_once() {
         let sink = new_auth_banner_sink();
         sink.lock().push("Banner A".to_string());
         sink.lock().push("Banner B".to_string());
@@ -865,10 +868,6 @@ mod auth_banner_tests {
             vec!["Banner A".to_string(), "Banner B".to_string()]
         );
         assert!(take_auth_banners(&sink).is_empty());
-    }
-
-    #[test]
-    fn auth_banner_prelude_matches_terminal_line_endings() {
         assert_eq!(
             auth_banner_prelude_bytes(vec!["one\ntwo".to_string(), "three".to_string()]),
             b"one\r\ntwo\r\nthree\r\n".to_vec()

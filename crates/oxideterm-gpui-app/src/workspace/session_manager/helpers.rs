@@ -248,7 +248,7 @@ pub(in crate::workspace) fn form_from_saved_connection(
     error: Option<String>,
 ) -> NewConnectionForm {
     let (auth_tab, password, key_path, managed_key_id, cert_path, passphrase, save_password) =
-        match &conn.auth {
+        match conn.auth.conventional_fallback() {
             SavedAuth::Password {
                 keychain_id,
                 plaintext_password,
@@ -344,7 +344,13 @@ pub(in crate::workspace) fn form_from_saved_connection(
                 String::new(),
                 false,
             ),
+            SavedAuth::KerberosPreferred { .. } => unreachable!("fallback auth is conventional"),
         };
+    let (gssapi_server_identity, gssapi_delegate_credentials) = conn
+        .auth
+        .gssapi_options()
+        .map(|(identity, delegate)| (identity.unwrap_or_default().to_string(), delegate))
+        .unwrap_or_default();
     let upstream_proxy_form = upstream_proxy_form_fields(&conn.upstream_proxy);
     let mut form = NewConnectionForm::default();
     form.name = conn.name.clone();
@@ -353,7 +359,7 @@ pub(in crate::workspace) fn form_from_saved_connection(
     form.username = conn.username.clone();
     form.auth_tab = auth_tab;
     form.password = password;
-    form.saved_password_keychain_id = match &conn.auth {
+    form.saved_password_keychain_id = match conn.auth.conventional_fallback() {
         SavedAuth::Password { keychain_id, .. } => keychain_id.clone(),
         _ => None,
     };
@@ -364,13 +370,22 @@ pub(in crate::workspace) fn form_from_saved_connection(
     form.managed_key_id = managed_key_id;
     form.cert_path = cert_path;
     form.passphrase = passphrase;
+    form.gssapi_enabled = conn.auth.gssapi_options().is_some();
+    form.gssapi_server_identity = gssapi_server_identity;
+    form.gssapi_delegate_credentials = gssapi_delegate_credentials;
     form.save_password = save_password;
     form.group = group_label_for_form(conn.group.as_deref());
+    form.notes = conn.notes.clone().unwrap_or_default();
     form.color = conn.color.clone().unwrap_or_default();
     form.icon_background_color = conn.icon_background_color.clone().unwrap_or_default();
     form.icon = conn.icon.clone().unwrap_or_default();
     form.tags = conn.tags.clone();
     form.post_connect_command = conn.post_connect_command().unwrap_or_default().to_string();
+    form.proxy_command_enabled = conn.proxy_command.is_some();
+    form.proxy_command_keychain_id = conn
+        .proxy_command
+        .as_ref()
+        .and_then(|command| command.keychain_id.clone());
     form.upstream_proxy_policy = upstream_proxy_form.policy;
     form.upstream_proxy_protocol = upstream_proxy_form.protocol;
     form.upstream_proxy_host = upstream_proxy_form.host;
@@ -390,52 +405,218 @@ pub(in crate::workspace) fn form_from_saved_connection(
     // Preserve compatibility settings when an existing connection enters edit mode.
     form.legacy_ssh_compatibility = conn.options.legacy_ssh_compatibility;
     form.connect_timeout_seconds = conn.options.effective_connect_timeout_seconds();
+    form.connect_timeout_seconds_text = form.connect_timeout_seconds.to_string();
     form.dedicated_new_terminal_connection = conn.options.dedicated_new_terminal_connection;
     form.x11_forwarding = conn.options.x11_forwarding;
-    form.terminal = conn.options.terminal;
+    form.terminal = conn.options.terminal.clone();
+    // Every saved-connection form receives the complete non-secret route so
+    // edit, duplicate, prompt, and SSH-config entry points cannot diverge.
+    form.proxy_hops = conn
+        .proxy_chain
+        .iter()
+        .enumerate()
+        .map(|(index, hop)| NewConnectionProxyHop::from_saved(index, hop))
+        .collect();
+    form.proxy_chain_expanded = !form.proxy_hops.is_empty();
     form.save_connection = true;
     form.error = error;
     form
 }
 
-pub(in crate::workspace) fn restore_saved_proxy_chain_in_form(
+pub(in crate::workspace) fn restore_legacy_jump_host_in_form(
     form: &mut NewConnectionForm,
     connection: &SavedConnection,
+    store: &ConnectionStore,
 ) {
-    // Edit forms retain only non-secret hop metadata plus an index back to the
-    // persisted owner; passwords and passphrases remain in the keychain.
-    form.proxy_hops = connection
+    if !form.proxy_hops.is_empty() {
+        return;
+    }
+    let Some(jump_id) = connection.options.jump_host.as_deref() else {
+        return;
+    };
+    let Some(jump) = store
+        .connection_infos()
+        .into_iter()
+        .find(|candidate| candidate.id == jump_id)
+    else {
+        return;
+    };
+    let mut hop = NewConnectionProxyHop::new();
+    hop.apply_saved_connection(&jump);
+    form.proxy_hops.push(hop);
+    form.proxy_chain_expanded = true;
+}
+
+pub(super) fn form_from_standalone_sftp_profile(
+    profile: &oxideterm_connections::StandaloneSftpProfile,
+) -> NewConnectionForm {
+    // Edit mode restores only non-secret metadata and protected-store references.
+    let upstream_proxy_form = upstream_proxy_form_fields(&profile.upstream_proxy);
+    let mut form = NewConnectionForm::default();
+    form.transport = crate::workspace::new_connection::NewConnectionTransport::StandaloneSftp;
+    // Editing keeps the selected advanced transport discoverable in the shared selector.
+    form.advanced_connections_expanded = true;
+    form.standalone_sftp_profile_id = Some(profile.id.clone());
+    form.standalone_sftp_transfer_mode = profile.transfer_mode;
+    form.name = profile.name.clone();
+    form.host = profile.host.clone();
+    form.port = profile.port.to_string();
+    form.username = profile.username.clone();
+    form.auth_tab = ssh_auth_tab_from_saved_auth(&profile.auth);
+    form.saved_password_keychain_id = match profile.auth.conventional_fallback() {
+        SavedAuth::Password { keychain_id, .. } => keychain_id.clone(),
+        _ => None,
+    };
+    form.password_loaded = true;
+    form.save_password = match profile.auth.conventional_fallback() {
+        SavedAuth::Password { keychain_id, .. } => keychain_id.is_some(),
+        SavedAuth::Key {
+            has_passphrase,
+            passphrase_keychain_id,
+            ..
+        }
+        | SavedAuth::Certificate {
+            has_passphrase,
+            passphrase_keychain_id,
+            ..
+        } => *has_passphrase || passphrase_keychain_id.is_some(),
+        SavedAuth::ManagedKey {
+            passphrase_keychain_id,
+            ..
+        } => passphrase_keychain_id.is_some(),
+        SavedAuth::KeyboardInteractive | SavedAuth::Agent => false,
+        SavedAuth::KerberosPreferred { .. } => unreachable!("fallback auth is conventional"),
+    };
+    form.key_path = profile.auth.key_path().unwrap_or_default().to_string();
+    form.managed_key_id = profile
+        .auth
+        .managed_key_id()
+        .unwrap_or_default()
+        .to_string();
+    form.cert_path = profile.auth.cert_path().unwrap_or_default().to_string();
+    form.gssapi_enabled = profile.auth.gssapi_options().is_some();
+    form.gssapi_server_identity = profile
+        .auth
+        .gssapi_options()
+        .and_then(|(identity, _)| identity.map(ToOwned::to_owned))
+        .unwrap_or_default();
+    form.gssapi_delegate_credentials = profile
+        .auth
+        .gssapi_options()
+        .is_some_and(|(_, delegate)| delegate);
+    form.group = group_label_for_form(profile.group.as_deref());
+    form.notes = profile.notes.clone().unwrap_or_default();
+    form.icon = profile.icon.clone().unwrap_or_default();
+    form.color = profile.color.clone().unwrap_or_default();
+    form.icon_background_color = profile.icon_background_color.clone().unwrap_or_default();
+    form.sftp_initial_remote_path = profile.initial_remote_path.clone().unwrap_or_default();
+    form.proxy_hops = profile
         .proxy_chain
         .iter()
         .enumerate()
-        .map(|(persisted_proxy_hop_index, hop)| {
-            proxy_hop_form_from_saved_proxy_hop(persisted_proxy_hop_index, hop)
-        })
+        .map(|(index, hop)| NewConnectionProxyHop::from_saved(index, hop))
         .collect();
     form.proxy_chain_expanded = !form.proxy_hops.is_empty();
-}
-
-fn proxy_hop_form_from_saved_proxy_hop(
-    persisted_proxy_hop_index: usize,
-    hop: &SavedProxyHop,
-) -> NewConnectionProxyHop {
-    NewConnectionProxyHop {
-        saved_connection_id: String::new(),
-        persisted_proxy_hop_index: Some(persisted_proxy_hop_index),
-        host: hop.host.clone(),
-        port: hop.port.to_string(),
-        username: hop.username.clone(),
-        auth_tab: ssh_auth_tab_from_saved_auth(&hop.auth),
-        password: String::new(),
-        key_path: hop.auth.key_path().unwrap_or_default().to_string(),
-        managed_key_id: hop.auth.managed_key_id().unwrap_or_default().to_string(),
-        cert_path: hop.auth.cert_path().unwrap_or_default().to_string(),
-        passphrase: String::new(),
-        agent_forwarding: hop.agent_forwarding,
-        identity_agent: hop.identity_agent.clone().unwrap_or_default(),
-        agent_forwarding_socket: hop.agent_forwarding_socket.clone(),
-        legacy_ssh_compatibility: hop.legacy_ssh_compatibility,
+    form.proxy_command_enabled = profile.proxy_command.is_some();
+    form.proxy_command_keychain_id = profile
+        .proxy_command
+        .as_ref()
+        .and_then(|command| command.keychain_id.clone());
+    form.upstream_proxy_policy = upstream_proxy_form.policy;
+    form.upstream_proxy_protocol = upstream_proxy_form.protocol;
+    form.upstream_proxy_host = upstream_proxy_form.host;
+    form.upstream_proxy_port = upstream_proxy_form.port;
+    form.upstream_proxy_auth = upstream_proxy_form.auth;
+    form.upstream_proxy_username = upstream_proxy_form.username;
+    form.upstream_proxy_password_keychain_id = upstream_proxy_form.password_keychain_id;
+    form.upstream_proxy_remote_dns = upstream_proxy_form.remote_dns;
+    form.upstream_proxy_no_proxy = upstream_proxy_form.no_proxy;
+    form.identity_agent = profile.identity_agent.clone().unwrap_or_default();
+    form.agent_available =
+        oxideterm_ssh::ssh_agent_available(identity_agent_selector(&form.identity_agent));
+    form.legacy_ssh_compatibility = profile.legacy_ssh_compatibility;
+    form.connect_timeout_seconds = profile.connect_timeout_seconds;
+    form.connect_timeout_seconds_text = profile.connect_timeout_seconds.to_string();
+    if let Some(endpoint) = profile.secondary_endpoint.as_ref() {
+        let secondary_upstream_proxy_form = upstream_proxy_form_fields(&endpoint.upstream_proxy);
+        let secondary = &mut form.standalone_sftp_secondary;
+        secondary.host = endpoint.host.clone();
+        secondary.port = endpoint.port.to_string();
+        secondary.username = endpoint.username.clone();
+        secondary.auth_tab = ssh_auth_tab_from_saved_auth(&endpoint.auth);
+        secondary.password_keychain_id = match endpoint.auth.conventional_fallback() {
+            SavedAuth::Password { keychain_id, .. } => keychain_id.clone(),
+            _ => None,
+        };
+        secondary.save_password = match endpoint.auth.conventional_fallback() {
+            SavedAuth::Password { keychain_id, .. } => keychain_id.is_some(),
+            SavedAuth::Key {
+                has_passphrase,
+                passphrase_keychain_id,
+                ..
+            }
+            | SavedAuth::Certificate {
+                has_passphrase,
+                passphrase_keychain_id,
+                ..
+            } => *has_passphrase || passphrase_keychain_id.is_some(),
+            SavedAuth::ManagedKey {
+                passphrase_keychain_id,
+                ..
+            } => passphrase_keychain_id.is_some(),
+            SavedAuth::KeyboardInteractive | SavedAuth::Agent => false,
+            SavedAuth::KerberosPreferred { .. } => unreachable!("fallback auth is conventional"),
+        };
+        secondary.key_path = endpoint.auth.key_path().unwrap_or_default().to_string();
+        secondary.managed_key_id = endpoint
+            .auth
+            .managed_key_id()
+            .unwrap_or_default()
+            .to_string();
+        secondary.cert_path = endpoint.auth.cert_path().unwrap_or_default().to_string();
+        secondary.gssapi_enabled = endpoint.auth.gssapi_options().is_some();
+        secondary.gssapi_server_identity = endpoint
+            .auth
+            .gssapi_options()
+            .and_then(|(identity, _)| identity.map(ToOwned::to_owned))
+            .unwrap_or_default();
+        secondary.gssapi_delegate_credentials = endpoint
+            .auth
+            .gssapi_options()
+            .is_some_and(|(_, delegate)| delegate);
+        secondary.identity_agent = endpoint.identity_agent.clone().unwrap_or_default();
+        secondary.agent_available =
+            oxideterm_ssh::ssh_agent_available(identity_agent_selector(&secondary.identity_agent));
+        secondary.legacy_ssh_compatibility = endpoint.legacy_ssh_compatibility;
+        secondary.ssh_algorithms = endpoint.ssh_algorithms.clone();
+        secondary.connect_timeout_seconds = endpoint.connect_timeout_seconds;
+        secondary.connect_timeout_seconds_text = endpoint.connect_timeout_seconds.to_string();
+        secondary.initial_remote_path = endpoint.initial_remote_path.clone().unwrap_or_default();
+        secondary.proxy_hops = endpoint
+            .proxy_chain
+            .iter()
+            .enumerate()
+            .map(|(index, hop)| NewConnectionProxyHop::from_saved(index, hop))
+            .collect();
+        secondary.proxy_chain_expanded = !secondary.proxy_hops.is_empty();
+        secondary.proxy_command_enabled = endpoint.proxy_command.is_some();
+        secondary.proxy_command_keychain_id = endpoint
+            .proxy_command
+            .as_ref()
+            .and_then(|command| command.keychain_id.clone());
+        secondary.upstream_proxy_policy = secondary_upstream_proxy_form.policy;
+        secondary.upstream_proxy_protocol = secondary_upstream_proxy_form.protocol;
+        secondary.upstream_proxy_host = secondary_upstream_proxy_form.host;
+        secondary.upstream_proxy_port = secondary_upstream_proxy_form.port;
+        secondary.upstream_proxy_auth = secondary_upstream_proxy_form.auth;
+        secondary.upstream_proxy_username = secondary_upstream_proxy_form.username;
+        secondary.upstream_proxy_password_keychain_id =
+            secondary_upstream_proxy_form.password_keychain_id;
+        secondary.upstream_proxy_remote_dns = secondary_upstream_proxy_form.remote_dns;
+        secondary.upstream_proxy_no_proxy = secondary_upstream_proxy_form.no_proxy;
     }
+    form.focused_field = NewConnectionField::Name;
+    form
 }
 
 pub(super) fn connection_has_unloaded_keychain_password(conn: &SavedConnection) -> bool {
@@ -541,6 +722,7 @@ pub(in crate::workspace) fn save_request_from_form_with_proxy_hop_prefix(
         None,
     )?;
     request.upstream_proxy = saved_upstream_proxy_policy_from_form(form)?;
+    request.proxy_command = saved_proxy_command_from_form(form);
     Ok(request)
 }
 
@@ -557,6 +739,7 @@ pub(in crate::workspace) fn save_request_from_form_with_existing_auth(
         existing_auth,
     )?;
     request.upstream_proxy = saved_upstream_proxy_policy_from_form(form)?;
+    request.proxy_command = saved_proxy_command_from_form(form);
     Ok(request)
 }
 
@@ -596,6 +779,12 @@ fn validate_save_form_non_secret(
             anyhow::bail!("Upstream proxy username is required");
         }
     }
+    if form.proxy_command_enabled
+        && form.proxy_command.trim().is_empty()
+        && form.proxy_command_keychain_id.is_none()
+    {
+        anyhow::bail!("ProxyCommand value is required");
+    }
     Ok(())
 }
 
@@ -611,6 +800,7 @@ fn connection_draft_from_form_with_proxy_hop_prefix(
         username: form.username.clone(),
         auth: auth_draft_from_form(form, persist_password_draft),
         group: form.group.clone(),
+        notes: form.notes.clone(),
         color: form.color.clone(),
         icon_background_color: form.icon_background_color.clone(),
         icon: form.icon.clone(),
@@ -624,11 +814,12 @@ fn connection_draft_from_form_with_proxy_hop_prefix(
         identity_agent: identity_agent_from_form(&form.identity_agent),
         agent_forwarding_socket: form.agent_forwarding_socket.clone(),
         legacy_ssh_compatibility: form.legacy_ssh_compatibility,
+        ssh_algorithms: form.ssh_algorithms.clone(),
         connect_timeout_seconds: form.connect_timeout_seconds,
         dedicated_new_terminal_connection: form.dedicated_new_terminal_connection,
         x11_forwarding: form.x11_forwarding,
         post_connect_command: form.post_connect_command.clone(),
-        terminal: form.terminal,
+        terminal: form.terminal.clone(),
     }
 }
 
@@ -641,11 +832,14 @@ pub(super) fn proxy_hop_draft_from_form(
         username: hop.username.clone(),
         auth: ConnectionAuthDraft {
             kind: auth_draft_kind(hop.auth_tab),
+            gssapi_authentication: hop.gssapi_enabled,
             password: take_secret_from_ui_draft(&mut hop.password),
             key_path: hop.key_path.clone(),
             managed_key_id: hop.managed_key_id.clone(),
             cert_path: hop.cert_path.clone(),
             passphrase: take_secret_from_ui_draft(&mut hop.passphrase),
+            gssapi_server_identity: hop.gssapi_server_identity.clone(),
+            gssapi_delegate_credentials: hop.gssapi_delegate_credentials,
             save_password: true,
             ..ConnectionAuthDraft::default()
         },
@@ -653,6 +847,7 @@ pub(super) fn proxy_hop_draft_from_form(
         identity_agent: identity_agent_from_form(&hop.identity_agent),
         agent_forwarding_socket: hop.agent_forwarding_socket.clone(),
         legacy_ssh_compatibility: hop.legacy_ssh_compatibility,
+        ssh_algorithms: hop.ssh_algorithms.clone(),
     }
 }
 
@@ -662,6 +857,7 @@ pub(super) fn auth_draft_from_form(
 ) -> ConnectionAuthDraft {
     ConnectionAuthDraft {
         kind: auth_draft_kind(form.auth_tab),
+        gssapi_authentication: form.gssapi_enabled,
         password: if form.auth_tab == SshAuthTab::Password && persist_password_draft {
             take_secret_from_ui_draft(&mut form.password)
         } else {
@@ -674,12 +870,23 @@ pub(super) fn auth_draft_from_form(
         managed_key_id: form.managed_key_id.clone(),
         cert_path: form.cert_path.clone(),
         passphrase: take_secret_from_ui_draft(&mut form.passphrase),
+        gssapi_server_identity: form.gssapi_server_identity.clone(),
+        gssapi_delegate_credentials: form.gssapi_delegate_credentials,
     }
 }
 
 pub(super) fn take_secret_from_ui_draft(value: &mut String) -> SecretString {
     // Move the existing allocation into a zeroizing owner at the persistence boundary.
     SecretString::from(std::mem::take(value))
+}
+
+fn saved_proxy_command_from_form(form: &mut NewConnectionForm) -> Option<SavedProxyCommand> {
+    form.proxy_command_enabled.then(|| SavedProxyCommand {
+        keychain_id: form.proxy_command_keychain_id.clone(),
+        // An empty edit draft retains the existing protected value without loading it into UI.
+        plaintext_command: (!form.proxy_command.trim().is_empty())
+            .then(|| take_secret_from_ui_draft(&mut form.proxy_command)),
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

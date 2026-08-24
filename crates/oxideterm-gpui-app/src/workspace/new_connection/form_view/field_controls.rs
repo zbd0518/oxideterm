@@ -1,10 +1,125 @@
 use super::*;
-use gpui::{Animation, AnimationExt, App};
+use gpui::{Animation, AnimationExt, App, CursorStyle};
+use oxideterm_connections::ConnectionTerminalSessionLogPolicy;
 use oxideterm_settings_model::parse_rgb24_hex;
 
 const NEW_CONNECTION_TRANSPORT_ROW_HEIGHT: f32 = 36.0;
 const NEW_CONNECTION_TRANSPORT_ROW_GAP: f32 = 4.0;
-const SSH_CONNECT_TIMEOUT_OPTIONS_SECONDS: [u64; 5] = [10, 30, 60, 120, 300];
+const NEW_CONNECTION_ADVANCED_GROUP_HEIGHT: f32 = 28.0;
+const NEW_CONNECTION_ADVANCED_GROUP_OFFSET: f32 =
+    NEW_CONNECTION_ADVANCED_GROUP_HEIGHT + NEW_CONNECTION_TRANSPORT_ROW_GAP;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ConnectionFormSection {
+    Basic,
+    Authentication,
+    Route,
+    StandaloneSftpSecondaryRoute,
+    SshOptions,
+    Terminal,
+    Appearance,
+    RemoteGateway,
+    VncPreferences,
+    RemoteFeatures,
+    SerialParameters,
+    MoshOptions,
+    SftpOptions,
+    LocalShell,
+}
+
+impl ConnectionFormSection {
+    fn element_id(self) -> &'static str {
+        match self {
+            Self::Basic => "new-connection-basic-section",
+            Self::Authentication => "new-connection-authentication-section",
+            Self::Route => "new-connection-route-section",
+            Self::StandaloneSftpSecondaryRoute => {
+                "new-connection-standalone-sftp-secondary-route-section"
+            }
+            Self::SshOptions => "new-connection-ssh-options-section",
+            Self::Terminal => "new-connection-terminal-section",
+            Self::Appearance => "new-connection-appearance-section",
+            Self::RemoteGateway => "new-connection-remote-gateway-section",
+            Self::VncPreferences => "new-connection-vnc-preferences-section",
+            Self::RemoteFeatures => "new-connection-remote-features-section",
+            Self::SerialParameters => "new-connection-serial-parameters-section",
+            Self::MoshOptions => "new-connection-mosh-options-section",
+            Self::SftpOptions => "new-connection-sftp-options-section",
+            Self::LocalShell => "new-connection-local-shell-section",
+        }
+    }
+
+    fn title_key(self) -> &'static str {
+        match self {
+            Self::Basic => "ssh.form.basic_information",
+            Self::Authentication => "ssh.form.authentication",
+            Self::Route => "ssh.form.connection_route",
+            Self::StandaloneSftpSecondaryRoute => "ssh.form.connection_route",
+            Self::SshOptions => "ssh.form.ssh_options",
+            Self::Terminal => "ssh.form.terminal_options",
+            Self::Appearance => "ssh.form.appearance",
+            Self::RemoteGateway => "modals.new_connection.remote_desktop_ssh_gateway",
+            Self::VncPreferences => "modals.new_connection.vnc_preferences_title",
+            Self::RemoteFeatures => "modals.new_connection.remote_desktop_features_title",
+            Self::SerialParameters => "modals.new_connection.serial_section_title",
+            Self::MoshOptions => "mosh.form.advanced",
+            Self::SftpOptions => "sftp.standalone.options_title",
+            Self::LocalShell => "settings_view.local_terminal.available_shells",
+        }
+    }
+
+    fn hint_key(self) -> &'static str {
+        match self {
+            Self::Basic => "ssh.form.basic_information_hint",
+            Self::Authentication => "ssh.form.authentication_hint",
+            Self::Route => "ssh.form.connection_route_hint",
+            Self::StandaloneSftpSecondaryRoute => "ssh.form.connection_route_hint",
+            Self::SshOptions => "ssh.form.ssh_options_hint",
+            Self::Terminal => "ssh.form.terminal_options_hint",
+            Self::Appearance => "ssh.form.appearance_hint",
+            Self::RemoteGateway => "modals.new_connection.remote_desktop_ssh_gateway_hint",
+            Self::VncPreferences => "modals.new_connection.vnc_preferences_hint",
+            Self::RemoteFeatures => "modals.new_connection.remote_desktop_features_hint",
+            Self::SerialParameters => "modals.new_connection.serial_connect_hint",
+            Self::MoshOptions => "mosh.form.capability_hint",
+            Self::SftpOptions => "sftp.standalone.options_hint",
+            Self::LocalShell => "modals.new_connection.local_terminal_detail",
+        }
+    }
+}
+
+fn connection_form_section_expanded_for_form(
+    form: &NewConnectionForm,
+    section: ConnectionFormSection,
+) -> bool {
+    // Every section starts open; an explicit user toggle remains authoritative
+    // for the lifetime of this form only.
+    let override_value = match section {
+        ConnectionFormSection::Basic => form.basic_section_expanded,
+        ConnectionFormSection::Authentication => form.authentication_section_expanded,
+        ConnectionFormSection::Route => form.route_section_expanded,
+        ConnectionFormSection::StandaloneSftpSecondaryRoute => {
+            form.standalone_sftp_secondary_route_section_expanded
+        }
+        ConnectionFormSection::SshOptions => form.ssh_options_section_expanded,
+        ConnectionFormSection::Terminal => form.terminal_section_expanded,
+        ConnectionFormSection::Appearance => form.appearance_section_expanded,
+        ConnectionFormSection::RemoteGateway => form.remote_gateway_section_expanded,
+        ConnectionFormSection::VncPreferences => form.vnc_preferences_section_expanded,
+        ConnectionFormSection::RemoteFeatures => form.remote_features_section_expanded,
+        ConnectionFormSection::SerialParameters => form.serial_parameters_section_expanded,
+        ConnectionFormSection::MoshOptions => form.mosh_options_section_expanded,
+        ConnectionFormSection::SftpOptions => form.sftp_options_section_expanded,
+        ConnectionFormSection::LocalShell => form.local_shell_section_expanded,
+    };
+    override_value.unwrap_or(true)
+}
+
+fn remote_desktop_feature_columns(feature_count: usize) -> u16 {
+    // Two columns reduce vertical scanning without squeezing a lone display option.
+    if feature_count > 1 { 2 } else { 1 }
+}
+
 const REMOTE_DESKTOP_CLIPBOARD_FEATURES: &[(RemoteDesktopSessionFeature, &str, &str)] = &[
     (
         RemoteDesktopSessionFeature::ClipboardText,
@@ -38,6 +153,11 @@ const REMOTE_DESKTOP_DISPLAY_FEATURES: &[(RemoteDesktopSessionFeature, &str, &st
     RemoteDesktopSessionFeature::MultiMonitor,
     "modals.new_connection.remote_desktop_multi_monitor",
     "modals.new_connection.remote_desktop_multi_monitor_hint",
+)];
+const RDP_COMPATIBILITY_FEATURES: &[(RemoteDesktopSessionFeature, &str, &str)] = &[(
+    RemoteDesktopSessionFeature::DisableRdpGraphicsPipeline,
+    "modals.new_connection.remote_desktop_disable_graphics_pipeline",
+    "modals.new_connection.remote_desktop_disable_graphics_pipeline_hint",
 )];
 const VNC_SECURITY_PREFERENCES: &[(RemoteDesktopVncPreference, &str)] = &[
     (
@@ -112,21 +232,37 @@ fn new_connection_transport_index(transport: NewConnectionTransport) -> usize {
                 6
             }
         }
+        NewConnectionTransport::StandaloneSftp => {
+            if cfg!(target_os = "windows") {
+                8
+            } else {
+                7
+            }
+        }
     }
+}
+
+fn new_connection_transport_visual_offset(transport: NewConnectionTransport) -> f32 {
+    let row_stride = NEW_CONNECTION_TRANSPORT_ROW_HEIGHT + NEW_CONNECTION_TRANSPORT_ROW_GAP;
+    let advanced_offset = if transport == NewConnectionTransport::StandaloneSftp {
+        NEW_CONNECTION_ADVANCED_GROUP_OFFSET
+    } else {
+        0.0
+    };
+    new_connection_transport_index(transport) as f32 * row_stride + advanced_offset
 }
 
 fn new_connection_transport_vertical_offset(
     source: NewConnectionTransport,
     target: NewConnectionTransport,
 ) -> f32 {
-    let row_stride = NEW_CONNECTION_TRANSPORT_ROW_HEIGHT + NEW_CONNECTION_TRANSPORT_ROW_GAP;
-    (new_connection_transport_index(source) as f32 - new_connection_transport_index(target) as f32)
-        * row_stride
+    new_connection_transport_visual_offset(source) - new_connection_transport_visual_offset(target)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum AuthSelectorContext {
     Standard,
+    StandaloneSftpSecondary,
     EditProperties,
     Prompt,
     DrillDown,
@@ -142,7 +278,16 @@ fn connection_secret_field_value(
     match field {
         NewConnectionField::Password => Some(&form.password),
         NewConnectionField::Passphrase => Some(&form.passphrase),
+        NewConnectionField::StandaloneSftpSecondaryPassword => {
+            Some(&form.standalone_sftp_secondary.password)
+        }
+        NewConnectionField::StandaloneSftpSecondaryPassphrase => {
+            Some(&form.standalone_sftp_secondary.passphrase)
+        }
         NewConnectionField::UpstreamProxyPassword => Some(&form.upstream_proxy_password),
+        NewConnectionField::StandaloneSftpSecondaryUpstreamProxyPassword => {
+            Some(&form.standalone_sftp_secondary.upstream_proxy_password)
+        }
         NewConnectionField::JumpPassword => form
             .jump_server_form
             .as_ref()
@@ -155,7 +300,177 @@ fn connection_secret_field_value(
     }
 }
 
+fn toggle_primary_sftp_password_persistence(form: &mut NewConnectionForm) {
+    form.save_password = !form.save_password;
+}
+
+fn toggle_secondary_sftp_password_persistence(form: &mut NewConnectionForm) {
+    form.standalone_sftp_secondary.save_password = !form.standalone_sftp_secondary.save_password;
+}
+
+fn toggle_primary_sftp_gssapi_delegation(form: &mut NewConnectionForm) {
+    form.gssapi_delegate_credentials = !form.gssapi_delegate_credentials;
+}
+
+fn toggle_primary_sftp_gssapi(form: &mut NewConnectionForm) {
+    form.gssapi_enabled = !form.gssapi_enabled;
+}
+
+fn toggle_secondary_sftp_gssapi(form: &mut NewConnectionForm) {
+    let endpoint = &mut form.standalone_sftp_secondary;
+    endpoint.gssapi_enabled = !endpoint.gssapi_enabled;
+}
+
+fn toggle_secondary_sftp_gssapi_delegation(form: &mut NewConnectionForm) {
+    let endpoint = &mut form.standalone_sftp_secondary;
+    endpoint.gssapi_delegate_credentials = !endpoint.gssapi_delegate_credentials;
+}
+
 impl WorkspaceApp {
+    fn connection_form_section_expanded(
+        &self,
+        section: ConnectionFormSection,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.connection_form_state(cx)
+            .form
+            .as_ref()
+            .map(|form| connection_form_section_expanded_for_form(form, section))
+            .unwrap_or(false)
+    }
+
+    pub(super) fn render_connection_form_section(
+        &self,
+        section: ConnectionFormSection,
+        body: AnyElement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let expanded = self.connection_form_section_expanded(section, cx);
+        let element_id = section.element_id();
+        let chevron_id = format!("{element_id}-chevron");
+        div()
+            .flex()
+            .flex_col()
+            .when(
+                !matches!(
+                    section,
+                    ConnectionFormSection::Basic | ConnectionFormSection::LocalShell
+                ),
+                |content| {
+                    content
+                        .border_t_1()
+                        .border_color(rgb(self.tokens.ui.border))
+                        .pt(px(self.tokens.spacing.three))
+                },
+            )
+            .child(
+                div()
+                    .id(element_id)
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(self.tokens.spacing.three))
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap(px(self.tokens.spacing.one))
+                            .child(
+                                div()
+                                    .text_size(px(self.tokens.metrics.ui_text_sm))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(rgb(self.tokens.ui.text_heading))
+                                    .child(self.i18n.t(section.title_key())),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(self.tokens.metrics.ui_text_xs))
+                                    .text_color(rgb(self.tokens.ui.text_muted))
+                                    .child(self.i18n.t(section.hint_key())),
+                            ),
+                    )
+                    .child(self.render_animated_chevron(
+                        (SharedString::from(chevron_id), expanded as usize),
+                        expanded,
+                        16.0,
+                        rgb(self.tokens.ui.text_muted),
+                    ))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _event, _window, cx| {
+                            this.update_connection_form_state(cx, |state| {
+                                let Some(form) = state.form.as_mut() else {
+                                    return;
+                                };
+                                let override_value = Some(!expanded);
+                                match section {
+                                    ConnectionFormSection::Basic => {
+                                        form.basic_section_expanded = override_value;
+                                    }
+                                    ConnectionFormSection::Authentication => {
+                                        form.authentication_section_expanded = override_value;
+                                    }
+                                    ConnectionFormSection::Route => {
+                                        form.route_section_expanded = override_value;
+                                    }
+                                    ConnectionFormSection::StandaloneSftpSecondaryRoute => {
+                                        form.standalone_sftp_secondary_route_section_expanded =
+                                            override_value;
+                                    }
+                                    ConnectionFormSection::SshOptions => {
+                                        form.ssh_options_section_expanded = override_value;
+                                    }
+                                    ConnectionFormSection::Terminal => {
+                                        form.terminal_section_expanded = override_value;
+                                    }
+                                    ConnectionFormSection::Appearance => {
+                                        form.appearance_section_expanded = override_value;
+                                    }
+                                    ConnectionFormSection::RemoteGateway => {
+                                        form.remote_gateway_section_expanded = override_value;
+                                    }
+                                    ConnectionFormSection::VncPreferences => {
+                                        form.vnc_preferences_section_expanded = override_value;
+                                    }
+                                    ConnectionFormSection::RemoteFeatures => {
+                                        form.remote_features_section_expanded = override_value;
+                                    }
+                                    ConnectionFormSection::SerialParameters => {
+                                        form.serial_parameters_section_expanded = override_value;
+                                    }
+                                    ConnectionFormSection::MoshOptions => {
+                                        form.mosh_options_section_expanded = override_value;
+                                    }
+                                    ConnectionFormSection::SftpOptions => {
+                                        form.sftp_options_section_expanded = override_value;
+                                    }
+                                    ConnectionFormSection::LocalShell => {
+                                        form.local_shell_section_expanded = override_value;
+                                    }
+                                }
+                                form.field_focused = false;
+                            });
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ),
+            )
+            .when(expanded, |content| {
+                content.child(
+                    div()
+                        .pt(px(self.tokens.spacing.three))
+                        .flex()
+                        .flex_col()
+                        .gap(px(self.tokens.metrics.modal_section_gap))
+                        .child(body),
+                )
+            })
+            .into_any_element()
+    }
+
     pub(in crate::workspace) fn new_connection_select_anchor_id(
         select_id: NewConnectionSelect,
     ) -> SelectAnchorId {
@@ -163,6 +478,12 @@ impl WorkspaceApp {
             NewConnectionSelect::Group => SelectAnchorId::NewConnectionGroup,
             NewConnectionSelect::KeyAuthSource => SelectAnchorId::NewConnectionKeyAuthSource,
             NewConnectionSelect::ManagedKey => SelectAnchorId::NewConnectionManagedKey,
+            NewConnectionSelect::StandaloneSftpSecondaryKeyAuthSource => {
+                SelectAnchorId::NewConnectionStandaloneSftpSecondaryKeyAuthSource
+            }
+            NewConnectionSelect::StandaloneSftpSecondaryManagedKey => {
+                SelectAnchorId::NewConnectionStandaloneSftpSecondaryManagedKey
+            }
             NewConnectionSelect::JumpSavedConnection => {
                 SelectAnchorId::NewConnectionJumpSavedConnection
             }
@@ -182,6 +503,16 @@ impl WorkspaceApp {
             NewConnectionSelect::UpstreamProxyAuth => {
                 SelectAnchorId::NewConnectionUpstreamProxyAuth
             }
+            NewConnectionSelect::StandaloneSftpSecondaryUpstreamProxyPolicy => {
+                SelectAnchorId::NewConnectionStandaloneSftpSecondaryUpstreamProxyPolicy
+            }
+            NewConnectionSelect::StandaloneSftpSecondaryUpstreamProxyProtocol => {
+                SelectAnchorId::NewConnectionStandaloneSftpSecondaryUpstreamProxyProtocol
+            }
+            NewConnectionSelect::StandaloneSftpSecondaryUpstreamProxyAuth => {
+                SelectAnchorId::NewConnectionStandaloneSftpSecondaryUpstreamProxyAuth
+            }
+            NewConnectionSelect::LocalShell => SelectAnchorId::NewConnectionLocalShell,
             NewConnectionSelect::SerialPort => SelectAnchorId::NewConnectionSerialPort,
             NewConnectionSelect::SerialDataBits => SelectAnchorId::NewConnectionSerialDataBits,
             NewConnectionSelect::SerialStopBits => SelectAnchorId::NewConnectionSerialStopBits,
@@ -195,6 +526,15 @@ impl WorkspaceApp {
             }
             NewConnectionSelect::TerminalDeleteSequence => {
                 SelectAnchorId::NewConnectionTerminalDeleteSequence
+            }
+            NewConnectionSelect::TerminalSemanticScheme => {
+                SelectAnchorId::NewConnectionTerminalSemanticScheme
+            }
+            NewConnectionSelect::TerminalHighlightRuleSet => {
+                SelectAnchorId::NewConnectionTerminalHighlightRuleSet
+            }
+            NewConnectionSelect::TerminalSessionLogPolicy => {
+                SelectAnchorId::NewConnectionTerminalSessionLogPolicy
             }
         }
     }
@@ -306,6 +646,31 @@ impl WorkspaceApp {
             .into_any_element()
     }
 
+    pub(super) fn render_kerberos_credentials_status(&self, available: Option<bool>) -> AnyElement {
+        let (color, label) = match available {
+            Some(true) => (
+                self.tokens.ui.success,
+                self.i18n.t("ssh.form.kerberos_credentials_available"),
+            ),
+            Some(false) => (
+                self.tokens.ui.warning,
+                self.i18n.t("ssh.form.kerberos_credentials_unavailable"),
+            ),
+            None => (
+                self.tokens.ui.text_muted,
+                self.i18n.t("ssh.form.kerberos_credentials_checking"),
+            ),
+        };
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_size(px(self.tokens.metrics.ui_text_xs))
+            .child(div().size(px(8.0)).rounded_full().bg(rgb(color)))
+            .child(div().text_color(rgb(color)).child(label))
+            .into_any_element()
+    }
+
     pub(super) fn render_prompt_feedback_box(&self, message: String, success: bool) -> AnyElement {
         let feedback_color = if success {
             self.tokens.ui.success
@@ -355,6 +720,132 @@ impl WorkspaceApp {
         };
 
         form_field(&self.tokens, label, control)
+    }
+
+    pub(super) fn render_connection_multiline_field(
+        &self,
+        label: String,
+        value: &str,
+        placeholder: String,
+        field: NewConnectionField,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let target = WorkspaceImeTarget::NewConnection(field);
+        let focused = self
+            .connection_form_state(cx)
+            .form
+            .as_ref()
+            .is_some_and(|form| form.field_focused && form.focused_field == field);
+        let marked_range = self.ime_marked_virtual_range_for_target(target, cx);
+        let selection = self.ime_selected_range_for_target(target, cx);
+        let showing_placeholder = value.is_empty() && marked_range.is_none();
+        let display = if showing_placeholder {
+            placeholder
+        } else {
+            self.ime_text_with_marked_text_for_target(target, cx)
+                .unwrap_or_else(|| value.to_string())
+        };
+        let theme = self.tokens.ui;
+        let mut textarea = div()
+            .w_full()
+            .min_h(px(CONNECTION_NOTES_MIN_HEIGHT))
+            .px(px(self.tokens.metrics.ui_control_padding_x))
+            .py(px(CONNECTION_NOTES_VERTICAL_PADDING))
+            .flex()
+            .flex_col()
+            .items_start()
+            .rounded(px(self.tokens.radii.md))
+            .border_1()
+            .border_color(if focused {
+                rgb(theme.accent)
+            } else {
+                rgb(theme.border)
+            })
+            .bg(rgba((theme.bg << 8) | 0x80))
+            .cursor(CursorStyle::IBeam)
+            .overflow_hidden()
+            .text_size(px(self.tokens.metrics.ui_text_sm))
+            .line_height(px(CONNECTION_NOTES_LINE_HEIGHT))
+            .text_color(if showing_placeholder {
+                rgb(theme.text_muted)
+            } else {
+                rgb(theme.text)
+            });
+        let lines = settings_multiline_line_ranges(&display);
+        for (index, (line_range, line_text)) in lines.iter().enumerate() {
+            let is_last_line = index + 1 == lines.len();
+            let local_marked_range = marked_range.as_ref().and_then(|marked| {
+                let start = marked.start.max(line_range.start);
+                let end = marked.end.min(line_range.end);
+                (start < end).then_some(start - line_range.start..end - line_range.start)
+            });
+            let (line_selection, line_caret) = if showing_placeholder || marked_range.is_some() {
+                (None, None)
+            } else {
+                settings_multiline_line_selection(selection.as_ref(), line_range)
+            };
+            let segments = if showing_placeholder {
+                div().child(line_text.as_str().to_string())
+            } else if let Some(marked_range) = local_marked_range {
+                text_input_value_segments_with_marked_range(&self.tokens, line_text, marked_range)
+            } else {
+                text_input_value_segments(
+                    &self.tokens,
+                    line_text,
+                    false,
+                    line_selection,
+                    line_caret,
+                    self.input_caret.visible(),
+                )
+            };
+            textarea = textarea.child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .h(px(CONNECTION_NOTES_LINE_HEIGHT))
+                    .min_h(px(CONNECTION_NOTES_LINE_HEIGHT))
+                    .flex()
+                    .items_center()
+                    .when(focused && showing_placeholder && index == 0, |line| {
+                        line.child(text_caret(&self.tokens, self.input_caret.visible()))
+                    })
+                    .child(segments)
+                    .when(
+                        focused
+                            && is_last_line
+                            && !showing_placeholder
+                            && selection.is_none()
+                            && marked_range.is_none(),
+                        |line| line.child(text_caret(&self.tokens, self.input_caret.visible())),
+                    ),
+            );
+        }
+        form_field(
+            &self.tokens,
+            label,
+            self.finish_connection_input(textarea, field, cx),
+        )
+    }
+
+    pub(super) fn render_connection_notes_fields(
+        &self,
+        notes: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // Notes are ordinary metadata; the warning keeps credentials in protected fields.
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(self.tokens.spacing.two))
+            .child(self.render_connection_multiline_field(
+                self.i18n.t("ssh.form.notes"),
+                notes,
+                self.i18n.t("ssh.form.notes_placeholder"),
+                NewConnectionField::Notes,
+                cx,
+            ))
+            .child(self.render_connection_hint(self.i18n.t("ssh.form.notes_hint")))
+            .into_any_element()
     }
 
     pub(super) fn render_connection_secret_field(
@@ -459,12 +950,7 @@ impl WorkspaceApp {
         }
     }
 
-    pub(super) fn render_edit_saved_password_field(
-        &self,
-        password_visible: bool,
-        password_loading: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    pub(super) fn render_edit_saved_password_field(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some((input, _)) = self.render_connection_secret_input(
             self.i18n
                 .t("sessionManager.edit_properties.password_placeholder"),
@@ -473,58 +959,10 @@ impl WorkspaceApp {
         ) else {
             return div().into_any_element();
         };
-        let icon = if password_visible {
-            LucideIcon::EyeOff
-        } else {
-            LucideIcon::Eye
-        };
         form_field(
             &self.tokens,
             self.i18n.t("sessionManager.edit_properties.saved_password"),
-            div().relative().child(input).child(
-                if password_loading {
-                    oxideterm_gpui_ui::button::icon_button(
-                        &self.tokens,
-                        self.render_loading_icon(
-                            "saved-password-loading",
-                            SECRET_VISIBILITY_ICON_SIZE,
-                            rgb(self.tokens.ui.text_muted),
-                        ),
-                        IconButtonOptions {
-                            loading: true,
-                            hover_background: Some(rgba((self.tokens.ui.bg_hover << 8) | 0x99)),
-                            ..IconButtonOptions::opaque_toolbar(
-                                SECRET_VISIBILITY_BUTTON_SIZE,
-                                ButtonRadius::Sm,
-                            )
-                        },
-                    )
-                    .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
-                        cx.stop_propagation();
-                    })
-                } else {
-                    self.workspace_icon_action_button(
-                        icon,
-                        SECRET_VISIBILITY_ICON_SIZE,
-                        rgb(self.tokens.ui.text_muted),
-                        IconButtonOptions {
-                            hover_background: Some(rgba((self.tokens.ui.bg_hover << 8) | 0x99)),
-                            ..IconButtonOptions::opaque_toolbar(
-                                SECRET_VISIBILITY_BUTTON_SIZE,
-                                ButtonRadius::Sm,
-                            )
-                        },
-                        |this, _event, _window, cx| {
-                            this.toggle_edit_saved_password_visibility(cx);
-                            cx.stop_propagation();
-                        },
-                        cx,
-                    )
-                }
-                .absolute()
-                .right(px(SECRET_VISIBILITY_BUTTON_OFFSET))
-                .top(px(SECRET_VISIBILITY_BUTTON_OFFSET)),
-            ),
+            input,
         )
     }
 
@@ -638,6 +1076,35 @@ impl WorkspaceApp {
         jump_form: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let select_id = if jump_form {
+            NewConnectionSelect::JumpManagedKey
+        } else {
+            NewConnectionSelect::ManagedKey
+        };
+        self.render_managed_key_select_for_target(label, selected_id, select_id, cx)
+    }
+
+    pub(super) fn render_standalone_sftp_secondary_managed_key_select(
+        &self,
+        label: String,
+        selected_id: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.render_managed_key_select_for_target(
+            label,
+            selected_id,
+            NewConnectionSelect::StandaloneSftpSecondaryManagedKey,
+            cx,
+        )
+    }
+
+    fn render_managed_key_select_for_target(
+        &self,
+        label: String,
+        selected_id: &str,
+        select_id: NewConnectionSelect,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let keys = self.connection_store.managed_ssh_keys();
         let selected_label = if selected_id.trim().is_empty() {
             self.i18n.t("ssh.form.managed_key_placeholder")
@@ -646,11 +1113,6 @@ impl WorkspaceApp {
                 .find(|key| key.id == selected_id)
                 .map(|key| key.name.clone())
                 .unwrap_or_else(|| selected_id.to_string())
-        };
-        let select_id = if jump_form {
-            NewConnectionSelect::JumpManagedKey
-        } else {
-            NewConnectionSelect::ManagedKey
         };
         let trigger = self
             .new_connection_select_trigger(
@@ -815,17 +1277,12 @@ impl WorkspaceApp {
                 }),
             );
 
-        form_field(
-            &self.tokens,
-            self.i18n
-                .t("modals.new_connection.remote_desktop_ssh_gateway"),
-            self.track_new_connection_select_anchor(
-                NewConnectionSelect::RemoteDesktopSshGateway,
-                trigger,
-                cx,
-            ),
+        // The surrounding route section owns the label and explanatory copy.
+        self.track_new_connection_select_anchor(
+            NewConnectionSelect::RemoteDesktopSshGateway,
+            trigger,
+            cx,
         )
-        .into_any_element()
     }
 
     pub(super) fn set_new_connection_managed_key(
@@ -841,6 +1298,11 @@ impl WorkspaceApp {
                         form.managed_key_id = key_id;
                         form.focused_field = NewConnectionField::ManagedKeyId;
                     }
+                    NewConnectionSelect::StandaloneSftpSecondaryManagedKey => {
+                        form.standalone_sftp_secondary.managed_key_id = key_id;
+                        form.focused_field =
+                            NewConnectionField::StandaloneSftpSecondaryManagedKeyId;
+                    }
                     NewConnectionSelect::JumpManagedKey => {
                         let Some(jump_form) = form.jump_server_form.as_mut() else {
                             return;
@@ -850,12 +1312,17 @@ impl WorkspaceApp {
                     }
                     NewConnectionSelect::Group
                     | NewConnectionSelect::KeyAuthSource
+                    | NewConnectionSelect::StandaloneSftpSecondaryKeyAuthSource
                     | NewConnectionSelect::JumpSavedConnection
                     | NewConnectionSelect::RemoteDesktopSshGateway
                     | NewConnectionSelect::JumpKeyAuthSource
                     | NewConnectionSelect::UpstreamProxyPolicy
                     | NewConnectionSelect::UpstreamProxyProtocol
                     | NewConnectionSelect::UpstreamProxyAuth
+                    | NewConnectionSelect::StandaloneSftpSecondaryUpstreamProxyPolicy
+                    | NewConnectionSelect::StandaloneSftpSecondaryUpstreamProxyProtocol
+                    | NewConnectionSelect::StandaloneSftpSecondaryUpstreamProxyAuth
+                    | NewConnectionSelect::LocalShell
                     | NewConnectionSelect::SerialPort
                     | NewConnectionSelect::SerialDataBits
                     | NewConnectionSelect::SerialStopBits
@@ -863,7 +1330,10 @@ impl WorkspaceApp {
                     | NewConnectionSelect::SerialFlowControl
                     | NewConnectionSelect::TerminalEncoding
                     | NewConnectionSelect::TerminalBackspaceSequence
-                    | NewConnectionSelect::TerminalDeleteSequence => return,
+                    | NewConnectionSelect::TerminalDeleteSequence
+                    | NewConnectionSelect::TerminalSemanticScheme
+                    | NewConnectionSelect::TerminalHighlightRuleSet
+                    | NewConnectionSelect::TerminalSessionLogPolicy => return,
                 }
                 form.field_focused = false;
                 form.selected_field = None;
@@ -943,11 +1413,61 @@ impl WorkspaceApp {
         self.i18n.t("ssh.form.ungrouped")
     }
 
+    pub(super) fn render_proxy_command_section(
+        &self,
+        enabled: bool,
+        command: &str,
+        configured: bool,
+        secondary: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(self.tokens.spacing.two))
+            .child(self.render_connection_checkbox(
+                self.i18n.t("ssh.form.proxy_command_enable"),
+                enabled,
+                move |form| {
+                    if secondary {
+                        let route = &mut form.standalone_sftp_secondary;
+                        route.proxy_command_enabled = !route.proxy_command_enabled;
+                    } else {
+                        form.proxy_command_enabled = !form.proxy_command_enabled;
+                    }
+                },
+                cx,
+            ))
+            .when(enabled, |content| {
+                content
+                    .child(self.render_connection_field(
+                        self.i18n.t("ssh.form.proxy_command"),
+                        command,
+                        self.i18n.t(if configured && command.is_empty() {
+                            "ssh.form.proxy_command_configured_placeholder"
+                        } else {
+                            "ssh.form.proxy_command_placeholder"
+                        }),
+                        if secondary {
+                            NewConnectionField::StandaloneSftpSecondaryProxyCommand
+                        } else {
+                            NewConnectionField::ProxyCommand
+                        },
+                        false,
+                        cx,
+                    ))
+                    .child(self.render_connection_hint(self.i18n.t("ssh.form.proxy_command_hint")))
+            })
+            .into_any_element()
+    }
+
     fn pick_new_connection_path(&mut self, field: NewConnectionField, cx: &mut Context<Self>) {
         if !matches!(
             field,
             NewConnectionField::KeyPath
                 | NewConnectionField::CertPath
+                | NewConnectionField::StandaloneSftpSecondaryKeyPath
+                | NewConnectionField::StandaloneSftpSecondaryCertPath
                 | NewConnectionField::JumpKeyPath
                 | NewConnectionField::JumpCertPath
         ) {
@@ -972,47 +1492,6 @@ impl WorkspaceApp {
         };
         self.connection_flow.update(cx, |connection_flow, cx| {
             connection_flow.start_path_picker(field, selection, cx);
-        });
-    }
-
-    fn toggle_edit_saved_password_visibility(&mut self, cx: &mut Context<Self>) {
-        let source_connection_id = self
-            .saved_connection_form_source_id(cx)
-            .map(|connection_id| connection_id.to_string());
-        let should_load = self.update_connection_form_state(cx, |state| {
-            let Some(form) = state.form.as_mut() else {
-                return false;
-            };
-            if form.password_loading {
-                return false;
-            }
-            if form.password_loaded {
-                form.password_visible = !form.password_visible;
-                form.password_error = None;
-                return false;
-            }
-            form.password_loading = true;
-            form.password_error = None;
-            true
-        });
-        if !should_load {
-            cx.notify();
-            return;
-        }
-        let Some(connection_id) = source_connection_id else {
-            self.update_connection_form_state(cx, |state| {
-                if let Some(form) = state.form.as_mut() {
-                    form.password_loading = false;
-                }
-            });
-            return;
-        };
-        cx.notify();
-
-        let store = self.connection_store.clone();
-        let load = async move { store.get_connection_password(&connection_id) };
-        self.connection_flow.update(cx, |connection_flow, cx| {
-            connection_flow.start_password_load(load, cx);
         });
     }
 
@@ -1110,9 +1589,9 @@ impl WorkspaceApp {
             }
             AuthSelectorContext::DrillDown => self.i18n.t("ssh.drill_down.auth_method"),
             AuthSelectorContext::Jump => self.i18n.t("ssh.form.proxy_jump_auth"),
-            AuthSelectorContext::Standard | AuthSelectorContext::Prompt => {
-                self.i18n.t("ssh.form.authentication")
-            }
+            AuthSelectorContext::Standard
+            | AuthSelectorContext::StandaloneSftpSecondary
+            | AuthSelectorContext::Prompt => self.i18n.t("ssh.form.authentication"),
         };
         let choices = Self::auth_family_choices(context);
         let active_index = choices
@@ -1227,6 +1706,245 @@ impl WorkspaceApp {
             .into_any_element()
     }
 
+    pub(super) fn render_standalone_sftp_endpoint_auth(
+        &self,
+        active_tab: SshAuthTab,
+        secondary: bool,
+        key_path: &str,
+        managed_key_id: &str,
+        cert_path: &str,
+        identity_agent: &str,
+        gssapi_enabled: bool,
+        gssapi_server_identity: &str,
+        gssapi_delegate_credentials: bool,
+        gssapi_credentials_available: Option<bool>,
+        agent_available: Option<bool>,
+        saved_credential_present: bool,
+        save_password: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let context = if secondary {
+            AuthSelectorContext::StandaloneSftpSecondary
+        } else {
+            AuthSelectorContext::Standard
+        };
+        let password_field = if secondary {
+            NewConnectionField::StandaloneSftpSecondaryPassword
+        } else {
+            NewConnectionField::Password
+        };
+        let key_path_field = if secondary {
+            NewConnectionField::StandaloneSftpSecondaryKeyPath
+        } else {
+            NewConnectionField::KeyPath
+        };
+        let cert_path_field = if secondary {
+            NewConnectionField::StandaloneSftpSecondaryCertPath
+        } else {
+            NewConnectionField::CertPath
+        };
+        let passphrase_field = if secondary {
+            NewConnectionField::StandaloneSftpSecondaryPassphrase
+        } else {
+            NewConnectionField::Passphrase
+        };
+        let identity_agent_field = if secondary {
+            NewConnectionField::StandaloneSftpSecondaryIdentityAgent
+        } else {
+            NewConnectionField::IdentityAgent
+        };
+        let gssapi_server_identity_field = if secondary {
+            NewConnectionField::StandaloneSftpSecondaryGssapiServerIdentity
+        } else {
+            NewConnectionField::GssapiServerIdentity
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(self.tokens.metrics.modal_section_gap))
+            .child(self.render_connection_checkbox(
+                self.i18n.t("ssh.form.kerberos_preferred"),
+                gssapi_enabled,
+                if secondary {
+                    toggle_secondary_sftp_gssapi
+                } else {
+                    toggle_primary_sftp_gssapi
+                },
+                cx,
+            ))
+            .when(gssapi_enabled, |content| {
+                content
+                    .child(self.render_connection_hint(self.i18n.t("ssh.form.gssapi_desc")))
+                    .child(self.render_connection_field(
+                        self.i18n.t("ssh.form.gssapi_server_identity"),
+                        gssapi_server_identity,
+                        self.i18n.t("ssh.form.gssapi_server_identity_placeholder"),
+                        gssapi_server_identity_field,
+                        false,
+                        cx,
+                    ))
+                    .child(self.render_connection_hint(
+                        self.i18n.t("ssh.form.gssapi_server_identity_hint"),
+                    ))
+                    .child(self.render_kerberos_credentials_status(gssapi_credentials_available))
+                    .child(self.render_connection_checkbox_with_warning(
+                        if secondary {
+                            "secondary-sftp-kerberos-delegation-help"
+                        } else {
+                            "primary-sftp-kerberos-delegation-help"
+                        },
+                        if secondary {
+                            "secondary-sftp-kerberos-delegation-tooltip"
+                        } else {
+                            "primary-sftp-kerberos-delegation-tooltip"
+                        },
+                        "ssh.form.gssapi_delegate_credentials",
+                        "ssh.form.gssapi_delegation_warning",
+                        gssapi_delegate_credentials,
+                        if secondary {
+                            toggle_secondary_sftp_gssapi_delegation
+                        } else {
+                            toggle_primary_sftp_gssapi_delegation
+                        },
+                        cx,
+                    ))
+            })
+            .child(
+                div()
+                    .text_size(px(self.tokens.metrics.ui_text_sm))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(rgb(self.tokens.ui.text))
+                    .child(self.i18n.t("ssh.form.fallback_authentication")),
+            )
+            .child(self.render_auth_selector(active_tab, context, false, cx))
+            .when(active_tab == SshAuthTab::Password, |content| {
+                content
+                    .child(self.render_connection_secret_field(
+                        self.i18n.t("ssh.form.password"),
+                        String::new(),
+                        password_field,
+                        cx,
+                    ))
+                    .when(saved_credential_present, |content| {
+                        content.child(self.render_connection_hint(
+                            self.i18n.t("sessionManager.edit_properties.password_hint"),
+                        ))
+                    })
+                    .when(!saved_credential_present, |content| {
+                        content.child(self.render_connection_checkbox(
+                            self.i18n.t("ssh.form.save_password"),
+                            save_password,
+                            if secondary {
+                                toggle_secondary_sftp_password_persistence
+                            } else {
+                                toggle_primary_sftp_password_persistence
+                            },
+                            cx,
+                        ))
+                    })
+            })
+            .when(active_tab == SshAuthTab::DefaultKey, |content| {
+                content
+                    .child(self.render_connection_hint(self.i18n.t("ssh.form.default_key_desc")))
+                    .child(self.render_connection_secret_field(
+                        self.i18n.t("ssh.form.passphrase"),
+                        self.i18n.t("ssh.form.passphrase_placeholder"),
+                        passphrase_field,
+                        cx,
+                    ))
+            })
+            .when(active_tab == SshAuthTab::SshKey, |content| {
+                content
+                    .child(self.render_connection_field_with_browse(
+                        self.i18n.t("ssh.form.key_file"),
+                        key_path,
+                        "~/.ssh/id_ed25519".to_string(),
+                        key_path_field,
+                        cx,
+                    ))
+                    .child(self.render_connection_secret_field(
+                        self.i18n.t("ssh.form.passphrase"),
+                        self.i18n.t("ssh.form.passphrase_placeholder"),
+                        passphrase_field,
+                        cx,
+                    ))
+            })
+            .when(active_tab == SshAuthTab::ManagedKey, |content| {
+                let managed_key = if secondary {
+                    self.render_standalone_sftp_secondary_managed_key_select(
+                        self.i18n.t("ssh.form.managed_key"),
+                        managed_key_id,
+                        cx,
+                    )
+                } else {
+                    self.render_managed_key_select(
+                        self.i18n.t("ssh.form.managed_key"),
+                        managed_key_id,
+                        false,
+                        cx,
+                    )
+                };
+                content
+                    .child(managed_key)
+                    .child(self.render_connection_secret_field(
+                        self.i18n.t("ssh.form.passphrase"),
+                        self.i18n.t("ssh.form.passphrase_placeholder"),
+                        passphrase_field,
+                        cx,
+                    ))
+                    .child(self.render_connection_hint(self.i18n.t("ssh.form.managed_key_hint")))
+            })
+            .when(active_tab == SshAuthTab::Certificate, |content| {
+                content
+                    .child(self.render_connection_hint(self.i18n.t("ssh.form.certificate_note")))
+                    .child(self.render_connection_field_with_browse(
+                        self.i18n.t("ssh.form.private_key"),
+                        key_path,
+                        "~/.ssh/id_ed25519".to_string(),
+                        key_path_field,
+                        cx,
+                    ))
+                    .child(self.render_connection_field_with_browse(
+                        self.i18n.t("ssh.form.certificate"),
+                        cert_path,
+                        "~/.ssh/id_ed25519-cert.pub".to_string(),
+                        cert_path_field,
+                        cx,
+                    ))
+                    .child(self.render_connection_secret_field(
+                        self.i18n.t("ssh.form.passphrase"),
+                        self.i18n.t("ssh.form.passphrase_placeholder"),
+                        passphrase_field,
+                        cx,
+                    ))
+            })
+            .when(active_tab == SshAuthTab::Agent, |content| {
+                content
+                    .child(self.render_connection_hint(self.i18n.t("ssh.form.agent_desc")))
+                    .child(self.render_connection_field(
+                        self.i18n.t("ssh.form.agent_endpoint"),
+                        identity_agent,
+                        self.i18n.t("ssh.form.agent_endpoint_placeholder"),
+                        identity_agent_field,
+                        false,
+                        cx,
+                    ))
+                    .child(self.render_connection_hint(self.i18n.t("ssh.form.agent_endpoint_hint")))
+                    .child(self.render_agent_status(agent_available))
+            })
+            .when(active_tab == SshAuthTab::TwoFactor, |content| {
+                content
+                    .child(self.render_connection_hint(self.i18n.t("ssh.form.two_factor_desc")))
+                    .child(self.render_connection_hint(self.i18n.t("ssh.form.two_factor_hint")))
+                    .child(self.render_connection_hint_with_color(
+                        self.i18n.t("ssh.form.two_factor_warning"),
+                        self.tokens.ui.warning,
+                    ))
+            })
+            .into_any_element()
+    }
+
     fn auth_family_choices(
         context: AuthSelectorContext,
     ) -> &'static [(SshAuthFamily, &'static str)] {
@@ -1246,7 +1964,7 @@ impl WorkspaceApp {
                 (SshAuthFamily::Key, "ssh.auth.key"),
                 (SshAuthFamily::Agent, "ssh.auth.agent"),
             ],
-            AuthSelectorContext::Standard => &[
+            AuthSelectorContext::Standard | AuthSelectorContext::StandaloneSftpSecondary => &[
                 (SshAuthFamily::Password, "ssh.auth.password"),
                 (SshAuthFamily::Key, "ssh.auth.key"),
                 (SshAuthFamily::Agent, "ssh.auth.agent"),
@@ -1259,6 +1977,9 @@ impl WorkspaceApp {
         match context {
             AuthSelectorContext::Standard => {
                 crate::workspace::selection_motion::NEW_CONNECTION_AUTH_SELECTOR_ID
+            }
+            AuthSelectorContext::StandaloneSftpSecondary => {
+                "standalone-sftp-secondary-auth-selector"
             }
             AuthSelectorContext::EditProperties => {
                 crate::workspace::selection_motion::EDIT_CONNECTION_AUTH_SELECTOR_ID
@@ -1279,7 +2000,9 @@ impl WorkspaceApp {
         context: AuthSelectorContext,
     ) -> &'static [SshKeyAuthSource] {
         match context {
-            AuthSelectorContext::Standard | AuthSelectorContext::Jump => &[
+            AuthSelectorContext::Standard
+            | AuthSelectorContext::StandaloneSftpSecondary
+            | AuthSelectorContext::Jump => &[
                 SshKeyAuthSource::DefaultKey,
                 SshKeyAuthSource::SshKey,
                 SshKeyAuthSource::ManagedKey,
@@ -1345,7 +2068,9 @@ impl WorkspaceApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let source = Self::normalized_key_source_for_context(active_tab, context);
-        let select_id = if jump_form {
+        let select_id = if context == AuthSelectorContext::StandaloneSftpSecondary {
+            NewConnectionSelect::StandaloneSftpSecondaryKeyAuthSource
+        } else if jump_form {
             NewConnectionSelect::JumpKeyAuthSource
         } else {
             NewConnectionSelect::KeyAuthSource
@@ -1393,7 +2118,9 @@ impl WorkspaceApp {
     ) {
         self.update_connection_form_state(cx, |state| {
             if let Some(form) = state.form.as_mut() {
-                let current_tab = if jump_form {
+                let current_tab = if context == AuthSelectorContext::StandaloneSftpSecondary {
+                    form.standalone_sftp_secondary.auth_tab
+                } else if jump_form {
                     form.jump_server_form
                         .as_ref()
                         .map(|jump_form| jump_form.auth_tab)
@@ -1402,14 +2129,20 @@ impl WorkspaceApp {
                     form.auth_tab
                 };
                 let next_tab = Self::auth_tab_for_family_selection(family, current_tab, context);
-                if jump_form {
+                if context == AuthSelectorContext::StandaloneSftpSecondary {
+                    form.standalone_sftp_secondary.auth_tab = next_tab;
+                } else if jump_form {
                     if let Some(jump_form) = form.jump_server_form.as_mut() {
                         jump_form.auth_tab = next_tab;
                     }
                 } else {
                     form.auth_tab = next_tab;
                 }
-                form.focused_field = Self::focus_field_for_auth_tab(next_tab, jump_form);
+                form.focused_field = Self::focus_field_for_auth_tab(
+                    next_tab,
+                    jump_form,
+                    context == AuthSelectorContext::StandaloneSftpSecondary,
+                );
                 form.field_focused = false;
                 clear_connection_selection(form);
                 form.error = None;
@@ -1455,6 +2188,9 @@ impl WorkspaceApp {
             if let Some(form) = state.form.as_mut() {
                 match select_id {
                     NewConnectionSelect::KeyAuthSource => form.auth_tab = tab,
+                    NewConnectionSelect::StandaloneSftpSecondaryKeyAuthSource => {
+                        form.standalone_sftp_secondary.auth_tab = tab;
+                    }
                     NewConnectionSelect::JumpKeyAuthSource => {
                         let Some(jump_form) = form.jump_server_form.as_mut() else {
                             return;
@@ -1466,6 +2202,7 @@ impl WorkspaceApp {
                 form.focused_field = Self::focus_field_for_auth_tab(
                     tab,
                     select_id == NewConnectionSelect::JumpKeyAuthSource,
+                    select_id == NewConnectionSelect::StandaloneSftpSecondaryKeyAuthSource,
                 );
                 form.field_focused = false;
                 clear_connection_selection(form);
@@ -1476,8 +2213,24 @@ impl WorkspaceApp {
         cx.notify();
     }
 
-    fn focus_field_for_auth_tab(tab: SshAuthTab, jump_form: bool) -> NewConnectionField {
-        if jump_form {
+    fn focus_field_for_auth_tab(
+        tab: SshAuthTab,
+        jump_form: bool,
+        standalone_sftp_secondary: bool,
+    ) -> NewConnectionField {
+        if standalone_sftp_secondary {
+            match tab {
+                SshAuthTab::Password => NewConnectionField::StandaloneSftpSecondaryPassword,
+                SshAuthTab::SshKey | SshAuthTab::Certificate => {
+                    NewConnectionField::StandaloneSftpSecondaryKeyPath
+                }
+                SshAuthTab::ManagedKey => NewConnectionField::StandaloneSftpSecondaryManagedKeyId,
+                SshAuthTab::DefaultKey => NewConnectionField::StandaloneSftpSecondaryPassphrase,
+                SshAuthTab::Agent | SshAuthTab::TwoFactor => {
+                    NewConnectionField::StandaloneSftpSecondaryHost
+                }
+            }
+        } else if jump_form {
             match tab {
                 SshAuthTab::Password => NewConnectionField::JumpPassword,
                 SshAuthTab::SshKey | SshAuthTab::Certificate => NewConnectionField::JumpKeyPath,
@@ -1713,48 +2466,54 @@ impl WorkspaceApp {
 
     pub(super) fn render_transport_selector(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = self.tokens.ui;
-        let active_transport = self
+        let (active_transport, advanced_connections_expanded) = self
             .connection_form_state(cx)
             .form
             .as_ref()
-            .map(|form| form.transport)
-            .unwrap_or(NewConnectionTransport::Ssh);
+            .map(|form| (form.transport, form.advanced_connections_expanded))
+            .unwrap_or((NewConnectionTransport::Ssh, false));
         let mut choices = vec![
             (
                 NewConnectionTransport::Ssh,
                 self.i18n.t("modals.new_connection.transport_ssh"),
                 NewConnectionField::Name,
                 LucideIcon::Server,
+                false,
             ),
             (
                 NewConnectionTransport::Mosh,
                 self.i18n.t("modals.new_connection.transport_mosh"),
                 NewConnectionField::Name,
                 LucideIcon::Wifi,
+                false,
             ),
             (
                 NewConnectionTransport::Telnet,
                 self.i18n.t("modals.new_connection.transport_telnet"),
                 NewConnectionField::Host,
                 LucideIcon::Network,
+                false,
             ),
             (
                 NewConnectionTransport::Serial,
                 self.i18n.t("modals.new_connection.transport_serial"),
                 NewConnectionField::SerialPortPath,
                 LucideIcon::Radio,
+                false,
             ),
             (
                 NewConnectionTransport::Rdp,
                 self.i18n.t("modals.new_connection.transport_rdp"),
                 NewConnectionField::Host,
                 LucideIcon::Monitor,
+                false,
             ),
             (
                 NewConnectionTransport::Vnc,
                 self.i18n.t("modals.new_connection.transport_vnc"),
                 NewConnectionField::Host,
                 LucideIcon::Monitor,
+                false,
             ),
         ];
         if cfg!(target_os = "windows") {
@@ -1763,6 +2522,7 @@ impl WorkspaceApp {
                 self.i18n.t("modals.new_connection.transport_wsl_graphics"),
                 NewConnectionField::Name,
                 LucideIcon::AppWindow,
+                false,
             ));
         }
         // Local terminals are one-shot launch targets, so keep them after saved transports.
@@ -1772,9 +2532,19 @@ impl WorkspaceApp {
                 .t("modals.new_connection.transport_local_terminal"),
             NewConnectionField::Name,
             LucideIcon::Terminal,
+            false,
+        ));
+        choices.push((
+            NewConnectionTransport::StandaloneSftp,
+            self.i18n
+                .t("modals.new_connection.transport_standalone_sftp"),
+            NewConnectionField::Name,
+            LucideIcon::FolderSync,
+            true,
         ));
         let mut sidebar = div()
             .w(px(NEW_CONNECTION_TYPE_SIDEBAR_WIDTH))
+            .h_full()
             .flex_none()
             .flex()
             .flex_col()
@@ -1783,7 +2553,52 @@ impl WorkspaceApp {
             .border_color(rgba((theme.border << 8) | 0x80))
             .pr(px(self.tokens.spacing.three));
 
-        for (transport, label, focus_field, icon) in choices {
+        for (transport, label, focus_field, icon, advanced) in choices {
+            if advanced {
+                sidebar = sidebar.child(div().flex_1()).child(
+                    div()
+                        .id("new-connection-advanced-group")
+                        .h(px(NEW_CONNECTION_ADVANCED_GROUP_HEIGHT))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .px(px(self.tokens.spacing.two))
+                        .border_t_1()
+                        .border_color(rgba((theme.border << 8) | 0x80))
+                        .cursor_pointer()
+                        .text_size(px(self.tokens.metrics.ui_text_xs))
+                        .text_color(rgb(theme.text_muted))
+                        .child(self.i18n.t("modals.new_connection.advanced_group"))
+                        .child(self.render_animated_chevron(
+                            (
+                                "new-connection-advanced-group-chevron",
+                                advanced_connections_expanded as usize,
+                            ),
+                            advanced_connections_expanded,
+                            14.0,
+                            rgb(theme.text_muted),
+                        ))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.update_connection_form_state(cx, |state| {
+                                    if let Some(form) = state.form.as_mut() {
+                                        form.advanced_connections_expanded =
+                                            !form.advanced_connections_expanded;
+                                        form.field_focused = false;
+                                        clear_connection_selection(form);
+                                    }
+                                });
+                                cx.stop_propagation();
+                                cx.notify();
+                            }),
+                        ),
+                );
+                if !advanced_connections_expanded {
+                    continue;
+                }
+            }
             let active = active_transport == transport;
             let transport_index = new_connection_transport_index(transport);
             let row_text = if active {
@@ -1881,7 +2696,12 @@ impl WorkspaceApp {
                         let mut selection_offset = None;
                         this.update_connection_form_state(cx, |state| {     if let Some(form) = state.form.as_mut() {
                             let previous_transport = form.transport;
-                            if previous_transport != transport {
+                            if previous_transport != transport
+                                && previous_transport != NewConnectionTransport::StandaloneSftp
+                                && transport != NewConnectionTransport::StandaloneSftp
+                            {
+                                // The advanced group is pinned below a flexible spacer, so its
+                                // absolute row offset cannot use the fixed-list slide animation.
                                 selection_offset = Some(new_connection_transport_vertical_offset(
                                     previous_transport,
                                     transport,
@@ -1919,14 +2739,12 @@ impl WorkspaceApp {
     }
 
     pub(super) fn render_local_terminal_form_branch(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = self.tokens.ui;
         let selected_shell_id = self
             .connection_form_state(cx)
             .form
             .as_ref()
             .and_then(|form| form.local_shell_id.as_deref());
         let resolved_shell = self.resolved_local_shell(selected_shell_id);
-        let resolved_shell_id = resolved_shell.as_ref().map(|shell| shell.id.as_str());
         let default_shell_id = self
             .settings_store
             .settings()
@@ -1934,127 +2752,50 @@ impl WorkspaceApp {
             .default_shell_id
             .as_deref();
         let shells = self.effective_local_shells_for_settings(self.settings_store.settings());
-
-        let mut shell_list = div()
-            .w_full()
-            .rounded(px(self.tokens.radii.md))
-            .border_1()
-            .border_color(rgb(theme.border))
-            .bg(rgb(theme.bg_panel))
-            .flex()
-            .flex_col()
-            .overflow_hidden();
-        for (index, shell) in shells.into_iter().enumerate() {
-            let shell_id = shell.id.clone();
-            let selected = resolved_shell_id == Some(shell.id.as_str());
-            let is_default = default_shell_id == Some(shell.id.as_str());
-            shell_list = shell_list.child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .when(index > 0, |row| {
-                        row.border_t_1().border_color(rgb(theme.border))
-                    })
-                    .bg(if selected {
-                        rgba((theme.accent << 8) | 0x14)
-                    } else {
-                        rgba((theme.bg_panel << 8) | 0x00)
-                    })
-                    .hover(move |row| row.bg(rgb(theme.bg_hover)))
-                    .px(px(self.tokens.spacing.three))
-                    .py(px(10.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(self.tokens.spacing.three))
-                    .cursor_pointer()
-                    .child(Self::render_lucide_icon(
-                        LucideIcon::Terminal,
-                        17.0,
-                        rgb(if selected {
-                            theme.accent
-                        } else {
-                            theme.text_muted
-                        }),
-                    ))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(8.0))
-                                    .text_size(px(self.tokens.metrics.ui_text_sm))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(rgb(theme.text))
-                                    .child(shell.label)
-                                    .when(is_default, |label| {
-                                        label.child(self.text_badge(
-                                            self.i18n.t("settings_view.local_terminal.default"),
-                                            theme.warning,
-                                        ))
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(px(self.tokens.metrics.ui_text_xs))
-                                    .text_color(rgb(theme.text_muted))
-                                    .child(shell.path.display().to_string()),
-                            ),
+        let selected_label = resolved_shell
+            .as_ref()
+            .map(|shell| {
+                if default_shell_id == Some(shell.id.as_str()) {
+                    format!(
+                        "{} · {}",
+                        shell.label,
+                        self.i18n.t("settings_view.local_terminal.default")
                     )
-                    .when(selected, |row| {
-                        row.child(Self::render_lucide_icon(
-                            LucideIcon::Check,
-                            16.0,
-                            rgb(theme.accent),
-                        ))
-                    })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _event, _window, cx| {
-                            this.update_connection_form_state(cx, |state| {
-                                if let Some(form) = state.form.as_mut() {
-                                    form.local_shell_id = Some(shell_id.clone());
-                                    form.field_focused = false;
-                                    clear_connection_selection(form);
-                                    form.error = None;
-                                }
-                            });
-                            cx.stop_propagation();
-                            cx.notify();
-                        }),
-                    ),
-            );
-        }
-
-        div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap(px(self.tokens.spacing.three))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(3.0))
-                    .child(
-                        div()
-                            .text_size(px(self.tokens.metrics.ui_text_sm))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(theme.text_heading))
-                            .child(self.i18n.t("settings_view.local_terminal.select_shell")),
-                    )
-                    .child(self.render_connection_hint(
-                        self.i18n.t("modals.new_connection.local_terminal_detail"),
-                    )),
+                } else {
+                    shell.label.clone()
+                }
+            })
+            .unwrap_or_else(|| self.i18n.t("settings_view.local_terminal.select_shell"));
+        let selected_path = resolved_shell.as_ref().map(|shell| {
+            format!(
+                "{}: {}",
+                self.i18n.t("settings_view.local_terminal.path"),
+                shell.path.display()
             )
-            .child(shell_list)
-            .into_any_element()
+        });
+        let shell_field = div()
+            .flex()
+            .flex_col()
+            .gap(px(self.tokens.spacing.two))
+            .child(form_field(
+                &self.tokens,
+                self.i18n.t("settings_view.local_terminal.select_shell"),
+                self.render_new_connection_select_control(
+                    NewConnectionSelect::LocalShell,
+                    selected_label,
+                    resolved_shell.is_none(),
+                    shells.is_empty(),
+                    cx,
+                ),
+            ))
+            .when_some(selected_path, |field, path| {
+                field.child(self.render_connection_hint(path))
+            })
+            .into_any_element();
+
+        // Match the shared connection form hierarchy while keeping the one-shot
+        // local terminal choice compact and backed by application settings.
+        self.render_connection_form_section(ConnectionFormSection::LocalShell, shell_field, cx)
     }
 
     pub(super) fn render_wsl_graphics_form_branch(&self, _cx: &mut Context<Self>) -> AnyElement {
@@ -2135,16 +2876,6 @@ impl WorkspaceApp {
             .flex()
             .flex_col()
             .gap(px(self.tokens.spacing.three))
-            .pt(px(self.tokens.spacing.two))
-            .border_t_1()
-            .border_color(rgb(self.tokens.ui.border))
-            .child(
-                div()
-                    .text_size(px(self.tokens.metrics.ui_text_sm))
-                    .text_color(rgb(self.tokens.ui.text_heading))
-                    .child(self.i18n.t("mosh.form.advanced")),
-            )
-            .child(self.render_connection_hint(self.i18n.t("mosh.form.capability_hint")))
             .child(self.render_connection_field(
                 self.i18n.t("mosh.form.server_executable"),
                 server_executable,
@@ -2238,6 +2969,7 @@ impl WorkspaceApp {
                         ),
                     )),
             )
+            .child(self.render_ssh_algorithms_navigation_row(cx))
             .into_any_element()
     }
 
@@ -2254,6 +2986,7 @@ impl WorkspaceApp {
             keeps_saved_password,
             save_password,
             group,
+            notes,
             ssh_gateway_connection_id,
         )) = self.connection_form_state(cx).form.as_ref().map(|form| {
             (
@@ -2265,6 +2998,7 @@ impl WorkspaceApp {
                     && form.saved_password_keychain_id.is_some(),
                 form.save_password,
                 form.group.clone(),
+                form.notes.clone(),
                 form.remote_desktop_ssh_gateway_connection_id.clone(),
             )
         })
@@ -2279,8 +3013,7 @@ impl WorkspaceApp {
             !port.trim().is_empty() && !port.trim().parse::<u16>().is_ok_and(|port| port > 0);
         let capabilities =
             oxideterm_remote_desktop::builtin_provider_manifest(protocol).capabilities;
-
-        div()
+        let basic = div()
             .flex()
             .flex_col()
             .gap(px(self.tokens.metrics.modal_section_gap))
@@ -2292,6 +3025,8 @@ impl WorkspaceApp {
                 false,
                 cx,
             ))
+            .child(self.render_connection_group_select(self.i18n.t("ssh.form.group"), &group, cx))
+            .child(self.render_connection_notes_fields(&notes, cx))
             .child(
                 div()
                     .flex()
@@ -2325,6 +3060,11 @@ impl WorkspaceApp {
                     ),
                 )
             })
+            .into_any_element();
+        let authentication = div()
+            .flex()
+            .flex_col()
+            .gap(px(self.tokens.metrics.modal_section_gap))
             .when(
                 protocol == oxideterm_remote_desktop::RemoteDesktopProtocol::Rdp,
                 |section| {
@@ -2358,51 +3098,56 @@ impl WorkspaceApp {
                 |form| form.save_password = !form.save_password,
                 cx,
             ))
-            .child(self.render_connection_group_select(self.i18n.t("ssh.form.group"), &group, cx))
-            .child(
-                self.render_remote_desktop_ssh_gateway_select(
+            .into_any_element();
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(self.tokens.metrics.modal_section_gap))
+            .child(self.render_connection_form_section(ConnectionFormSection::Basic, basic, cx))
+            .child(self.render_connection_form_section(
+                ConnectionFormSection::Authentication,
+                authentication,
+                cx,
+            ))
+            .child({
+                let gateway = self.render_remote_desktop_ssh_gateway_select(
                     ssh_gateway_connection_id.as_deref(),
                     cx,
-                ),
-            )
-            .child(
-                self.render_connection_hint(
-                    self.i18n
-                        .t("modals.new_connection.remote_desktop_ssh_gateway_hint"),
-                ),
-            )
+                );
+                self.render_connection_form_section(
+                    ConnectionFormSection::RemoteGateway,
+                    gateway,
+                    cx,
+                )
+            })
             .when(
                 protocol == oxideterm_remote_desktop::RemoteDesktopProtocol::Vnc,
-                |section| section.child(self.render_vnc_connection_preferences(cx)),
+                |section| {
+                    let preferences = self.render_vnc_connection_preferences(cx);
+                    section.child(self.render_connection_form_section(
+                        ConnectionFormSection::VncPreferences,
+                        preferences,
+                        cx,
+                    ))
+                },
             )
-            .child(self.render_remote_desktop_features(&capabilities, cx))
+            .child({
+                let features = self.render_remote_desktop_features(protocol, &capabilities, cx);
+                self.render_connection_form_section(
+                    ConnectionFormSection::RemoteFeatures,
+                    features,
+                    cx,
+                )
+            })
             .into_any_element()
     }
 
     fn render_vnc_connection_preferences(&self, cx: &mut Context<Self>) -> AnyElement {
         div()
-            .pt(px(self.tokens.spacing.one))
-            .border_t_1()
-            .border_color(rgb(self.tokens.ui.border))
             .flex()
             .flex_col()
             .gap(px(self.tokens.spacing.three))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(self.tokens.spacing.one))
-                    .child(
-                        div()
-                            .text_size(px(self.tokens.metrics.ui_text_sm))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(rgb(self.tokens.ui.text))
-                            .child(self.i18n.t("modals.new_connection.vnc_preferences_title")),
-                    )
-                    .child(self.render_connection_hint(
-                        self.i18n.t("modals.new_connection.vnc_preferences_hint"),
-                    )),
-            )
             .child(self.render_vnc_preference_group(
                 "modals.new_connection.vnc_security_policy",
                 "modals.new_connection.vnc_security_policy_hint",
@@ -2489,38 +3234,14 @@ impl WorkspaceApp {
 
     fn render_remote_desktop_features(
         &self,
+        protocol: oxideterm_remote_desktop::RemoteDesktopProtocol,
         capabilities: &oxideterm_remote_desktop::RemoteDesktopProviderCapabilities,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         div()
-            .pt(px(self.tokens.spacing.one))
-            .border_t_1()
-            .border_color(rgb(self.tokens.ui.border))
             .flex()
             .flex_col()
             .gap(px(self.tokens.spacing.three))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(self.tokens.spacing.one))
-                    .child(
-                        div()
-                            .text_size(px(self.tokens.metrics.ui_text_sm))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(rgb(self.tokens.ui.text))
-                            .child(
-                                self.i18n
-                                    .t("modals.new_connection.remote_desktop_features_title"),
-                            ),
-                    )
-                    .child(
-                        self.render_connection_hint(
-                            self.i18n
-                                .t("modals.new_connection.remote_desktop_features_hint"),
-                        ),
-                    ),
-            )
             .child(self.render_remote_desktop_feature_group(
                 "modals.new_connection.remote_desktop_clipboard_group",
                 REMOTE_DESKTOP_CLIPBOARD_FEATURES,
@@ -2539,6 +3260,17 @@ impl WorkspaceApp {
                 capabilities,
                 cx,
             ))
+            .when(
+                protocol == oxideterm_remote_desktop::RemoteDesktopProtocol::Rdp,
+                |features| {
+                    features.child(self.render_remote_desktop_feature_group(
+                        "modals.new_connection.remote_desktop_compatibility_group",
+                        RDP_COMPATIBILITY_FEATURES,
+                        capabilities,
+                        cx,
+                    ))
+                },
+            )
             .into_any_element()
     }
 
@@ -2549,6 +3281,19 @@ impl WorkspaceApp {
         capabilities: &oxideterm_remote_desktop::RemoteDesktopProviderCapabilities,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let feature_grid = div()
+            .grid()
+            .grid_cols(remote_desktop_feature_columns(features.len()))
+            .gap(px(self.tokens.spacing.two))
+            .children(features.iter().map(|(feature, label_key, hint_key)| {
+                self.render_remote_desktop_feature_row(
+                    self.i18n.t(label_key),
+                    self.i18n.t(hint_key),
+                    remote_desktop_feature_supported(capabilities, *feature),
+                    *feature,
+                    cx,
+                )
+            }));
         div()
             .flex()
             .flex_col()
@@ -2560,15 +3305,7 @@ impl WorkspaceApp {
                     .text_color(rgb(self.tokens.ui.text_muted))
                     .child(self.i18n.t(title_key)),
             )
-            .children(features.iter().map(|(feature, label_key, hint_key)| {
-                self.render_remote_desktop_feature_row(
-                    self.i18n.t(label_key),
-                    self.i18n.t(hint_key),
-                    remote_desktop_feature_supported(capabilities, *feature),
-                    *feature,
-                    cx,
-                )
-            }))
+            .child(feature_grid)
             .into_any_element()
     }
 
@@ -2602,6 +3339,7 @@ impl WorkspaceApp {
         };
 
         div()
+            .min_w_0()
             .flex()
             .flex_col()
             .gap(px(self.tokens.spacing.one))
@@ -2636,6 +3374,7 @@ impl WorkspaceApp {
             )
             .child(
                 div()
+                    .min_w_0()
                     .pl(px(
                         self.tokens.metrics.ui_checkbox_size + self.tokens.spacing.two
                     ))
@@ -2651,46 +3390,35 @@ impl WorkspaceApp {
     }
 
     pub(super) fn render_telnet_form_branch(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some((host, port, profile_name)) =
+        let Some((host, port, profile_name, notes)) =
             self.connection_form_state(cx).form.as_ref().map(|form| {
                 (
                     form.host.clone(),
                     form.port.clone(),
                     form.telnet_profile_name.clone(),
+                    form.notes.clone(),
                 )
             })
         else {
             return div().into_any_element();
         };
         let telnet_port_invalid = !port.trim().is_empty() && port.trim().parse::<u16>().is_err();
-        div()
+        let basic = div()
             .flex()
             .flex_col()
             .gap(px(self.tokens.metrics.modal_section_gap))
             .child(
-                div()
-                    .rounded(px(self.tokens.radii.lg))
-                    .border_1()
-                    .border_color(rgb(self.tokens.ui.border))
-                    .bg(rgba(
-                        (self.tokens.ui.bg << 8) | TAURI_CONNECTION_PANEL_BG_ALPHA,
-                    ))
-                    .p(px(self.tokens.spacing.three))
-                    .child(
-                        div()
-                            .text_size(px(self.tokens.metrics.ui_text_sm))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(rgb(self.tokens.ui.text))
-                            .child(self.i18n.t("modals.new_connection.telnet_section_title")),
-                    )
-                    .child(
-                        div()
-                            .mt(px(self.tokens.spacing.one))
-                            .text_size(px(self.tokens.metrics.ui_text_xs))
-                            .text_color(rgb(self.tokens.ui.text_muted))
-                            .child(self.i18n.t("modals.new_connection.telnet_connect_hint")),
-                    ),
+                self.render_connection_field(
+                    self.i18n.t("modals.new_connection.telnet_profile_name"),
+                    &profile_name,
+                    self.i18n
+                        .t("modals.new_connection.telnet_profile_name_placeholder"),
+                    NewConnectionField::TelnetProfileName,
+                    false,
+                    cx,
+                ),
             )
+            .child(self.render_connection_notes_fields(&notes, cx))
             .child(
                 div()
                     .flex()
@@ -2721,18 +3449,17 @@ impl WorkspaceApp {
                     self.tokens.ui.error,
                 ))
             })
-            .child(
-                self.render_connection_field(
-                    self.i18n.t("modals.new_connection.telnet_profile_name"),
-                    &profile_name,
-                    self.i18n
-                        .t("modals.new_connection.telnet_profile_name_placeholder"),
-                    NewConnectionField::TelnetProfileName,
-                    false,
-                    cx,
-                ),
-            )
-            .child(self.render_connection_terminal_options(cx))
+            .into_any_element();
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(self.tokens.metrics.modal_section_gap))
+            .child(self.render_connection_form_section(ConnectionFormSection::Basic, basic, cx))
+            .child(self.render_connection_form_section(
+                ConnectionFormSection::Terminal,
+                self.render_connection_terminal_options(cx),
+                cx,
+            ))
             .into_any_element()
     }
 
@@ -2772,51 +3499,36 @@ impl WorkspaceApp {
     }
 
     pub(super) fn render_serial_form_branch(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some((ports, baud_rate, data_bits, stop_bits, parity, flow_control, profile_name)) =
-            self.connection_form_state(cx).form.as_ref().map(|form| {
-                (
-                    form.serial_ports.clone(),
-                    form.serial_baud_rate.clone(),
-                    form.serial_data_bits,
-                    form.serial_stop_bits,
-                    form.serial_parity,
-                    form.serial_flow_control,
-                    form.serial_profile_name.clone(),
-                )
-            })
+        let Some((
+            ports,
+            baud_rate,
+            data_bits,
+            stop_bits,
+            parity,
+            flow_control,
+            profile_name,
+            notes,
+        )) = self.connection_form_state(cx).form.as_ref().map(|form| {
+            (
+                form.serial_ports.clone(),
+                form.serial_baud_rate.clone(),
+                form.serial_data_bits,
+                form.serial_stop_bits,
+                form.serial_parity,
+                form.serial_flow_control,
+                form.serial_profile_name.clone(),
+                form.notes.clone(),
+            )
+        })
         else {
             return div().into_any_element();
         };
         let serial_baud_rate_invalid = !baud_rate.trim().is_empty()
             && !baud_rate.trim().parse::<u32>().is_ok_and(|baud| baud > 0);
-        div()
+        let parameters = div()
             .flex()
             .flex_col()
             .gap(px(self.tokens.metrics.modal_section_gap))
-            .child(
-                div()
-                    .rounded(px(self.tokens.radii.lg))
-                    .border_1()
-                    .border_color(rgb(self.tokens.ui.border))
-                    .bg(rgba(
-                        (self.tokens.ui.bg << 8) | TAURI_CONNECTION_PANEL_BG_ALPHA,
-                    ))
-                    .p(px(self.tokens.spacing.three))
-                    .child(
-                        div()
-                            .text_size(px(self.tokens.metrics.ui_text_sm))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(rgb(self.tokens.ui.text))
-                            .child(self.i18n.t("modals.new_connection.serial_section_title")),
-                    )
-                    .child(
-                        div()
-                            .mt(px(self.tokens.spacing.one))
-                            .text_size(px(self.tokens.metrics.ui_text_xs))
-                            .text_color(rgb(self.tokens.ui.text_muted))
-                            .child(self.i18n.t("modals.new_connection.serial_connect_hint")),
-                    ),
-            )
             .child(self.render_serial_port_field(&ports, cx))
             .child(
                 div()
@@ -2869,6 +3581,11 @@ impl WorkspaceApp {
                     .child(self.render_serial_parity_select(parity, cx))
                     .child(self.render_serial_flow_select(flow_control, cx)),
             )
+            .into_any_element();
+        let basic = div()
+            .flex()
+            .flex_col()
+            .gap(px(self.tokens.metrics.modal_section_gap))
             .child(
                 self.render_connection_field(
                     self.i18n.t("modals.new_connection.serial_profile_name"),
@@ -2880,6 +3597,18 @@ impl WorkspaceApp {
                     cx,
                 ),
             )
+            .child(self.render_connection_notes_fields(&notes, cx))
+            .into_any_element();
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(self.tokens.metrics.modal_section_gap))
+            .child(self.render_connection_form_section(ConnectionFormSection::Basic, basic, cx))
+            .child(self.render_connection_form_section(
+                ConnectionFormSection::SerialParameters,
+                parameters,
+                cx,
+            ))
             .into_any_element()
     }
 
@@ -3016,24 +3745,144 @@ impl WorkspaceApp {
         self.track_new_connection_select_anchor(select_id, trigger, cx)
     }
 
+    pub(super) fn render_connection_checkbox_with_help(
+        &self,
+        trigger_id: &'static str,
+        tooltip_id: &'static str,
+        label_key: &'static str,
+        hint_key: &'static str,
+        checked: bool,
+        toggle: fn(&mut NewConnectionForm),
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // Advanced SSH toggles keep their explanation available without
+        // adding permanent helper copy to an already dense form section.
+        div()
+            .flex()
+            .items_center()
+            .gap(px(self.tokens.spacing.two))
+            .child(self.render_connection_checkbox(self.i18n.t(label_key), checked, toggle, cx))
+            .child(self.render_connection_help_icon(trigger_id, tooltip_id, hint_key, cx))
+            .into_any_element()
+    }
+
+    pub(super) fn render_connection_checkbox_with_warning(
+        &self,
+        trigger_id: &'static str,
+        tooltip_id: &'static str,
+        label_key: &'static str,
+        hint_key: &'static str,
+        checked: bool,
+        toggle: fn(&mut NewConnectionForm),
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .flex()
+            .items_center()
+            .gap(px(self.tokens.spacing.two))
+            .child(self.render_connection_checkbox(self.i18n.t(label_key), checked, toggle, cx))
+            .child(self.render_connection_help_icon_with_icon(
+                trigger_id,
+                tooltip_id,
+                hint_key,
+                LucideIcon::AlertCircle,
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    fn render_connection_label_with_help(
+        &self,
+        trigger_id: &'static str,
+        tooltip_id: &'static str,
+        label_key: &'static str,
+        hint_key: &'static str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .flex()
+            .items_center()
+            .gap(px(self.tokens.spacing.two))
+            .child(self.i18n.t(label_key))
+            .child(self.render_connection_help_icon(trigger_id, tooltip_id, hint_key, cx))
+            .into_any_element()
+    }
+
+    fn render_connection_help_icon(
+        &self,
+        trigger_id: &'static str,
+        tooltip_id: &'static str,
+        hint_key: &'static str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.render_connection_help_icon_with_icon(
+            trigger_id,
+            tooltip_id,
+            hint_key,
+            LucideIcon::Info,
+            cx,
+        )
+    }
+
+    fn render_connection_help_icon_with_icon(
+        &self,
+        trigger_id: &'static str,
+        tooltip_id: &'static str,
+        hint_key: &'static str,
+        icon: LucideIcon,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // All advanced SSH explanations share one existing tooltip interaction
+        // so dense forms do not alternate between inline and hidden help text.
+        div()
+            .id(trigger_id)
+            .size(px(18.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .child(Self::render_lucide_icon(
+                icon,
+                14.0,
+                rgb(self.tokens.ui.warning),
+            ))
+            .on_mouse_move(
+                cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
+                    this.queue_workspace_tooltip(
+                        tooltip_id,
+                        this.i18n.t(hint_key),
+                        f32::from(event.position.x) + 12.0,
+                        f32::from(event.position.y) + 16.0,
+                        cx,
+                    );
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _event, _window, cx| {
+                    this.clear_workspace_tooltip(tooltip_id, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                if !*hovered {
+                    // Tooltip content is portalled, so the trigger clears ownership.
+                    this.clear_workspace_tooltip(tooltip_id, cx);
+                }
+            }))
+            .into_any_element()
+    }
+
     pub(super) fn render_connection_terminal_options(&self, cx: &mut Context<Self>) -> AnyElement {
         // Saved host controls are optional overrides so application defaults
         // continue to govern legacy records and temporary local terminals.
-        let Some((
-            terminal,
-            dedicated_new_terminal_connection,
-            x11_forwarding,
-            connect_timeout_seconds,
-            transport,
-        )) = self.connection_form_state(cx).form.as_ref().map(|form| {
-            (
-                form.terminal,
-                form.dedicated_new_terminal_connection,
-                form.x11_forwarding,
-                form.connect_timeout_seconds,
-                form.transport,
-            )
-        })
+        let Some((terminal, dedicated_new_terminal_connection)) =
+            self.connection_form_state(cx).form.as_ref().map(|form| {
+                (
+                    form.terminal.clone(),
+                    form.dedicated_new_terminal_connection,
+                )
+            })
         else {
             return div().into_any_element();
         };
@@ -3042,6 +3891,17 @@ impl WorkspaceApp {
         let default_backspace =
             terminal_backspace_sequence_label(application_defaults.backspace_sequence);
         let default_delete = terminal_delete_sequence_label(application_defaults.delete_sequence);
+        let default_scheme = application_defaults
+            .active_custom_semantic_scheme()
+            .map(|scheme| scheme.name.clone())
+            .unwrap_or_else(|| match application_defaults.semantic_scheme {
+                oxideterm_settings::TerminalSemanticScheme::Balanced => self
+                    .i18n
+                    .t("settings_view.terminal.highlight_rules.semantic_scheme_balanced"),
+                oxideterm_settings::TerminalSemanticScheme::Conservative => self
+                    .i18n
+                    .t("settings_view.terminal.highlight_rules.semantic_scheme_conservative"),
+            });
         let inherited_label = |value: &str| {
             self.i18n
                 .t("ssh.form.terminal_use_application_default")
@@ -3062,71 +3922,61 @@ impl WorkspaceApp {
             .map(connection_terminal_delete_sequence_label)
             .map(str::to_string)
             .unwrap_or_else(|| inherited_label(default_delete));
+        let scheme_label = terminal
+            .semantic_scheme
+            .as_deref()
+            .map(|id| match id {
+                "balanced" => self
+                    .i18n
+                    .t("settings_view.terminal.highlight_rules.semantic_scheme_balanced"),
+                "conservative" => self
+                    .i18n
+                    .t("settings_view.terminal.highlight_rules.semantic_scheme_conservative"),
+                custom_id => application_defaults
+                    .custom_semantic_schemes
+                    .iter()
+                    .find(|scheme| scheme.id == custom_id)
+                    .map(|scheme| scheme.name.clone())
+                    .unwrap_or_else(|| custom_id.to_string()),
+            })
+            .unwrap_or_else(|| inherited_label(&default_scheme));
+        let default_highlight_rule_set = application_defaults
+            .default_highlight_rule_set_name()
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                self.i18n
+                    .t("settings_view.terminal.highlight_rules.rule_set_global_base")
+            });
+        let highlight_rule_set_label = terminal
+            .highlight_rule_set
+            .as_deref()
+            .and_then(|id| application_defaults.highlight_rule_set(id))
+            .map(|rule_set| rule_set.name.clone())
+            .unwrap_or_else(|| inherited_label(&default_highlight_rule_set));
+        let inherited_session_log_policy_label = if application_defaults.session_log.automatic {
+            self.i18n.t("ssh.form.terminal_session_log_automatic")
+        } else {
+            self.i18n.t("ssh.form.terminal_session_log_manual")
+        };
+        let session_log_policy_label = match terminal.session_log_policy {
+            ConnectionTerminalSessionLogPolicy::Inherit => {
+                inherited_label(&inherited_session_log_policy_label)
+            }
+            ConnectionTerminalSessionLogPolicy::Automatic => {
+                self.i18n.t("ssh.form.terminal_session_log_automatic")
+            }
+            ConnectionTerminalSessionLogPolicy::Manual => {
+                self.i18n.t("ssh.form.terminal_session_log_manual")
+            }
+            ConnectionTerminalSessionLogPolicy::Disabled => {
+                self.i18n.t("ssh.form.terminal_session_log_disabled")
+            }
+        };
 
         div()
             .flex()
             .flex_col()
             .gap(px(self.tokens.spacing.three))
-            .border_t_1()
-            .border_color(rgb(self.tokens.ui.border))
-            .pt(px(self.tokens.spacing.three))
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_baseline()
-                    .gap(px(self.tokens.spacing.two))
-                    .child(
-                        div()
-                            .text_size(px(self.tokens.metrics.ui_text_sm))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(rgb(self.tokens.ui.text))
-                            .child(self.i18n.t("ssh.form.terminal_options")),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(self.tokens.metrics.ui_text_xs))
-                            .text_color(rgb(self.tokens.ui.text_muted))
-                            .child(self.i18n.t("ssh.form.terminal_options_hint")),
-                    ),
-            )
-            .when(transport == NewConnectionTransport::Ssh, |section| {
-                let mut timeout_options = SSH_CONNECT_TIMEOUT_OPTIONS_SECONDS.to_vec();
-                if !timeout_options.contains(&connect_timeout_seconds) {
-                    timeout_options.push(connect_timeout_seconds);
-                    timeout_options.sort_unstable();
-                }
-                let timeout_tabs = timeout_options.into_iter().map(|seconds| {
-                    segmented_tab(
-                        &self.tokens,
-                        self.i18n
-                            .t("ssh.form.connect_timeout_value")
-                            .replace("{{seconds}}", &seconds.to_string()),
-                        connect_timeout_seconds == seconds,
-                    )
-                    .id(SharedString::from(format!("ssh-connect-timeout-{seconds}")))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _event, _window, cx| {
-                            this.update_connection_form_state(cx, |state| {
-                                if let Some(form) = state.form.as_mut() {
-                                    form.connect_timeout_seconds = seconds;
-                                }
-                            });
-                            cx.notify();
-                        }),
-                    )
-                });
-                section
-                    .child(form_field(
-                        &self.tokens,
-                        self.i18n.t("ssh.form.connect_timeout"),
-                        segmented_tabs(&self.tokens).children(timeout_tabs),
-                    ))
-                    .child(
-                        self.render_connection_hint(self.i18n.t("ssh.form.connect_timeout_hint")),
-                    )
-            })
             .child(
                 div()
                     .flex()
@@ -3180,144 +4030,297 @@ impl WorkspaceApp {
                                     cx,
                                 ),
                             )),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(self.tokens.spacing.one))
-                    .child(self.render_connection_checkbox(
-                        self.i18n.t("ssh.form.dedicated_new_terminal_connection"),
-                        dedicated_new_terminal_connection,
-                        |form| {
-                            form.dedicated_new_terminal_connection =
-                                !form.dedicated_new_terminal_connection;
-                        },
-                        cx,
-                    ))
+                    )
                     .child(
                         div()
-                            .pl(px(self.tokens.spacing.three))
-                            .text_size(px(self.tokens.metrics.ui_text_xs))
-                            .text_color(rgb(self.tokens.ui.text_muted))
-                            .child(
+                            .flex_1()
+                            .min_w(px(CONNECTION_TERMINAL_CONTROL_MIN_WIDTH))
+                            .child(form_field(
+                                &self.tokens,
                                 self.i18n
-                                    .t("ssh.form.dedicated_new_terminal_connection_hint"),
-                            ),
+                                    .t("settings_view.terminal.highlight_rules.semantic_scheme"),
+                                self.render_new_connection_select_control(
+                                    NewConnectionSelect::TerminalSemanticScheme,
+                                    scheme_label,
+                                    false,
+                                    false,
+                                    cx,
+                                ),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(CONNECTION_TERMINAL_CONTROL_MIN_WIDTH))
+                            .child(form_field(
+                                &self.tokens,
+                                self.i18n
+                                    .t("settings_view.terminal.highlight_rules.rule_set"),
+                                self.render_new_connection_select_control(
+                                    NewConnectionSelect::TerminalHighlightRuleSet,
+                                    highlight_rule_set_label,
+                                    false,
+                                    false,
+                                    cx,
+                                ),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(CONNECTION_TERMINAL_CONTROL_MIN_WIDTH))
+                            .child(form_field(
+                                &self.tokens,
+                                self.i18n.t("ssh.form.terminal_session_log"),
+                                self.render_new_connection_select_control(
+                                    NewConnectionSelect::TerminalSessionLogPolicy,
+                                    session_log_policy_label,
+                                    false,
+                                    false,
+                                    cx,
+                                ),
+                            )),
                     ),
             )
-            .when(transport == NewConnectionTransport::Ssh, |section| {
-                section.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(self.tokens.spacing.two))
-                        .pt(px(self.tokens.spacing.two))
-                        .border_t_1()
-                        .border_color(rgb(self.tokens.ui.border))
-                        .child(self.render_connection_checkbox(
-                            self.i18n.t("ssh.form.x11_forwarding"),
-                            x11_forwarding.enabled,
-                            |form| form.x11_forwarding.enabled = !form.x11_forwarding.enabled,
-                            cx,
-                        ))
-                        .child(
-                            self.render_connection_hint(
-                                self.i18n.t("ssh.form.x11_forwarding_hint"),
-                            ),
-                        )
-                        .when(x11_forwarding.enabled, |content| {
-                            let mode_options = [
-                                (
-                                    ConnectionX11ForwardingMode::Untrusted,
-                                    "ssh.form.x11_mode_untrusted",
-                                ),
-                                (
-                                    ConnectionX11ForwardingMode::Trusted,
-                                    "ssh.form.x11_mode_trusted",
-                                ),
-                            ]
-                            .into_iter()
-                            .enumerate()
-                            .map(|(index, (mode, label_key))| {
-                                segmented_tab(
-                                    &self.tokens,
-                                    self.i18n.t(label_key),
-                                    x11_forwarding.mode == mode,
-                                )
-                                .id(SharedString::from(format!("x11-mode-{index}")))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _event, _window, cx| {
-                                        this.update_connection_form_state(cx, |state| {
-                                            if let Some(form) = state.form.as_mut() {
-                                                form.x11_forwarding.mode = mode;
-                                            }
-                                        });
-                                        cx.notify();
-                                    }),
-                                )
-                            });
-                            content
-                                .child(form_field(
-                                    &self.tokens,
-                                    self.i18n.t("ssh.form.x11_mode"),
-                                    segmented_tabs(&self.tokens).children(mode_options),
-                                ))
-                                .child(
-                                    self.render_connection_hint(
-                                        self.i18n.t("ssh.form.x11_mode_hint"),
-                                    ),
-                                )
-                        })
-                        .when(
-                            x11_forwarding.enabled
-                                && x11_forwarding.mode == ConnectionX11ForwardingMode::Untrusted,
-                            |content| {
-                                let timeout_options = [
-                                    (300u32, "ssh.form.x11_timeout_5_minutes"),
-                                    (1_200u32, "ssh.form.x11_timeout_20_minutes"),
-                                    (3_600u32, "ssh.form.x11_timeout_1_hour"),
-                                    (0u32, "ssh.form.x11_timeout_none"),
-                                ]
-                                .into_iter()
-                                .enumerate()
-                                .map(
-                                    |(index, (seconds, label_key))| {
-                                        segmented_tab(
-                                            &self.tokens,
-                                            self.i18n.t(label_key),
-                                            x11_forwarding.untrusted_timeout_seconds == seconds,
-                                        )
-                                        .id(SharedString::from(format!("x11-timeout-{index}")))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _event, _window, cx| {
-                                                this.update_connection_form_state(cx, |state| {
-                                                    if let Some(form) = state.form.as_mut() {
-                                                        form.x11_forwarding
-                                                            .untrusted_timeout_seconds = seconds;
-                                                    }
-                                                });
-                                                cx.notify();
-                                            }),
-                                        )
-                                    },
-                                );
-                                content
-                                    .child(form_field(
-                                        &self.tokens,
-                                        self.i18n.t("ssh.form.x11_timeout"),
-                                        segmented_tabs(&self.tokens).children(timeout_options),
-                                    ))
-                                    .child(self.render_connection_hint(
-                                        self.i18n.t("ssh.form.x11_timeout_hint"),
-                                    ))
-                            },
-                        ),
+            .child(self.render_connection_checkbox_with_help(
+                "new-connection-dedicated-terminal-help",
+                "new-connection-dedicated-terminal",
+                "ssh.form.dedicated_new_terminal_connection",
+                "ssh.form.dedicated_new_terminal_connection_hint",
+                dedicated_new_terminal_connection,
+                |form| {
+                    form.dedicated_new_terminal_connection =
+                        !form.dedicated_new_terminal_connection;
+                },
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    pub(super) fn render_connection_ssh_options(
+        &self,
+        agent_forwarding: bool,
+        legacy_ssh_compatibility: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some((connect_timeout_seconds_text, x11_forwarding)) =
+            self.connection_form_state(cx).form.as_ref().map(|form| {
+                (
+                    form.connect_timeout_seconds_text.clone(),
+                    form.x11_forwarding,
                 )
             })
+        else {
+            return div().into_any_element();
+        };
+        let x11_mode_options = [
+            (
+                ConnectionX11ForwardingMode::Untrusted,
+                "ssh.form.x11_mode_untrusted",
+            ),
+            (
+                ConnectionX11ForwardingMode::Trusted,
+                "ssh.form.x11_mode_trusted",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (mode, label_key))| {
+            segmented_tab(
+                &self.tokens,
+                self.i18n.t(label_key),
+                x11_forwarding.mode == mode,
+            )
+            .id(SharedString::from(format!("x11-mode-{index}")))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _event, _window, cx| {
+                    this.update_connection_form_state(cx, |state| {
+                        if let Some(form) = state.form.as_mut() {
+                            form.x11_forwarding.mode = mode;
+                        }
+                    });
+                    cx.notify();
+                }),
+            )
+        })
+        .collect::<Vec<_>>();
+        let x11_timeout_options = [
+            (300u32, "ssh.form.x11_timeout_5_minutes"),
+            (1_200u32, "ssh.form.x11_timeout_20_minutes"),
+            (3_600u32, "ssh.form.x11_timeout_1_hour"),
+            (0u32, "ssh.form.x11_timeout_none"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (seconds, label_key))| {
+            segmented_tab(
+                &self.tokens,
+                self.i18n.t(label_key),
+                x11_forwarding.untrusted_timeout_seconds == seconds,
+            )
+            .id(SharedString::from(format!("x11-timeout-{index}")))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _event, _window, cx| {
+                    this.update_connection_form_state(cx, |state| {
+                        if let Some(form) = state.form.as_mut() {
+                            form.x11_forwarding.untrusted_timeout_seconds = seconds;
+                        }
+                    });
+                    cx.notify();
+                }),
+            )
+        })
+        .collect::<Vec<_>>();
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(self.tokens.spacing.three))
+            .child(form_field(
+                &self.tokens,
+                self.render_connection_label_with_help(
+                    "new-connection-connect-timeout-help",
+                    "new-connection-connect-timeout",
+                    "ssh.form.connect_timeout",
+                    "ssh.form.connect_timeout_hint",
+                    cx,
+                ),
+                self.render_connection_input(
+                    &connect_timeout_seconds_text,
+                    oxideterm_connections::DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS.to_string(),
+                    NewConnectionField::ConnectTimeoutSeconds,
+                    false,
+                    cx,
+                ),
+            ))
+            .child(self.render_connection_checkbox_with_help(
+                "new-connection-agent-forwarding-help",
+                "new-connection-agent-forwarding",
+                "ssh.form.agent_forwarding",
+                "ssh.form.agent_forwarding_hint",
+                agent_forwarding,
+                |form| form.agent_forwarding = !form.agent_forwarding,
+                cx,
+            ))
+            .child(self.render_connection_checkbox_with_help(
+                "new-connection-x11-forwarding-help",
+                "new-connection-x11-forwarding",
+                "ssh.form.x11_forwarding",
+                "ssh.form.x11_forwarding_hint",
+                x11_forwarding.enabled,
+                |form| form.x11_forwarding.enabled = !form.x11_forwarding.enabled,
+                cx,
+            ))
+            .when(x11_forwarding.enabled, |content| {
+                content.child(form_field(
+                    &self.tokens,
+                    self.render_connection_label_with_help(
+                        "new-connection-x11-mode-help",
+                        "new-connection-x11-mode",
+                        "ssh.form.x11_mode",
+                        "ssh.form.x11_mode_hint",
+                        cx,
+                    ),
+                    segmented_tabs(&self.tokens).children(x11_mode_options),
+                ))
+            })
+            .when(
+                x11_forwarding.enabled
+                    && x11_forwarding.mode == ConnectionX11ForwardingMode::Untrusted,
+                |content| {
+                    content.child(form_field(
+                        &self.tokens,
+                        self.render_connection_label_with_help(
+                            "new-connection-x11-timeout-help",
+                            "new-connection-x11-timeout",
+                            "ssh.form.x11_timeout",
+                            "ssh.form.x11_timeout_hint",
+                            cx,
+                        ),
+                        segmented_tabs(&self.tokens).children(x11_timeout_options),
+                    ))
+                },
+            )
+            .child(self.render_connection_checkbox_with_help(
+                "new-connection-legacy-ssh-compatibility-help",
+                "new-connection-legacy-ssh-compatibility",
+                "ssh.form.legacy_ssh_compatibility",
+                "ssh.form.legacy_ssh_compatibility_hint",
+                legacy_ssh_compatibility,
+                |form| form.legacy_ssh_compatibility = !form.legacy_ssh_compatibility,
+                cx,
+            ))
+            .child(self.render_ssh_algorithms_navigation_row(cx))
+            .into_any_element()
+    }
+
+    pub(super) fn render_standalone_sftp_options(
+        &self,
+        initial_remote_path: &str,
+        connect_timeout_seconds_text: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.render_standalone_sftp_endpoint_options(
+            initial_remote_path,
+            connect_timeout_seconds_text,
+            false,
+            cx,
+        )
+    }
+
+    pub(super) fn render_standalone_sftp_secondary_options(
+        &self,
+        initial_remote_path: &str,
+        connect_timeout_seconds_text: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.render_standalone_sftp_endpoint_options(
+            initial_remote_path,
+            connect_timeout_seconds_text,
+            true,
+            cx,
+        )
+    }
+
+    fn render_standalone_sftp_endpoint_options(
+        &self,
+        initial_remote_path: &str,
+        connect_timeout_seconds_text: &str,
+        secondary: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(self.tokens.metrics.modal_section_gap))
+            .child(self.render_connection_field(
+                self.i18n.t("sftp.standalone.initial_path"),
+                initial_remote_path,
+                self.i18n.t("sftp.standalone.initial_path_placeholder"),
+                if secondary {
+                    NewConnectionField::StandaloneSftpSecondaryInitialRemotePath
+                } else {
+                    NewConnectionField::InitialRemotePath
+                },
+                false,
+                cx,
+            ))
+            .child(self.render_connection_hint(self.i18n.t("sftp.standalone.initial_path_hint")))
+            .child(self.render_connection_field(
+                self.i18n.t("ssh.form.connect_timeout"),
+                connect_timeout_seconds_text,
+                oxideterm_connections::DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS.to_string(),
+                if secondary {
+                    NewConnectionField::StandaloneSftpSecondaryConnectTimeoutSeconds
+                } else {
+                    NewConnectionField::ConnectTimeoutSeconds
+                },
+                false,
+                cx,
+            ))
+            .child(self.render_connection_hint(self.i18n.t("ssh.form.connect_timeout_hint")))
             .into_any_element()
     }
 
@@ -3363,6 +4366,57 @@ impl WorkspaceApp {
         self.update_connection_form_state(cx, |state| {
             if let Some(form) = state.form.as_mut() {
                 form.terminal.delete_sequence = sequence;
+                form.field_focused = false;
+                clear_connection_selection(form);
+                form.error = None;
+            }
+        });
+        self.ime_marked_text = None;
+        cx.notify();
+    }
+
+    pub(super) fn set_new_connection_terminal_semantic_scheme(
+        &mut self,
+        scheme_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_connection_form_state(cx, |state| {
+            if let Some(form) = state.form.as_mut() {
+                form.terminal.semantic_scheme = scheme_id;
+                form.field_focused = false;
+                clear_connection_selection(form);
+                form.error = None;
+            }
+        });
+        self.ime_marked_text = None;
+        cx.notify();
+    }
+
+    pub(super) fn set_new_connection_terminal_highlight_rule_set(
+        &mut self,
+        rule_set_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_connection_form_state(cx, |state| {
+            if let Some(form) = state.form.as_mut() {
+                form.terminal.highlight_rule_set = rule_set_id;
+                form.field_focused = false;
+                clear_connection_selection(form);
+                form.error = None;
+            }
+        });
+        self.ime_marked_text = None;
+        cx.notify();
+    }
+
+    pub(super) fn set_new_connection_terminal_session_log_policy(
+        &mut self,
+        policy: ConnectionTerminalSessionLogPolicy,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_connection_form_state(cx, |state| {
+            if let Some(form) = state.form.as_mut() {
+                form.terminal.session_log_policy = policy;
                 form.field_focused = false;
                 clear_connection_selection(form);
                 form.error = None;
@@ -3461,20 +4515,35 @@ impl WorkspaceApp {
 
     pub(super) fn render_upstream_proxy_policy_section(
         &self,
+        secondary: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let Some((policy, protocol, host, port, no_proxy, remote_dns, auth, username)) =
             self.connection_form_state(cx).form.as_ref().map(|form| {
-                (
-                    form.upstream_proxy_policy,
-                    form.upstream_proxy_protocol,
-                    form.upstream_proxy_host.clone(),
-                    form.upstream_proxy_port.clone(),
-                    form.upstream_proxy_no_proxy.clone(),
-                    form.upstream_proxy_remote_dns,
-                    form.upstream_proxy_auth,
-                    form.upstream_proxy_username.clone(),
-                )
+                if secondary {
+                    let route = &form.standalone_sftp_secondary;
+                    (
+                        route.upstream_proxy_policy,
+                        route.upstream_proxy_protocol,
+                        route.upstream_proxy_host.clone(),
+                        route.upstream_proxy_port.clone(),
+                        route.upstream_proxy_no_proxy.clone(),
+                        route.upstream_proxy_remote_dns,
+                        route.upstream_proxy_auth,
+                        route.upstream_proxy_username.clone(),
+                    )
+                } else {
+                    (
+                        form.upstream_proxy_policy,
+                        form.upstream_proxy_protocol,
+                        form.upstream_proxy_host.clone(),
+                        form.upstream_proxy_port.clone(),
+                        form.upstream_proxy_no_proxy.clone(),
+                        form.upstream_proxy_remote_dns,
+                        form.upstream_proxy_auth,
+                        form.upstream_proxy_username.clone(),
+                    )
+                }
             })
         else {
             return div().into_any_element();
@@ -3491,7 +4560,11 @@ impl WorkspaceApp {
                 &self.tokens,
                 self.i18n.t("modals.upstream_proxy.policy"),
                 self.render_new_connection_select_control(
-                    NewConnectionSelect::UpstreamProxyPolicy,
+                    if secondary {
+                        NewConnectionSelect::StandaloneSftpSecondaryUpstreamProxyPolicy
+                    } else {
+                        NewConnectionSelect::UpstreamProxyPolicy
+                    },
                     self.upstream_proxy_policy_label(policy),
                     false,
                     false,
@@ -3509,7 +4582,11 @@ impl WorkspaceApp {
                                 &self.tokens,
                                 self.i18n.t("settings_view.network.protocol"),
                                 self.render_new_connection_select_control(
-                                    NewConnectionSelect::UpstreamProxyProtocol,
+                                    if secondary {
+                                        NewConnectionSelect::StandaloneSftpSecondaryUpstreamProxyProtocol
+                                    } else {
+                                        NewConnectionSelect::UpstreamProxyProtocol
+                                    },
                                     self.upstream_proxy_protocol_label(protocol),
                                     false,
                                     false,
@@ -3521,7 +4598,11 @@ impl WorkspaceApp {
                                     self.i18n.t("settings_view.network.port"),
                                     &port,
                                     "1080".to_string(),
-                                    NewConnectionField::UpstreamProxyPort,
+                                    if secondary {
+                                        NewConnectionField::StandaloneSftpSecondaryUpstreamProxyPort
+                                    } else {
+                                        NewConnectionField::UpstreamProxyPort
+                                    },
                                     false,
                                     cx,
                                 ),
@@ -3531,7 +4612,11 @@ impl WorkspaceApp {
                         self.i18n.t("settings_view.network.host"),
                         &host,
                         "127.0.0.1".to_string(),
-                        NewConnectionField::UpstreamProxyHost,
+                        if secondary {
+                            NewConnectionField::StandaloneSftpSecondaryUpstreamProxyHost
+                        } else {
+                            NewConnectionField::UpstreamProxyHost
+                        },
                         false,
                         cx,
                     ))
@@ -3539,21 +4624,37 @@ impl WorkspaceApp {
                         self.i18n.t("settings_view.network.no_proxy"),
                         &no_proxy,
                         "localhost,127.0.0.1,*.internal".to_string(),
-                        NewConnectionField::UpstreamProxyNoProxy,
+                        if secondary {
+                            NewConnectionField::StandaloneSftpSecondaryUpstreamProxyNoProxy
+                        } else {
+                            NewConnectionField::UpstreamProxyNoProxy
+                        },
                         false,
                         cx,
                     ))
                     .child(self.render_connection_checkbox(
                         self.i18n.t("settings_view.network.remote_dns"),
                         remote_dns,
-                        |form| form.upstream_proxy_remote_dns = !form.upstream_proxy_remote_dns,
+                        move |form| {
+                            if secondary {
+                                let route = &mut form.standalone_sftp_secondary;
+                                route.upstream_proxy_remote_dns =
+                                    !route.upstream_proxy_remote_dns;
+                            } else {
+                                form.upstream_proxy_remote_dns = !form.upstream_proxy_remote_dns;
+                            }
+                        },
                         cx,
                     ))
                     .child(form_field(
                         &self.tokens,
                         self.i18n.t("settings_view.network.auth"),
                         self.render_new_connection_select_control(
-                            NewConnectionSelect::UpstreamProxyAuth,
+                            if secondary {
+                                NewConnectionSelect::StandaloneSftpSecondaryUpstreamProxyAuth
+                            } else {
+                                NewConnectionSelect::UpstreamProxyAuth
+                            },
                             self.upstream_proxy_auth_label(auth),
                             false,
                             false,
@@ -3568,14 +4669,22 @@ impl WorkspaceApp {
                                     self.i18n.t("settings_view.network.username"),
                                     &username,
                                     String::new(),
-                                    NewConnectionField::UpstreamProxyUsername,
+                                    if secondary {
+                                        NewConnectionField::StandaloneSftpSecondaryUpstreamProxyUsername
+                                    } else {
+                                        NewConnectionField::UpstreamProxyUsername
+                                    },
                                     false,
                                     cx,
                                 ))
                                 .child(self.render_connection_secret_field(
                                     self.i18n.t("settings_view.network.password"),
                                     String::new(),
-                                    NewConnectionField::UpstreamProxyPassword,
+                                    if secondary {
+                                        NewConnectionField::StandaloneSftpSecondaryUpstreamProxyPassword
+                                    } else {
+                                        NewConnectionField::UpstreamProxyPassword
+                                    },
                                     cx,
                                 ))
                                 .child(self.render_connection_hint(
@@ -3695,11 +4804,16 @@ impl WorkspaceApp {
     pub(super) fn set_new_connection_upstream_proxy_policy(
         &mut self,
         policy: NewConnectionUpstreamProxyPolicy,
+        secondary: bool,
         cx: &mut Context<Self>,
     ) {
         self.update_connection_form_state(cx, |state| {
             if let Some(form) = state.form.as_mut() {
-                form.upstream_proxy_policy = policy;
+                if secondary {
+                    form.standalone_sftp_secondary.upstream_proxy_policy = policy;
+                } else {
+                    form.upstream_proxy_policy = policy;
+                }
                 form.field_focused = false;
                 clear_connection_selection(form);
                 form.error = None;
@@ -3712,11 +4826,16 @@ impl WorkspaceApp {
     pub(super) fn set_new_connection_upstream_proxy_protocol(
         &mut self,
         protocol: SavedUpstreamProxyProtocol,
+        secondary: bool,
         cx: &mut Context<Self>,
     ) {
         self.update_connection_form_state(cx, |state| {
             if let Some(form) = state.form.as_mut() {
-                form.upstream_proxy_protocol = protocol;
+                if secondary {
+                    form.standalone_sftp_secondary.upstream_proxy_protocol = protocol;
+                } else {
+                    form.upstream_proxy_protocol = protocol;
+                }
                 form.field_focused = false;
                 clear_connection_selection(form);
                 form.error = None;
@@ -3729,17 +4848,28 @@ impl WorkspaceApp {
     pub(super) fn set_new_connection_upstream_proxy_auth(
         &mut self,
         auth: NewConnectionUpstreamProxyAuth,
+        secondary: bool,
         cx: &mut Context<Self>,
     ) {
         self.update_connection_form_state(cx, |state| {
             if let Some(form) = state.form.as_mut() {
-                if auth == NewConnectionUpstreamProxyAuth::None {
-                    // Hidden password fields should not retain a draft secret after
-                    // switching the custom proxy back to unauthenticated mode.
-                    form.upstream_proxy_password.clear();
-                    form.upstream_proxy_password_keychain_id = None;
+                if secondary {
+                    let route = &mut form.standalone_sftp_secondary;
+                    if auth == NewConnectionUpstreamProxyAuth::None {
+                        // Hidden password drafts remain owned by this endpoint and are scrubbed.
+                        zeroize::Zeroize::zeroize(&mut route.upstream_proxy_password);
+                        route.upstream_proxy_password_keychain_id = None;
+                    }
+                    route.upstream_proxy_auth = auth;
+                } else {
+                    if auth == NewConnectionUpstreamProxyAuth::None {
+                        // Hidden password fields should not retain a draft secret after
+                        // switching the custom proxy back to unauthenticated mode.
+                        zeroize::Zeroize::zeroize(&mut form.upstream_proxy_password);
+                        form.upstream_proxy_password_keychain_id = None;
+                    }
+                    form.upstream_proxy_auth = auth;
                 }
-                form.upstream_proxy_auth = auth;
                 form.field_focused = false;
                 clear_connection_selection(form);
                 form.error = None;
@@ -3753,7 +4883,7 @@ impl WorkspaceApp {
         &self,
         label: String,
         checked: bool,
-        toggle: fn(&mut NewConnectionForm),
+        toggle: impl Fn(&mut NewConnectionForm) + 'static,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         checkbox(&self.tokens, label, checked)
@@ -3803,7 +4933,20 @@ impl WorkspaceApp {
                     this.close_new_connection_form(window, cx);
                 }
                 ConnectionButtonAction::Test => {
-                    this.start_new_connection_flow(SshConnectionIntent::Test, window, cx);
+                    let intent =
+                        if this
+                            .connection_form_state(cx)
+                            .form
+                            .as_ref()
+                            .is_some_and(|form| {
+                                form.transport == NewConnectionTransport::StandaloneSftp
+                            })
+                        {
+                            SshConnectionIntent::TestStandaloneSftp
+                        } else {
+                            SshConnectionIntent::Test
+                        };
+                    this.start_new_connection_flow(intent, window, cx);
                 }
                 ConnectionButtonAction::Connect => {
                     this.submit_new_connection_form_with_action(
@@ -3843,60 +4986,6 @@ pub(super) fn serial_port_display_label(port: &oxideterm_terminal::SerialPortInf
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn transport_selection_offset_matches_fixed_row_stride() {
-        assert_eq!(
-            new_connection_transport_vertical_offset(
-                NewConnectionTransport::Ssh,
-                NewConnectionTransport::Vnc,
-            ),
-            -200.0,
-        );
-        assert_eq!(
-            new_connection_transport_vertical_offset(
-                NewConnectionTransport::Vnc,
-                NewConnectionTransport::Telnet,
-            ),
-            120.0,
-        );
-    }
-
-    #[test]
-    fn windows_only_transport_follows_shared_transport_order() {
-        assert_eq!(
-            new_connection_transport_index(NewConnectionTransport::WslGraphics),
-            6,
-        );
-        assert_eq!(
-            new_connection_transport_index(NewConnectionTransport::LocalTerminal),
-            if cfg!(target_os = "windows") { 7 } else { 6 },
-        );
-    }
-
-    #[test]
-    fn terminal_selects_map_to_their_tracked_overlay_anchors() {
-        for (select, anchor_id) in [
-            (
-                NewConnectionSelect::TerminalEncoding,
-                SelectAnchorId::NewConnectionTerminalEncoding,
-            ),
-            (
-                NewConnectionSelect::TerminalBackspaceSequence,
-                SelectAnchorId::NewConnectionTerminalBackspaceSequence,
-            ),
-            (
-                NewConnectionSelect::TerminalDeleteSequence,
-                SelectAnchorId::NewConnectionTerminalDeleteSequence,
-            ),
-        ] {
-            assert_eq!(
-                WorkspaceApp::new_connection_select_anchor_id(select),
-                anchor_id
-            );
-            assert!(anchor_id.is_new_connection_select_trigger());
-        }
-    }
 
     #[test]
     fn secret_field_render_values_borrow_entity_owned_allocations() {

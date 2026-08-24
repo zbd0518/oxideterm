@@ -488,10 +488,12 @@ impl WorkspaceApp {
                     let _ = this.handle_graphics_key(event, cx);
                     window.prevent_default();
                     cx.stop_propagation();
-                } else if this
-                    .active_tab(cx)
-                    .is_some_and(|tab| tab.kind == TabKind::Sftp)
+                } else if this.sftp_view.read(cx).focused_input().is_some()
+                    || this
+                        .active_tab(cx)
+                        .is_some_and(|tab| tab.kind == TabKind::Sftp)
                 {
+                    // Embedded SFTP inputs keep their keyboard model while a terminal tab is active.
                     let _ = this.handle_sftp_key(event, window, cx);
                     window.prevent_default();
                     cx.stop_propagation();
@@ -1016,6 +1018,10 @@ impl WorkspaceApp {
             )
             .when_some(
                 self.render_remote_shell_integration_confirm(cx),
+                |root, dialog| root.child(dialog),
+            )
+            .when_some(
+                self.render_terminal_trigger_quick_command_confirm(cx),
                 |root, dialog| root.child(dialog),
             )
             .when(cloud_sync_confirm_open, |root| {

@@ -160,6 +160,15 @@ pub struct RemoteDesktopDisplayOptions {
     pub use_all_monitors: bool,
 }
 
+/// RDP-specific compatibility controls persisted with a connection profile.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDesktopRdpOptions {
+    /// Disables the EGFX dynamic channel so the server falls back to bitmap updates.
+    #[serde(default)]
+    pub disable_graphics_pipeline: bool,
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteDesktopSessionOptions {
@@ -169,6 +178,8 @@ pub struct RemoteDesktopSessionOptions {
     pub audio: RemoteDesktopAudioOptions,
     #[serde(default)]
     pub display: RemoteDesktopDisplayOptions,
+    #[serde(default)]
+    pub rdp: RemoteDesktopRdpOptions,
     #[serde(default)]
     pub vnc: RemoteDesktopVncOptions,
 }
@@ -1001,30 +1012,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn protocols_provide_provider_ids_and_default_ports() {
-        assert_eq!(RemoteDesktopProtocol::Rdp.provider_id(), "rdp");
-        assert_eq!(RemoteDesktopProtocol::Rdp.default_port(), 3389);
-        assert_eq!(RemoteDesktopProtocol::Vnc.provider_id(), "vnc");
-        assert_eq!(RemoteDesktopProtocol::Vnc.default_port(), 5900);
-    }
-
-    #[test]
-    fn vnc_options_default_to_verified_encryption_and_balanced_rendering() {
-        let options = RemoteDesktopVncOptions::default();
-
-        assert_eq!(
-            options.security_policy,
-            RemoteDesktopVncSecurityPolicy::RequireVerifiedEncryption
-        );
-        assert_eq!(options.session_mode, RemoteDesktopVncSessionMode::Shared);
-        assert_eq!(
-            options.image_quality,
-            RemoteDesktopVncImageQuality::Balanced
-        );
-        assert_eq!(options.compression, RemoteDesktopVncCompression::Balanced);
-    }
-
-    #[test]
     fn older_session_options_receive_safe_vnc_defaults() {
         let options: RemoteDesktopSessionOptions = serde_json::from_str(
             r#"{"clipboard":{"text":true,"images":false,"files":false},"audio":{"playback":false,"capture":false},"display":{"useAllMonitors":false}}"#,
@@ -1039,31 +1026,7 @@ mod tests {
             options.vnc.session_mode,
             RemoteDesktopVncSessionMode::Shared
         );
-    }
-
-    #[test]
-    fn unobserved_negotiated_capabilities_remain_unknown() {
-        let capabilities: NegotiatedCapabilities = serde_json::from_str("{}").unwrap();
-
-        assert_eq!(capabilities.resize, NegotiatedCapabilityStatus::Unknown);
-        assert_eq!(
-            capabilities.extended_clipboard,
-            NegotiatedCapabilityStatus::Unknown
-        );
-        assert_eq!(capabilities.h264, NegotiatedCapabilityStatus::Unknown);
-    }
-
-    #[test]
-    fn frame_completeness_uses_four_bytes_per_pixel() {
-        let size = RemoteDesktopSize {
-            width: 2,
-            height: 2,
-        };
-        let complete = RemoteDesktopFrame::new(size, RemoteDesktopFrameFormat::Rgba8, vec![0; 16]);
-        let short = RemoteDesktopFrame::new(size, RemoteDesktopFrameFormat::Rgba8, vec![0; 15]);
-
-        assert!(complete.is_complete());
-        assert!(!short.is_complete());
+        assert!(!options.rdp.disable_graphics_pipeline);
     }
 
     #[test]

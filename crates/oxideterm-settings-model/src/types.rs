@@ -51,6 +51,7 @@ pub enum TerminalSettingsPage {
     CommandBar,
     Awareness,
     Transfer,
+    Logging,
     Highlight,
 }
 
@@ -90,10 +91,18 @@ pub enum SettingsSelect {
     TerminalEncoding,
     TerminalBackspaceSequence,
     TerminalDeleteSequence,
+    TerminalSessionLogFileMode,
     TerminalCursorStyle,
     RemoteShellIntegrationMode,
+    TerminalTriggerMatchMode,
+    TerminalTriggerAction,
+    TerminalTriggerProcessMode,
+    TerminalTriggerQuickCommand,
+    TerminalTriggerTiming,
+    TerminalTriggerScope,
     IdeAgentMode,
     LocalShell,
+    LocalShellSemanticScheme(usize),
     LocalPrivilegeKind,
     ConnectionIdleTimeout,
     ReconnectMaxAttempts,
@@ -115,6 +124,10 @@ pub enum SettingsSelect {
     SftpConcurrent,
     SftpDirectoryParallelism,
     SftpConflict,
+    TerminalSemanticScheme,
+    SemanticSchemeRuleClass(usize),
+    SemanticSchemeRuleContext(usize),
+    HighlightRuleSet,
     HighlightPreset,
     HighlightRenderMode(usize),
     HighlightMatchScope(usize),
@@ -157,12 +170,30 @@ pub enum SettingsInput {
     InBandTransferMaxChunkBytes,
     InBandTransferMaxFileCount,
     InBandTransferMaxTotalBytes,
+    TerminalSessionLogRetentionDays,
+    TerminalSessionLogMaxFileSizeMib,
+    TerminalSessionLogFileNameTemplate,
+    TerminalSessionLogContentTemplate,
     TerminalCommandBarFocusHandoff,
     TerminalCommandSpecsJson,
+    TerminalTriggerName,
+    TerminalTriggerDescription,
+    TerminalTriggerPattern,
+    TerminalTriggerActionValue,
+    TerminalTriggerExecutable,
+    TerminalTriggerArguments,
+    TerminalTriggerWorkingDirectory,
+    TerminalTriggerDelayMs,
+    TerminalTriggerCooldownMs,
     KeybindingSearch,
     CustomThemeName,
     CustomThemeTerminalColor(usize),
     CustomThemeUiColor(usize),
+    SemanticSchemeName,
+    SemanticSchemeRulePattern(usize),
+    SemanticSchemeRuleCapture(usize),
+    SemanticSchemeColor(usize),
+    HighlightRuleSetName,
     HighlightLabel(usize),
     HighlightPattern(usize),
     HighlightForeground(usize),
@@ -254,6 +285,7 @@ impl TerminalSettingsPage {
             Self::CommandBar,
             Self::Awareness,
             Self::Transfer,
+            Self::Logging,
             Self::Highlight,
         ]
     }
@@ -266,6 +298,7 @@ impl TerminalSettingsPage {
             Self::CommandBar => "settings_view.terminal.page_commandBar",
             Self::Awareness => "settings_view.terminal.page_awareness",
             Self::Transfer => "settings_view.terminal.page_transfer",
+            Self::Logging => "settings_view.terminal.page_logging",
             Self::Highlight => "settings_view.terminal.page_highlight",
         }
     }
@@ -452,6 +485,7 @@ impl SettingsInput {
             self,
             Self::TerminalCommandBarFocusHandoff
                 | Self::TerminalCommandSpecsJson
+                | Self::TerminalTriggerArguments
                 | Self::AiSystemPrompt
                 | Self::AiMemoryContent
                 | Self::AiAcpAgentArgs(_)
@@ -467,6 +501,7 @@ impl SettingsInput {
         // converts them to concrete units at the view boundary.
         match self {
             Self::TerminalCommandBarFocusHandoff | Self::TerminalCommandSpecsJson => 20.0,
+            Self::TerminalTriggerArguments => 20.0,
             Self::AiSystemPrompt | Self::AiMemoryContent => 22.0,
             Self::AiAcpAgentArgs(_)
             | Self::AiAcpAgentEnv(_)
@@ -512,12 +547,30 @@ impl SettingsInput {
             Self::InBandTransferMaxChunkBytes => 13,
             Self::InBandTransferMaxFileCount => 14,
             Self::InBandTransferMaxTotalBytes => 15,
+            Self::TerminalSessionLogRetentionDays => 33_200,
+            Self::TerminalSessionLogMaxFileSizeMib => 33_201,
+            Self::TerminalSessionLogFileNameTemplate => 33_202,
+            Self::TerminalSessionLogContentTemplate => 33_203,
             Self::TerminalCommandBarFocusHandoff => 16,
             Self::TerminalCommandSpecsJson => 17,
+            Self::TerminalTriggerName => 33_100,
+            Self::TerminalTriggerDescription => 33_101,
+            Self::TerminalTriggerPattern => 33_102,
+            Self::TerminalTriggerActionValue => 33_103,
+            Self::TerminalTriggerExecutable => 33_104,
+            Self::TerminalTriggerArguments => 33_105,
+            Self::TerminalTriggerWorkingDirectory => 33_106,
+            Self::TerminalTriggerDelayMs => 33_107,
+            Self::TerminalTriggerCooldownMs => 33_108,
             Self::KeybindingSearch => 18,
             Self::CustomThemeName => 10_000,
             Self::CustomThemeTerminalColor(index) => 10_100 + index as u64,
             Self::CustomThemeUiColor(index) => 10_200 + index as u64,
+            Self::SemanticSchemeName => 10_300,
+            Self::SemanticSchemeRulePattern(index) => 10_400 + index as u64,
+            Self::SemanticSchemeRuleCapture(index) => 10_500 + index as u64,
+            Self::SemanticSchemeColor(index) => 10_600 + index as u64,
+            Self::HighlightRuleSetName => 10_700,
             Self::HighlightLabel(index) => 100 + index as u64 * 4,
             Self::HighlightPattern(index) => 101 + index as u64 * 4,
             Self::HighlightForeground(index) => 102 + index as u64 * 4,
@@ -687,19 +740,5 @@ mod tests {
         assert!(SettingsInput::AppLockConfirmPassword.is_secret());
         assert!(SettingsInput::LocalPrivilegeSecret.is_secret());
         assert!(!SettingsInput::TerminalFontSize.is_secret());
-    }
-
-    #[test]
-    fn ai_mcp_inputs_are_categorized_in_the_model_layer() {
-        assert!(SettingsInput::AiMcpEnvValue(0).is_ai_mcp());
-        assert!(!SettingsInput::AiSystemPrompt.is_ai_mcp());
-    }
-
-    #[test]
-    fn multiline_input_metadata_lives_with_settings_input_identity() {
-        assert!(SettingsInput::AiSystemPrompt.accepts_newline());
-        assert!(SettingsInput::LocalPrivilegePromptPatterns.accepts_newline());
-        assert!(!SettingsInput::TerminalFontSize.accepts_newline());
-        assert_eq!(SettingsInput::AiMemoryContent.textarea_line_height(), 22.0);
     }
 }

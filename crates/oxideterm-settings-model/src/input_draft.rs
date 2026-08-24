@@ -14,12 +14,14 @@ use oxideterm_settings::{
     DEFAULT_AI_TOOL_MAX_CALLS_PER_ROUND, DEFAULT_AI_TOOL_MAX_ROUNDS,
     MAX_AI_TOOL_MAX_CALLS_PER_ROUND, MAX_AI_TOOL_MAX_ROUNDS, MIN_AI_TOOL_MAX_CALLS_PER_ROUND,
     MIN_AI_TOOL_MAX_ROUNDS, PersistedSettings, RECOMMENDED_FOCUS_HANDOFF_COMMANDS,
-    SettingsUpstreamProxyAuth, UpdateProxyMode, reindex_highlight_rules,
+    SettingsUpstreamProxyAuth, UpdateProxyMode, parse_terminal_session_log_content_template,
+    parse_terminal_session_log_file_name_template, reindex_highlight_rules,
 };
+use oxideterm_terminal_semantic::SEMANTIC_CLASSES;
 
 use crate::{
-    SettingsInput, ai_update_provider, parse_focus_handoff_command_list,
-    set_ai_model_max_response_tokens, set_ai_user_context_window,
+    SettingsInput, ai_update_provider, edit_custom_semantic_scheme,
+    parse_focus_handoff_command_list, set_ai_model_max_response_tokens, set_ai_user_context_window,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -117,6 +119,18 @@ pub fn persisted_settings_input_value(
             .in_band_transfer
             .max_total_bytes
             .to_string(),
+        SettingsInput::TerminalSessionLogRetentionDays => {
+            settings.terminal.session_log.retention_days.to_string()
+        }
+        SettingsInput::TerminalSessionLogMaxFileSizeMib => {
+            settings.terminal.session_log.max_file_size_mib.to_string()
+        }
+        SettingsInput::TerminalSessionLogFileNameTemplate => {
+            settings.terminal.session_log.file_name_template.clone()
+        }
+        SettingsInput::TerminalSessionLogContentTemplate => {
+            settings.terminal.session_log.content_template.clone()
+        }
         SettingsInput::TerminalCommandBarFocusHandoff => settings
             .terminal
             .command_bar
@@ -126,27 +140,62 @@ pub fn persisted_settings_input_value(
             .cloned()
             .collect::<Vec<_>>()
             .join(", "),
+        SettingsInput::SemanticSchemeName => settings
+            .terminal
+            .active_custom_semantic_scheme()
+            .map(|scheme| scheme.name.clone())
+            .unwrap_or_default(),
+        SettingsInput::SemanticSchemeRulePattern(index) => settings
+            .terminal
+            .active_custom_semantic_scheme()
+            .and_then(|scheme| scheme.rules.get(index))
+            .map(|rule| rule.pattern.clone())
+            .unwrap_or_default(),
+        SettingsInput::SemanticSchemeRuleCapture(index) => settings
+            .terminal
+            .active_custom_semantic_scheme()
+            .and_then(|scheme| scheme.rules.get(index))
+            .map(|rule| rule.capture.to_string())
+            .unwrap_or_default(),
+        SettingsInput::SemanticSchemeColor(index) => SEMANTIC_CLASSES
+            .get(index)
+            .and_then(|class| {
+                settings
+                    .terminal
+                    .active_custom_semantic_scheme()?
+                    .colors
+                    .get(class)
+                    .cloned()
+            })
+            .unwrap_or_default(),
+        SettingsInput::HighlightRuleSetName => settings
+            .terminal
+            .default_highlight_rule_set
+            .as_deref()
+            .and_then(|id| settings.terminal.highlight_rule_set(id))
+            .map(|rule_set| rule_set.name.clone())
+            .unwrap_or_default(),
         SettingsInput::HighlightLabel(index) => settings
             .terminal
-            .highlight_rules
+            .effective_highlight_rules()
             .get(index)
             .map(|rule| rule.label.clone())
             .unwrap_or_default(),
         SettingsInput::HighlightPattern(index) => settings
             .terminal
-            .highlight_rules
+            .effective_highlight_rules()
             .get(index)
             .map(|rule| rule.pattern.clone())
             .unwrap_or_default(),
         SettingsInput::HighlightForeground(index) => settings
             .terminal
-            .highlight_rules
+            .effective_highlight_rules()
             .get(index)
             .and_then(|rule| rule.foreground.clone())
             .unwrap_or_default(),
         SettingsInput::HighlightBackground(index) => settings
             .terminal
-            .highlight_rules
+            .effective_highlight_rules()
             .get(index)
             .and_then(|rule| rule.background.clone())
             .unwrap_or_default(),
@@ -385,6 +434,28 @@ pub fn apply_persisted_settings_input_draft(
         SettingsInput::InBandTransferMaxTotalBytes => parse_i64(draft)
             .map(|value| settings.terminal.in_band_transfer.max_total_bytes = value.max(1024))
             .into(),
+        SettingsInput::TerminalSessionLogRetentionDays => parse_i64(draft)
+            .map(|value| settings.terminal.session_log.retention_days = value.clamp(0, 3650))
+            .into(),
+        SettingsInput::TerminalSessionLogMaxFileSizeMib => parse_i64(draft)
+            .map(|value| settings.terminal.session_log.max_file_size_mib = value.clamp(1, 4096))
+            .into(),
+        SettingsInput::TerminalSessionLogFileNameTemplate => {
+            if parse_terminal_session_log_file_name_template(draft).is_err() {
+                SettingsInputDraftApply::Invalid
+            } else {
+                settings.terminal.session_log.file_name_template = draft.to_string();
+                SettingsInputDraftApply::Applied
+            }
+        }
+        SettingsInput::TerminalSessionLogContentTemplate => {
+            if parse_terminal_session_log_content_template(draft).is_err() {
+                SettingsInputDraftApply::Invalid
+            } else {
+                settings.terminal.session_log.content_template = draft.to_string();
+                SettingsInputDraftApply::Applied
+            }
+        }
         SettingsInput::TerminalCommandBarFocusHandoff => {
             let mut commands = settings
                 .terminal
@@ -400,6 +471,65 @@ pub fn apply_persisted_settings_input_draft(
                 }
             }
             settings.terminal.command_bar.focus_handoff_commands = commands;
+            SettingsInputDraftApply::Applied
+        }
+        SettingsInput::SemanticSchemeName => edit_custom_semantic_scheme(settings, |scheme| {
+            scheme.name = draft.trim().to_string();
+        })
+        .map(|()| SettingsInputDraftApply::Applied)
+        .unwrap_or(SettingsInputDraftApply::Invalid),
+        SettingsInput::SemanticSchemeRulePattern(index) => {
+            edit_custom_semantic_scheme(settings, |scheme| {
+                if let Some(rule) = scheme.rules.get_mut(index) {
+                    rule.pattern = draft.trim().to_string();
+                }
+            })
+            .map(|()| SettingsInputDraftApply::Applied)
+            .unwrap_or(SettingsInputDraftApply::Invalid)
+        }
+        SettingsInput::SemanticSchemeRuleCapture(index) => {
+            let Ok(capture) = draft.trim().parse::<usize>() else {
+                return SettingsInputDraftApply::Invalid;
+            };
+            edit_custom_semantic_scheme(settings, |scheme| {
+                if let Some(rule) = scheme.rules.get_mut(index) {
+                    rule.capture = capture;
+                }
+            })
+            .map(|()| SettingsInputDraftApply::Applied)
+            .unwrap_or(SettingsInputDraftApply::Invalid)
+        }
+        SettingsInput::SemanticSchemeColor(index) => {
+            let Some(&class) = SEMANTIC_CLASSES.get(index) else {
+                return SettingsInputDraftApply::Invalid;
+            };
+            edit_custom_semantic_scheme(settings, |scheme| {
+                let color = draft.trim();
+                if color.is_empty() {
+                    scheme.colors.remove(&class);
+                } else {
+                    scheme.colors.insert(class, color.to_string());
+                }
+            })
+            .map(|()| SettingsInputDraftApply::Applied)
+            .unwrap_or(SettingsInputDraftApply::Invalid)
+        }
+        SettingsInput::HighlightRuleSetName => {
+            let name = draft.trim();
+            if name.is_empty() {
+                return SettingsInputDraftApply::Invalid;
+            }
+            let Some(id) = settings.terminal.default_highlight_rule_set.clone() else {
+                return SettingsInputDraftApply::Applied;
+            };
+            if let Some(rule_set) = settings
+                .terminal
+                .highlight_rule_sets
+                .iter_mut()
+                .find(|rule_set| rule_set.id == id)
+            {
+                rule_set.name = name.to_string();
+            }
             SettingsInputDraftApply::Applied
         }
         SettingsInput::HighlightLabel(index) => edit_highlight_rule(settings, index, |rule| {
@@ -577,12 +707,12 @@ fn edit_highlight_rule(
     index: usize,
     edit: impl FnOnce(&mut oxideterm_settings::HighlightRule),
 ) -> SettingsInputDraftApply {
-    let Some(rule) = settings.terminal.highlight_rules.get_mut(index) else {
+    let rules = settings.terminal.effective_highlight_rules_mut();
+    let Some(rule) = rules.get_mut(index) else {
         return SettingsInputDraftApply::Applied;
     };
     edit(rule);
-    settings.terminal.highlight_rules =
-        reindex_highlight_rules(settings.terminal.highlight_rules.clone());
+    *rules = reindex_highlight_rules(rules.clone());
     SettingsInputDraftApply::Applied
 }
 
@@ -729,22 +859,28 @@ mod tests {
     }
 
     #[test]
-    fn terminal_custom_font_draft_updates_custom_font_family() {
+    fn session_log_limits_accept_forever_retention_and_bound_file_size() {
         let mut settings = PersistedSettings::default();
 
         assert_eq!(
             apply_persisted_settings_input_draft(
                 &mut settings,
-                SettingsInput::TerminalCustomFontFamily,
-                "  'Sarasa Fixed SC', monospace  ",
+                SettingsInput::TerminalSessionLogRetentionDays,
+                "-1",
             ),
             SettingsInputDraftApply::Applied
         );
+        assert_eq!(settings.terminal.session_log.retention_days, 0);
 
         assert_eq!(
-            settings.terminal.custom_font_family,
-            "'Sarasa Fixed SC', monospace"
+            apply_persisted_settings_input_draft(
+                &mut settings,
+                SettingsInput::TerminalSessionLogMaxFileSizeMib,
+                "99999",
+            ),
+            SettingsInputDraftApply::Applied
         );
+        assert_eq!(settings.terminal.session_log.max_file_size_mib, 4096);
     }
 
     #[test]
@@ -801,13 +937,102 @@ mod tests {
     }
 
     #[test]
-    fn persisted_input_value_formats_optional_decimals() {
+    fn semantic_scheme_drafts_validate_before_mutating_the_active_document() {
         let mut settings = PersistedSettings::default();
-        settings.ide.line_height = Some(1.5);
+        crate::create_custom_semantic_scheme(
+            &mut settings,
+            "Operations".to_string(),
+            oxideterm_settings::TerminalSemanticScheme::Balanced,
+        )
+        .expect("create semantic scheme");
+        let original_pattern = settings
+            .terminal
+            .active_custom_semantic_scheme()
+            .unwrap()
+            .rules[0]
+            .pattern
+            .clone();
 
         assert_eq!(
-            persisted_settings_input_value(&settings, SettingsInput::IdeLineHeight).as_deref(),
-            Some("1.5")
+            apply_persisted_settings_input_draft(
+                &mut settings,
+                SettingsInput::SemanticSchemeRulePattern(0),
+                "(",
+            ),
+            SettingsInputDraftApply::Invalid
+        );
+        assert_eq!(
+            settings
+                .terminal
+                .active_custom_semantic_scheme()
+                .unwrap()
+                .rules[0]
+                .pattern,
+            original_pattern
+        );
+        assert_eq!(
+            apply_persisted_settings_input_draft(
+                &mut settings,
+                SettingsInput::SemanticSchemeColor(0),
+                "#123456",
+            ),
+            SettingsInputDraftApply::Applied
+        );
+        assert_eq!(
+            apply_persisted_settings_input_draft(
+                &mut settings,
+                SettingsInput::SemanticSchemeRuleCapture(0),
+                "99",
+            ),
+            SettingsInputDraftApply::Invalid
+        );
+        assert_eq!(
+            apply_persisted_settings_input_draft(
+                &mut settings,
+                SettingsInput::SemanticSchemeRuleCapture(0),
+                "0",
+            ),
+            SettingsInputDraftApply::Applied
+        );
+    }
+
+    #[test]
+    fn highlight_drafts_edit_the_selected_rule_set_without_changing_global_base() {
+        let mut settings = PersistedSettings::default();
+        settings
+            .terminal
+            .highlight_rules
+            .push(oxideterm_settings::HighlightRule {
+                id: "base".to_string(),
+                label: "Base".to_string(),
+                ..oxideterm_settings::HighlightRule::default()
+            });
+        settings
+            .terminal
+            .highlight_rule_sets
+            .push(oxideterm_settings::HighlightRuleSet {
+                id: "operations".to_string(),
+                name: "Operations".to_string(),
+                rules: vec![oxideterm_settings::HighlightRule {
+                    id: "override".to_string(),
+                    label: "Override".to_string(),
+                    ..oxideterm_settings::HighlightRule::default()
+                }],
+            });
+        settings.terminal.default_highlight_rule_set = Some("operations".to_string());
+
+        assert_eq!(
+            apply_persisted_settings_input_draft(
+                &mut settings,
+                SettingsInput::HighlightLabel(0),
+                "Edited",
+            ),
+            SettingsInputDraftApply::Applied
+        );
+        assert_eq!(settings.terminal.highlight_rules[0].label, "Base");
+        assert_eq!(
+            settings.terminal.highlight_rule_sets[0].rules[0].label,
+            "Edited"
         );
     }
 
@@ -821,6 +1046,51 @@ mod tests {
         assert_eq!(ranges[0].1.as_str(), "vim");
         assert_eq!(ranges[1].0, 4..4);
         assert!(ranges[1].1.is_empty());
+    }
+
+    #[test]
+    fn session_log_template_drafts_validate_before_mutating_settings() {
+        let mut settings = PersistedSettings::default();
+        let original_file_name = settings.terminal.session_log.file_name_template.clone();
+        let original_content = settings.terminal.session_log.content_template.clone();
+
+        assert_eq!(
+            apply_persisted_settings_input_draft(
+                &mut settings,
+                SettingsInput::TerminalSessionLogFileNameTemplate,
+                "../outside.log",
+            ),
+            SettingsInputDraftApply::Invalid
+        );
+        assert_eq!(
+            apply_persisted_settings_input_draft(
+                &mut settings,
+                SettingsInput::TerminalSessionLogContentTemplate,
+                "[{timestamp}]",
+            ),
+            SettingsInputDraftApply::Invalid
+        );
+        assert_eq!(
+            settings.terminal.session_log.file_name_template,
+            original_file_name
+        );
+        assert_eq!(
+            settings.terminal.session_log.content_template,
+            original_content
+        );
+
+        assert_eq!(
+            apply_persisted_settings_input_draft(
+                &mut settings,
+                SettingsInput::TerminalSessionLogContentTemplate,
+                "{protocol}: {text}",
+            ),
+            SettingsInputDraftApply::Applied
+        );
+        assert_eq!(
+            settings.terminal.session_log.content_template,
+            "{protocol}: {text}"
+        );
     }
 
     #[test]

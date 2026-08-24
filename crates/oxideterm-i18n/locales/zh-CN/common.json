@@ -37,8 +37,8 @@
       "import_connections": "导入连接",
       "import_connections_hint": "导入 SSH 配置和受支持应用的数据",
       "open_session_manager": "会话管理器",
-      "open_session_manager_hint": "浏览、编辑、导入和导出已保存连接",
-      "cloud_sync_hint": "将加密的工作区数据备份到自建服务"
+      "open_session_manager_hint": "浏览、编辑和导入已保存连接",
+      "cloud_sync_hint": "将加密的工作区数据备份到本地或自建服务"
     },
     "connection_monitor": {
       "title": "连接监控"
@@ -55,6 +55,7 @@
     "cmd_new_terminal": "新建本地终端",
     "cmd_new_connection": "新建 SSH 连接",
     "cmd_settings": "打开设置",
+    "cmd_manage_terminal_triggers": "管理终端触发器",
     "cmd_toggle_sidebar": "切换侧边栏",
     "cmd_toggle_panel": "切换面板",
     "cmd_toggle_ai_sidebar": "切换 OxideSens",
@@ -228,7 +229,9 @@
         "enable_sensitive_sync": "启用敏感同步",
         "github_oauth_login": "GitHub 登录",
         "microsoft_oauth_login": "Microsoft 登录",
-        "google_oauth_login": "Google 登录"
+        "google_oauth_login": "Google 登录",
+        "import_local": "从本地文件导入",
+        "export_local": "导出到本地文件"
       },
       "fields": {
         "backend": "后端类型",
@@ -267,6 +270,8 @@
         "sync_coverage": "同步覆盖范围",
         "sync_preflight": "同步前检查",
         "sync_health": "同步健康",
+        "local_backup": "本地备份与恢复",
+        "local_backup_description": "无需配置云同步，即可通过加密的 .oxide 文件备份或恢复数据。",
         "version_info": "版本信息",
         "notes": "注意事项"
       },
@@ -606,6 +611,8 @@
       },
       "confirm": {
         "import_title": "确认导入远端快照？",
+        "force_upload_title": "确认强制覆盖远端快照？",
+        "force_upload_description": "即使远端快照已被其他设备修改，也会用选中的本地数据将其替换。其他设备的远端改动可能丢失。",
         "clear_secret_title": "确认清除已存 secret？",
         "clear_secret_description": "这会从安全存储中删除 {{label}} 的已存值，而且无法撤销。",
         "restore_backup_title": "确认恢复之前的本地备份？",
@@ -719,11 +726,19 @@
         "key_path": "密钥路径",
         "cert_path": "证书路径",
         "managed_key": "托管密钥",
+        "gssapi_authentication": "优先使用 Kerberos",
+        "gssapi_server_identity": "Kerberos 服务器名称",
+        "gssapi_delegate_credentials": "Kerberos 凭据委派",
         "proxy_chain": "代理链",
         "agent_forwarding": "Agent 转发",
         "post_connect_command": "连接后命令",
         "color": "颜色",
         "tags": "标签",
+        "ssh_kex_algorithms": "SSH 密钥交换算法",
+        "ssh_host_key_algorithms": "SSH 主机密钥算法",
+        "ssh_cipher_algorithms": "SSH 加密算法",
+        "ssh_mac_algorithms": "SSH 完整性校验算法",
+        "ssh_compression_algorithms": "SSH 压缩算法",
         "forward_type": "转发类型",
         "bind_address": "监听地址",
         "bind_port": "监听端口",

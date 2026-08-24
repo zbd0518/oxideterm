@@ -1,6 +1,16 @@
 {
   "terminal": {
     "local_terminal": "Terminal local",
+    "triggers": {
+      "risky_quick_command_title": "¿Ejecutar una acción de desencadenador arriesgada?",
+      "risky_quick_command_description": "El desencadenador «{{trigger}}» ejecutará el comando rápido «{{command}}» con un riesgo {{risk}}.",
+      "cancel": "Cancelar",
+      "run": "Ejecutar",
+      "launch_failed": "El desencadenador no pudo iniciar el programa local.",
+      "risk_high": "alto",
+      "risk_medium": "medio",
+      "risk_configured": "configurado"
+    },
     "paste": {
       "title": "Múltiples líneas detectadas ({{count}} líneas)",
       "more_lines": "... {{count}} líneas más",
@@ -18,6 +28,7 @@
       "insert_selection_into_command": "Insertar selección aquí",
       "replace_command_with_selection": "Reemplazar comando con selección",
       "find": "Buscar...",
+      "manage_triggers": "Administrar activadores de esta sesión...",
       "select_command": "Seleccionar comando",
       "previous_command": "Comando anterior",
       "next_command": "Comando siguiente",
@@ -68,7 +79,8 @@
       "discarded": "Terminal recording discarded",
       "saved": "Terminal recording saved",
       "save_failed": "Failed to save terminal recording",
-      "open_cast": "Open terminal recording",
+      "title": "Grabación del terminal",
+      "open_cast": "Abrir grabación del terminal",
       "open_failed": "Could not open terminal recording",
       "recording": "REC",
       "paused": "Paused",
@@ -83,6 +95,36 @@
       "matches": "matches",
       "search_no_results": "No results",
       "player_empty": "No playback output yet"
+    },
+    "session_log": {
+      "title": "Registro de sesión",
+      "started": "Registro de sesión iniciado",
+      "start_failed": "No se pudo iniciar el registro de sesión",
+      "write_failed": "El registro de sesión se detuvo porque no se pudo escribir el archivo",
+      "stopped": "Registro de sesión guardado",
+      "stop_failed": "No se pudo finalizar el registro de sesión",
+      "start": "Iniciar registro de sesión",
+      "pause": "Pausar registro de sesión",
+      "resume": "Reanudar registro de sesión",
+      "stop": "Detener registro de sesión",
+      "open_file": "Abrir registro actual",
+      "open_directory": "Abrir carpeta de registros",
+      "open_failed": "No se pudo abrir el registro de sesión"
+    },
+    "highlight_override": {
+      "title": "Resaltado",
+      "source_global_base": "Usando reglas base globales",
+      "source_session": "Reemplazo de sesión: {{name}}",
+      "source_connection": "Reemplazo de conexión: {{name}}",
+      "source_global": "Configuración global: {{name}}",
+      "override_hint": "La selección reemplaza la configuración base de esta sesión.",
+      "use_inherited": "Usar configuración heredada",
+      "use_global_for_session": "Usar configuración global en esta sesión: {{name}}",
+      "save_to_connection": "Guardar la selección en esta conexión",
+      "saved_to_connection": "Reemplazo guardado en la conexión",
+      "reset_connection": "Restablecer esta conexión para heredar",
+      "command_context": "Resaltar términos de búsqueda de grep/rg",
+      "manage_rule_sets": "Administrar reglas base y conjuntos…"
     },
     "trzsz": {
       "select_upload_directory_title": "Seleccionar carpeta para subir",
@@ -351,6 +393,8 @@
       "current": "Actual",
       "all": "Todos",
       "selected": "Seleccionados",
+      "group": "Grupo",
+      "no_groups": "No hay grupos de difusión",
       "start": "Iniciar",
       "stop": "Detener",
       "idle": "Listo",
@@ -366,6 +410,13 @@
       "error_busy": "Otro emisor está usando un destino"
     },
     "broadcast": {
+      "groups": "Grupos de difusión",
+      "create_group": "Nuevo grupo",
+      "no_groups": "Aún no hay grupos con nombre",
+      "temporary_group": "Selección temporal",
+      "group_name_placeholder": "Nombre del grupo",
+      "group_members": "Miembros del grupo",
+      "unsaved_target": "No guardada",
       "current": "Actual",
       "deselect_all": "Deseleccionar todo",
       "no_targets": "No hay otros terminales disponibles",

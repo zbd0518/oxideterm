@@ -17,9 +17,9 @@ use gpui::{Div, EventEmitter, Task, prelude::*, rgba};
 use oxideterm_connections::{
     AuthType, ConnectionAuthDraft, ConnectionAuthDraftKind, ConnectionDraft, ConnectionInfo,
     ConnectionStore, MoshProfile, ProxyHopDraft, RemoteDesktopProfile, SaveConnectionRequest,
-    SavedAuth, SavedConnection, SavedProxyHop, SavedUpstreamProxyAuth, SavedUpstreamProxyConfig,
-    SavedUpstreamProxyPolicy, SavedUpstreamProxyProtocol, SecretString, SerialProfile,
-    SshConfigHost, TelnetProfile,
+    SavedAuth, SavedConnection, SavedProxyCommand, SavedUpstreamProxyAuth,
+    SavedUpstreamProxyConfig, SavedUpstreamProxyPolicy, SavedUpstreamProxyProtocol, SecretString,
+    SerialProfile, SshConfigHost, TelnetProfile,
     oxide_file::{
         ExportPreflightResult, ForwardDetail, ImportConflictStrategy, ImportPreview,
         ImportResultEnvelope, OxideExportOptions, OxideFile, OxideFileError, OxideForwardRecord,
@@ -257,12 +257,6 @@ const SESSION_MANAGER_BASIC_DIALOG_FOOTER_ACTIONS: [SessionManagerBasicDialogFoo
     SessionManagerBasicDialogFooterAction::Primary,
 ];
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum SessionTransferAction {
-    ImportOxide,
-    ExportOxide,
-}
-
 pub(super) enum SessionManagerWorkspaceEvent {
     OxideEffectsReady(oxide_actions::OxideWorkspaceEffects),
     RefreshOxideExportPreflight,
@@ -286,6 +280,10 @@ pub(super) enum SessionManagerDeleteConfirm {
         id: String,
         name: String,
     },
+    StandaloneSftpProfile {
+        id: String,
+        name: String,
+    },
     RemoteDesktopProfile {
         id: String,
         name: String,
@@ -304,6 +302,7 @@ pub(super) enum SessionManagerSelectionTarget {
     Serial(String),
     Telnet(String),
     Mosh(String),
+    StandaloneSftp(String),
     RemoteDesktop(String),
 }
 
@@ -313,6 +312,7 @@ pub(super) enum SessionManagerRowActionTarget {
     Serial(String),
     Telnet(String),
     Mosh(String),
+    StandaloneSftp(String),
     RemoteDesktop(String),
     GroupRoot,
     Group(String),
@@ -1026,7 +1026,7 @@ use self::{
 pub(in crate::workspace) use self::helpers::save_request_from_form;
 pub(in crate::workspace) use self::helpers::{
     RuntimeSecretHandoff, duplicate_connection_template_name, form_from_saved_connection,
-    restore_saved_proxy_chain_in_form, save_request_from_form_with_existing_auth,
+    restore_legacy_jump_host_in_form, save_request_from_form_with_existing_auth,
     save_request_from_form_with_proxy_hop_prefix, upstream_proxy_config_from_form,
 };
 

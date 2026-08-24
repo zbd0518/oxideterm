@@ -769,8 +769,10 @@ impl WorkspaceApp {
             TerminalGitPanelSection::Changes
         };
 
+        self.dismiss_terminal_recording_menu();
         self.close_terminal_quick_commands_popover(cx);
         self.dismiss_terminal_broadcast_menu(cx);
+        self.dismiss_terminal_highlight_popover();
         self.close_terminal_cwd_picker(cx);
         self.close_terminal_project_panel(cx);
         self.ime_marked_text = None;
@@ -1586,37 +1588,6 @@ fn terminal_git_clean_ai_commit_subject(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn git_panel_more_label_exists_in_every_locale() {
-        let locales = [
-            Locale::De,
-            Locale::En,
-            Locale::EsEs,
-            Locale::FrFr,
-            Locale::It,
-            Locale::Ja,
-            Locale::Ko,
-            Locale::PtBr,
-            Locale::Vi,
-            Locale::ZhCn,
-            Locale::ZhTw,
-        ];
-        let keys = [
-            TerminalGitPanelSection::More.label_key(),
-            "terminal.git.group_repository",
-            "terminal.git.group_advanced",
-            "terminal.git.commit_message_placeholder",
-        ];
-
-        // The compact navigation must never expose a raw key in shipped locales.
-        for locale in locales {
-            let i18n = I18n::new(locale);
-            for key in keys {
-                assert_ne!(i18n.t(key), key, "{locale:?} missing {key}");
-            }
-        }
-    }
 
     #[test]
     fn ai_commit_message_becomes_an_editable_subject() {

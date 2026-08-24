@@ -1,6 +1,16 @@
 {
   "terminal": {
     "local_terminal": "本機終端機",
+    "triggers": {
+      "risky_quick_command_title": "執行高風險觸發器動作？",
+      "risky_quick_command_description": "觸發器「{{trigger}}」將執行快速命令「{{command}}」，風險等級為{{risk}}。",
+      "cancel": "取消",
+      "run": "執行",
+      "launch_failed": "觸發器無法啟動本機程式。",
+      "risk_high": "高",
+      "risk_medium": "中",
+      "risk_configured": "依設定需確認"
+    },
     "paste": {
       "title": "偵測到多行內容（{{count}} 行）",
       "more_lines": "... 還有 {{count}} 行",
@@ -18,6 +28,7 @@
       "insert_selection_into_command": "在此插入選取內容",
       "replace_command_with_selection": "用選取內容取代目前命令",
       "find": "尋找...",
+      "manage_triggers": "管理此工作階段的觸發器...",
       "select_command": "選取命令",
       "previous_command": "上一個命令",
       "next_command": "下一個命令",
@@ -68,6 +79,7 @@
       "discarded": "終端錄製已丟棄",
       "saved": "終端錄製已儲存",
       "save_failed": "終端錄製儲存失敗",
+      "title": "終端錄製",
       "open_cast": "開啟終端錄製",
       "open_failed": "無法開啟終端錄製",
       "recording": "錄製中",
@@ -83,6 +95,36 @@
       "matches": "個匹配",
       "search_no_results": "沒有結果",
       "player_empty": "尚無回放輸出"
+    },
+    "session_log": {
+      "title": "工作階段日誌",
+      "started": "工作階段日誌已開始",
+      "start_failed": "無法開始工作階段日誌",
+      "write_failed": "無法寫入檔案，工作階段日誌已停止",
+      "stopped": "工作階段日誌已儲存",
+      "stop_failed": "無法完成工作階段日誌",
+      "start": "開始工作階段日誌",
+      "pause": "暫停工作階段日誌",
+      "resume": "繼續工作階段日誌",
+      "stop": "停止工作階段日誌",
+      "open_file": "開啟目前日誌",
+      "open_directory": "開啟日誌資料夾",
+      "open_failed": "無法開啟工作階段日誌"
+    },
+    "highlight_override": {
+      "title": "醒目提示",
+      "source_global_base": "正在使用全域基礎規則",
+      "source_session": "目前工作階段覆寫：{{name}}",
+      "source_connection": "連線覆寫：{{name}}",
+      "source_global": "全域設定：{{name}}",
+      "override_hint": "此處的選擇會覆寫目前工作階段的基礎設定。",
+      "use_inherited": "使用繼承設定",
+      "use_global_for_session": "本工作階段使用全域設定：{{name}}",
+      "save_to_connection": "將目前選擇儲存至此連線",
+      "saved_to_connection": "醒目提示覆寫已儲存至連線",
+      "reset_connection": "將此連線恢復為繼承",
+      "command_context": "醒目顯示 grep/rg 查詢詞",
+      "manage_rule_sets": "管理基礎規則與規則集…"
     },
     "trzsz": {
       "select_upload_directory_title": "選擇要上傳的資料夾",
@@ -351,6 +393,8 @@
       "current": "目前",
       "all": "全部",
       "selected": "指定",
+      "group": "群組",
+      "no_groups": "沒有廣播群組",
       "start": "開始",
       "stop": "停止",
       "idle": "就緒",
@@ -366,6 +410,13 @@
       "error_busy": "目標正由另一個傳送工作使用"
     },
     "broadcast": {
+      "groups": "廣播群組",
+      "create_group": "新增群組",
+      "no_groups": "尚無命名群組",
+      "temporary_group": "暫時選擇",
+      "group_name_placeholder": "群組名稱",
+      "group_members": "群組成員",
+      "unsaved_target": "未儲存",
       "current": "目前",
       "deselect_all": "取消全選",
       "no_targets": "沒有其他可用終端",

@@ -79,6 +79,13 @@ impl TerminalSessionBackend for LocalPtySession {
         LocalPtySession::set_output_events_enabled(self, enabled);
     }
 
+    fn set_trigger_rules(
+        &mut self,
+        rules: Option<Arc<oxideterm_terminal_triggers::CompiledTriggerSet>>,
+    ) {
+        LocalPtySession::set_trigger_rules(self, rules);
+    }
+
     fn start_modem_transfer(
         &mut self,
         request: TerminalModemTransferRequest,
@@ -108,6 +115,14 @@ impl TerminalSessionBackend for LocalPtySession {
 
     fn scroll_lines(&mut self, delta: i32) {
         LocalPtySession::scroll_lines(self, delta);
+    }
+
+    fn scroll_lines_snapshot_incremental(
+        &mut self,
+        delta: i32,
+        previous: &TerminalSnapshot,
+    ) -> TerminalSnapshot {
+        LocalPtySession::scroll_lines_snapshot_incremental(self, delta, previous)
     }
 
     fn page_up(&mut self) {

@@ -1,6 +1,16 @@
 {
   "terminal": {
     "local_terminal": "Local Terminal",
+    "triggers": {
+      "risky_quick_command_title": "Run a risky trigger action?",
+      "risky_quick_command_description": "Trigger “{{trigger}}” will run quick command “{{command}}” with {{risk}} risk.",
+      "cancel": "Cancel",
+      "run": "Run",
+      "launch_failed": "The trigger could not start the local program.",
+      "risk_high": "high",
+      "risk_medium": "medium",
+      "risk_configured": "configured"
+    },
     "command_bar": {
       "command": "Command",
       "command_mode": "Command mode",
@@ -47,6 +57,8 @@
       "current": "Current",
       "all": "All",
       "selected": "Selected",
+      "group": "Group",
+      "no_groups": "No broadcast groups",
       "start": "Start",
       "stop": "Stop",
       "idle": "Ready",
@@ -62,6 +74,13 @@
       "error_busy": "A target is used by another sender"
     },
     "broadcast": {
+      "groups": "Broadcast groups",
+      "create_group": "New group",
+      "no_groups": "No named groups yet",
+      "temporary_group": "Temporary selection",
+      "group_name_placeholder": "Group name",
+      "group_members": "Group members",
+      "unsaved_target": "Not saved",
       "select_targets": "Broadcast targets",
       "no_targets": "No other terminals",
       "current": "Current",
@@ -88,6 +107,7 @@
       "insert_selection_into_command": "Insert selection here",
       "replace_command_with_selection": "Replace command with selection",
       "find": "Find...",
+      "manage_triggers": "Manage triggers for this session...",
       "select_command": "Select command",
       "previous_command": "Previous command",
       "next_command": "Next command",
@@ -138,6 +158,7 @@
       "discarded": "Terminal recording discarded",
       "saved": "Terminal recording saved",
       "save_failed": "Failed to save terminal recording",
+      "title": "Terminal recording",
       "open_cast": "Open terminal recording",
       "open_failed": "Could not open terminal recording",
       "recording": "REC",
@@ -153,6 +174,36 @@
       "matches": "matches",
       "search_no_results": "No results",
       "player_empty": "No playback output yet"
+    },
+    "session_log": {
+      "title": "Session log",
+      "started": "Session logging started",
+      "start_failed": "Could not start session logging",
+      "write_failed": "Session logging stopped because the file could not be written",
+      "stopped": "Session log saved",
+      "stop_failed": "Could not finish the session log",
+      "start": "Start Session Log",
+      "pause": "Pause Session Log",
+      "resume": "Resume Session Log",
+      "stop": "Stop Session Log",
+      "open_file": "Open Current Log",
+      "open_directory": "Open Log Folder",
+      "open_failed": "Could not open the session log"
+    },
+    "highlight_override": {
+      "title": "Highlighting",
+      "source_global_base": "Using global base rules",
+      "source_session": "Session override: {{name}}",
+      "source_connection": "Connection override: {{name}}",
+      "source_global": "Global setting: {{name}}",
+      "override_hint": "Selections here override the base setting for this session.",
+      "use_inherited": "Use inherited setting",
+      "use_global_for_session": "Use global setting for this session: {{name}}",
+      "save_to_connection": "Save current choice to this connection",
+      "saved_to_connection": "Highlight override saved to connection",
+      "reset_connection": "Reset this connection to inherit",
+      "command_context": "Highlight grep/rg query terms",
+      "manage_rule_sets": "Manage base rules and rule sets…"
     },
     "trzsz": {
       "select_upload_directory_title": "Select a folder to upload",

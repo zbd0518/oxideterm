@@ -41,7 +41,7 @@ impl SftpWorkspaceEntity {
                 selected_count: self.local_selected.len(),
                 path_editing: self.editing_local_path,
                 path_input: self.local_path_input.clone(),
-                loading: false,
+                loading: self.pair_primary_loading,
             },
             remote: SftpPaneRenderSnapshot {
                 path: self.remote_path.clone(),
@@ -350,13 +350,13 @@ impl WorkspaceApp {
                                 cx.entity(),
                             )),
                     )
-                    .child(
-                        div()
-                            .truncate()
-                            .text_size(px(SFTP_TEXT_10))
-                            .text_color(rgb(theme.text_muted))
-                            .child(path),
-                    ),
+                    .child(self.render_sftp_sidebar_path_bar(
+                        &path,
+                        &snapshot.remote.path_input,
+                        snapshot.remote.path_editing,
+                        snapshot.focused_input,
+                        cx,
+                    )),
             )
             .child(self.render_sftp_filter(
                 SftpPane::Remote,
@@ -375,7 +375,100 @@ impl WorkspaceApp {
             // sidebar without being clipped by the sidebar scroll region.
             root = root.child(self.render_sftp_context_menu(menu, window, false, cx));
         }
+        if !dialog_open
+            && snapshot.focused_input == Some(SftpInput::RemotePath)
+            && let Some(completion) =
+                self.render_path_completion_overlay(PathCompletionOwner::SftpRemote, cx)
+        {
+            root = root.child(completion);
+        }
         root.into_any_element()
+    }
+
+    fn render_sftp_sidebar_path_bar(
+        &self,
+        path: &str,
+        path_input: &str,
+        editing: bool,
+        focused_input: Option<SftpInput>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = self.tokens.ui;
+        let focused = focused_input == Some(SftpInput::RemotePath);
+        let mut path_bar = div()
+            .id("sftp-sidebar-path-input")
+            .w_full()
+            .min_w(px(0.0))
+            .h(px(24.0))
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .rounded(px(self.tokens.radii.sm))
+            .border_1()
+            .border_color(if focused {
+                rgb(theme.accent)
+            } else {
+                rgb(theme.border)
+            })
+            .bg(rgb(theme.bg_sunken));
+
+        if editing {
+            // The sidebar uses one compact text field instead of the full breadcrumb row.
+            path_bar = path_bar
+                .child(self.render_sftp_inline_text(
+                    SftpInput::RemotePath,
+                    Some(SftpPane::Remote),
+                    path_input,
+                    "sftp.file_list.path_placeholder",
+                    focused,
+                    cx,
+                ))
+                .child(
+                    div()
+                        .flex_none()
+                        .size(px(16.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(self.tokens.radii.sm))
+                        .cursor_pointer()
+                        .hover(move |button| button.bg(rgb(theme.bg_hover)))
+                        .child(Self::render_lucide_icon(
+                            LucideIcon::CornerDownLeft,
+                            SFTP_ICON_SM,
+                            rgb(theme.text),
+                        ))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.commit_sftp_path_input(SftpPane::Remote, cx);
+                                cx.stop_propagation();
+                            }),
+                        ),
+                );
+        } else {
+            path_bar = path_bar
+                .cursor(CursorStyle::IBeam)
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .text_size(px(SFTP_TEXT_10))
+                        .text_color(rgb(theme.text_muted))
+                        .child(path.to_string()),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, window, cx| {
+                        window.focus(&this.focus_handle, cx);
+                        this.start_sftp_path_edit(SftpPane::Remote, cx);
+                        cx.stop_propagation();
+                    }),
+                );
+        }
+
+        path_bar.into_any_element()
     }
 
     pub(in crate::workspace) fn render_sftp_surface(
@@ -396,7 +489,7 @@ impl WorkspaceApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = self.tokens.ui;
-        let Some(node_id) = self.sftp_tab_nodes.get(&tab_id).cloned() else {
+        let Some(remote_id) = self.sftp_remote_id_for_tab(tab_id) else {
             return self.render_empty_workspace(f32::from(window.viewport_size().width), cx);
         };
         let has_background = self.background_surface_active("sftp");
@@ -423,11 +516,39 @@ impl WorkspaceApp {
         let remote_active = active_pane == SftpPane::Remote;
         let local_drag_over = drag_over_pane == Some(SftpPane::Local);
         let remote_drag_over = drag_over_pane == Some(SftpPane::Remote);
-        let node_title = self
-            .ssh_nodes
-            .get(&node_id)
-            .map(|node| node.title.as_str())
-            .unwrap_or("mock-host");
+        let remote_title = match &remote_id {
+            SftpRemoteId::Node(node_id) => self
+                .ssh_nodes
+                .get(node_id)
+                .map(|node| node.title.clone())
+                .unwrap_or_else(|| node_id.0.clone()),
+            SftpRemoteId::Standalone(endpoint_id) => self
+                .standalone_sftp_sessions
+                .get(endpoint_id)
+                .map(|runtime| runtime.title.clone())
+                .unwrap_or_else(|| endpoint_id.clone()),
+        };
+        let pair_primary_title =
+            self.sftp_pair_primary_remote_id(cx)
+                .map(|remote_id| match remote_id {
+                    SftpRemoteId::Node(node_id) => node_id.0,
+                    SftpRemoteId::Standalone(endpoint_id) => self
+                        .connection_store
+                        .get_standalone_sftp_profile(&endpoint_id)
+                        .map(|profile| profile.host.clone())
+                        .unwrap_or(endpoint_id),
+                });
+        let remote_title = match &remote_id {
+            SftpRemoteId::Standalone(endpoint_id) if endpoint_id.ends_with(":secondary") => {
+                let profile_id = endpoint_id.trim_end_matches(":secondary");
+                self.connection_store
+                    .get_standalone_sftp_profile(profile_id)
+                    .and_then(|profile| profile.secondary_endpoint.as_ref())
+                    .map(|endpoint| endpoint.host.clone())
+                    .unwrap_or(remote_title)
+            }
+            _ => remote_title,
+        };
 
         let mut root = div()
             .id("sftp-view")
@@ -471,7 +592,14 @@ impl WorkspaceApp {
                             .flex()
                             .child(self.render_sftp_pane(
                                 SftpPane::Local,
-                                self.i18n.t("sftp.file_list.local"),
+                                pair_primary_title.map_or_else(
+                                    || self.i18n.t("sftp.file_list.local"),
+                                    |host| {
+                                        self.i18n
+                                            .t("sftp.file_list.remote")
+                                            .replace("{{host}}", &host)
+                                    },
+                                ),
                                 local,
                                 local_active,
                                 local_drag_over,
@@ -495,7 +623,7 @@ impl WorkspaceApp {
                                     SftpPane::Remote,
                                     self.i18n
                                         .t("sftp.file_list.remote")
-                                        .replace("{{host}}", node_title),
+                                        .replace("{{host}}", &remote_title),
                                     remote,
                                     remote_active,
                                     remote_drag_over,
@@ -745,7 +873,7 @@ impl WorkspaceApp {
                 cx.entity(),
             ));
 
-        if pane == SftpPane::Local {
+        if pane == SftpPane::Local && self.sftp_pair_primary_remote_id(cx).is_none() {
             header = header
                 .child(self.render_sftp_icon_button(
                     LucideIcon::HardDrive,
@@ -940,7 +1068,9 @@ impl WorkspaceApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = self.tokens.ui;
-        let segments = sftp_path_segments(path, pane == SftpPane::Remote);
+        let pane_is_remote = pane == SftpPane::Remote
+            || (pane == SftpPane::Local && self.sftp_pair_primary_remote_id(cx).is_some());
+        let segments = sftp_path_segments(path, pane_is_remote);
         let scroll_handle = match pane {
             SftpPane::Local => self.sftp_view.read(cx).local_path_scroll.clone(),
             SftpPane::Remote => self.sftp_view.read(cx).remote_path_scroll.clone(),

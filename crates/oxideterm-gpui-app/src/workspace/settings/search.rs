@@ -106,6 +106,16 @@ fn settings_search_specs() -> Vec<SettingsSearchEntrySpec> {
             ],
         ),
         settings_search_entry(
+            SettingsTab::General,
+            4,
+            "settings_view.general.connection_uri_integration",
+            &[
+                "settings_view.general.connection_uri_integration_hint",
+                "settings_view.general.external_connection_uris",
+                "settings_view.general.external_connection_uris_hint",
+            ],
+        ),
+        settings_search_entry(
             SettingsTab::Portable,
             0,
             "settings_view.general.portable_runtime",
@@ -262,6 +272,15 @@ fn settings_search_specs() -> Vec<SettingsSearchEntrySpec> {
             ],
         ),
         terminal_search_entry(
+            TerminalSettingsPage::Awareness,
+            3,
+            "settings_view.terminal.triggers.title",
+            &[
+                "settings_view.terminal.triggers.description",
+                "settings_view.terminal.triggers.shell_execution",
+            ],
+        ),
+        terminal_search_entry(
             TerminalSettingsPage::Transfer,
             1,
             "settings_view.terminal.in_band_transfer.title",
@@ -274,11 +293,34 @@ fn settings_search_specs() -> Vec<SettingsSearchEntrySpec> {
             ],
         ),
         terminal_search_entry(
+            TerminalSettingsPage::Logging,
+            1,
+            "settings_view.terminal.session_log_title",
+            &[
+                "settings_view.terminal.session_log_automatic",
+                "settings_view.terminal.session_log_file_name_template",
+                "settings_view.terminal.session_log_file_mode",
+                "settings_view.terminal.session_log_content_template",
+                "settings_view.terminal.session_log_control_sequences",
+                "settings_view.terminal.session_log_retention_days",
+                "settings_view.terminal.session_log_max_file_size",
+                "settings_view.terminal.session_log_directory",
+            ],
+        ),
+        terminal_search_entry(
             TerminalSettingsPage::Highlight,
             1,
             "settings_view.terminal.highlight_rules.title",
             &[
                 "settings_view.terminal.highlight_rules.description",
+                "settings_view.terminal.highlight_rules.rule_set",
+                "settings_view.terminal.highlight_rules.rule_set_hint",
+                "settings_view.terminal.highlight_rules.semantic_coloring",
+                "settings_view.terminal.highlight_rules.semantic_coloring_hint",
+                "settings_view.terminal.highlight_rules.semantic_scheme",
+                "settings_view.terminal.highlight_rules.semantic_scheme_hint",
+                "settings_view.terminal.highlight_rules.semantic_scheme_balanced",
+                "settings_view.terminal.highlight_rules.semantic_scheme_conservative",
                 "settings_view.terminal.highlight_rules.pattern",
                 "settings_view.terminal.highlight_rules.foreground",
                 "settings_view.terminal.highlight_rules.background",
@@ -639,16 +681,16 @@ fn settings_search_specs() -> Vec<SettingsSearchEntrySpec> {
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     specs.push(settings_search_entry(
         SettingsTab::General,
-        4,
+        5,
         "settings_view.general.window_behavior",
         &["settings_view.general.window_behavior_hint"],
     ));
     specs.push(settings_search_entry(
         SettingsTab::General,
         if cfg!(any(target_os = "windows", target_os = "macos")) {
-            5
+            6
         } else {
-            4
+            5
         },
         "settings_view.general.app_lock_title",
         &[
@@ -795,6 +837,11 @@ impl WorkspaceApp {
                 && self.settings_dynamic_section_counts(cx).knowledge_has_error,
         );
         let target_section_index = result.section_index + knowledge_error_offset;
+        if result.terminal_page == Some(TerminalSettingsPage::Awareness)
+            && result.section_index == 3
+        {
+            self.terminal_trigger_settings_pane = None;
+        }
         self.settings_workspace.update(cx, |settings, cx| {
             settings.set_active_tab(tab, cx);
             if let Some(page) = result.terminal_page {

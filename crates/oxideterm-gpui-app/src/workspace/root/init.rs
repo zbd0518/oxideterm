@@ -30,6 +30,20 @@ impl WorkspaceApp {
         let connection_store = ConnectionStore::load(default_connections_path())?;
         let settings = settings_store.settings().clone();
         let i18n = I18n::new(locale_from_settings(settings.general.language));
+        let session_log_directory = settings_store
+            .path()
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("logs")
+            .join("terminal");
+        let session_log_retention_days = settings.terminal.session_log.retention_days.max(0) as u64;
+        cx.background_executor()
+            .spawn(async move {
+                // Cleanup is one-shot and non-fatal; it never owns or observes a terminal connection.
+                let _ =
+                    prune_terminal_session_logs(&session_log_directory, session_log_retention_days);
+            })
+            .detach();
         oxideterm_network_proxy::install_application_proxy_policy_from_settings(
             &settings,
             &connection_store,
@@ -179,6 +193,8 @@ impl WorkspaceApp {
                 workspace.handle_settings_workspace_event(settings, event, cx);
             },
         );
+        let terminal_triggers =
+            settings::TerminalTriggersSettingsState::load(settings_store.path());
         let launcher = cx.new(|cx| LauncherWorkspaceEntity::new(settings.launcher.enabled, cx));
         let launcher_observation = cx.observe(&launcher, |_workspace, _launcher, cx| {
             // Entity-owned scans and input transitions repaint every mounted launcher surface.
@@ -311,6 +327,11 @@ impl WorkspaceApp {
                     sftp::SftpWorkspaceEvent::ResumeIncompleteTransferRequested { transfer_id } => {
                         workspace.resume_sftp_incomplete_transfer(transfer_id.clone(), cx);
                     }
+                    sftp::SftpWorkspaceEvent::DiscardIncompleteTransferRequested {
+                        transfer_id,
+                    } => {
+                        workspace.discard_sftp_incomplete_transfer(transfer_id.clone(), cx);
+                    }
                     sftp::SftpWorkspaceEvent::TooltipRequested { id, label, x, y } => {
                         workspace.queue_workspace_tooltip(id, label, *x, *y, cx);
                     }
@@ -347,12 +368,12 @@ impl WorkspaceApp {
                     }
                     sftp::SftpWorkspaceEvent::RemoteLoadReady {
                         surface_id,
-                        node_id,
+                        remote_id,
                         delivery,
                     } => {
                         workspace.request_visible_sftp_remote_load(
                             *surface_id,
-                            node_id.clone(),
+                            remote_id.clone(),
                             delivery.clone(),
                             cx,
                         );
@@ -608,11 +629,23 @@ impl WorkspaceApp {
             tab_host,
             _tab_host_subscription: tab_host_subscription,
             search: SearchBarState::default(),
+            terminal_recording_menu_open: false,
+            terminal_highlight_popover_open: false,
+            terminal_trigger_settings_pane: None,
+            terminal_trigger_shell_confirmation_pending: false,
+            terminal_triggers,
+            terminal_trigger_runtime:
+                terminal_triggers_runtime::TerminalTriggerRuntimeState::default(),
+            terminal_saved_connection_refs: HashMap::new(),
+            terminal_semantic_highlight_section_expanded: true,
+            terminal_rule_highlight_section_expanded: true,
+            terminal_command_context_highlight_section_expanded: true,
             terminal_command_sender,
             _terminal_command_sender_observation: terminal_command_sender_observation,
             detached_local_terminals: HashMap::new(),
             detached_local_terminal_order: Vec::new(),
             serial_terminal_configs: HashMap::new(),
+            telnet_terminal_profile_ids: HashMap::new(),
             detached_local_terminals_popover_open: false,
             command_palette,
             _command_palette_observation: command_palette_observation,
@@ -782,6 +815,9 @@ impl WorkspaceApp {
             _file_manager_observation: file_manager_observation,
             _file_manager_subscription: file_manager_subscription,
             sftp_tab_nodes: HashMap::new(),
+            standalone_sftp_tabs: HashMap::new(),
+            standalone_sftp_sessions: HashMap::new(),
+            pending_standalone_sftp_pair_launches: HashMap::new(),
             embedded_sftp_node_id: None,
             sftp_presentation_request: None,
             ide_workspace,
@@ -856,9 +892,11 @@ impl WorkspaceApp {
         workspace.sync_active_terminal_metadata_context(cx);
         workspace.sync_active_terminal_recording_elapsed_tick(cx);
         workspace.sync_active_privilege_prompt_inline_hint(cx);
+        workspace.refresh_terminal_trigger_runtime(cx);
         workspace.schedule_automatic_native_update_check(cx);
         cx.on_release(|workspace, cx| {
             workspace.flush_main_window_state(cx);
+            workspace.shutdown_terminal_trigger_runtime();
             // Shutdown ordering is security-sensitive: late broker callbacks
             // fail before user-decision waiters and owner projections disappear.
             workspace.ai_runtime_context.update(cx, |runtime, _cx| {
@@ -915,13 +953,62 @@ impl WorkspaceApp {
         &self,
         saved_connection_id: Option<&str>,
     ) -> TerminalUiPreferenceOverrides {
-        let Some(options) = saved_connection_id
+        let Some(connection) = saved_connection_id
             .and_then(|saved_connection_id| self.connection_store.get(saved_connection_id))
-            .map(|connection| connection.options.terminal)
         else {
             return TerminalUiPreferenceOverrides::default();
         };
-        terminal_preference_overrides(options)
+        let mut overrides = terminal_preference_overrides(
+            connection.options.terminal.clone(),
+            &self.settings_store.settings().terminal,
+        );
+        overrides.session_log_context = Some(TerminalSessionLogContext {
+            session: connection.name.clone(),
+            host: connection.host.clone(),
+            username: connection.username.clone(),
+            protocol: "ssh".to_string(),
+        });
+        overrides
+    }
+
+    pub(in crate::workspace) fn terminal_preference_overrides_for_local_shell(
+        &self,
+        shell: Option<&ShellInfo>,
+    ) -> TerminalUiPreferenceOverrides {
+        let fallback_shell;
+        let shell = if let Some(shell) = shell {
+            shell
+        } else {
+            fallback_shell = oxideterm_terminal::default_shell();
+            &fallback_shell
+        };
+        let settings = self.settings_store.settings();
+        let semantic_scheme_id = settings
+            .local_terminal
+            .semantic_scheme_for_shell(&shell.id)
+            .map(str::to_string);
+        let semantic_scheme = semantic_scheme_id
+            .as_ref()
+            .map(|scheme_id| ConnectionTerminalOptions {
+                semantic_scheme: Some(scheme_id.to_string()),
+                ..ConnectionTerminalOptions::default()
+            })
+            .map(|options| terminal_preference_overrides(options, &settings.terminal))
+            .and_then(|overrides| overrides.semantic_scheme);
+
+        TerminalUiPreferenceOverrides {
+            semantic_scheme,
+            semantic_scheme_id,
+            semantic_shell: Some(semantic_shell_dialect(&shell.id)),
+            local_shell_id: Some(shell.id.clone()),
+            session_log_context: Some(TerminalSessionLogContext {
+                session: shell.label.clone(),
+                host: "localhost".to_string(),
+                username: String::new(),
+                protocol: "local".to_string(),
+            }),
+            ..TerminalUiPreferenceOverrides::default()
+        }
     }
 
     pub(in crate::workspace) fn terminal_preference_overrides_for_ssh_node(
@@ -935,7 +1022,17 @@ impl WorkspaceApp {
             return self
                 .terminal_preference_overrides_for_saved_connection(Some(saved_connection_id));
         }
-        terminal_preference_overrides(node.terminal_options)
+        let mut overrides = terminal_preference_overrides(
+            node.terminal_options.clone(),
+            &self.settings_store.settings().terminal,
+        );
+        overrides.session_log_context = Some(TerminalSessionLogContext {
+            session: node.title.clone(),
+            host: node.endpoint.host.clone(),
+            username: node.endpoint.username.clone(),
+            protocol: "ssh".to_string(),
+        });
+        overrides
     }
 
     pub(in crate::workspace) fn apply_saved_connection_terminal_preferences(
@@ -967,7 +1064,11 @@ impl WorkspaceApp {
         for (pane_id, pane) in panes {
             let application_preferences = self.terminal_preferences_for_pane(pane_id, cx);
             pane.update(cx, |pane, cx| {
-                pane.set_preference_overrides(preference_overrides, application_preferences, cx);
+                pane.set_preference_overrides(
+                    preference_overrides.clone(),
+                    application_preferences,
+                    cx,
+                );
             });
         }
     }
@@ -1000,6 +1101,14 @@ impl WorkspaceApp {
         let clear_screen_shortcut = clear_screen_shortcut
             .as_ref()
             .map(crate::keybindings::format_combo);
+        let session_log_directory = self
+            .settings_store
+            .path()
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("logs")
+            .join("terminal");
+        let session_log_settings = &terminal.session_log;
         TerminalUiPreferences {
             font_family: terminal
                 .font_family
@@ -1025,6 +1134,12 @@ impl WorkspaceApp {
             right_click_paste: terminal.right_click_paste,
             open_links_with_modifier: terminal.open_links_with_modifier,
             detect_file_paths_as_links: terminal.detect_file_paths_as_links,
+            semantic_coloring: terminal.semantic_coloring,
+            semantic_scheme: resolved_terminal_semantic_scheme(
+                terminal.semantic_scheme,
+                terminal.active_custom_semantic_scheme(),
+            ),
+            semantic_shell: SemanticShellDialect::Auto,
             selection_requires_shift: terminal.selection_requires_shift,
             free_type_mode: terminal.free_type_mode,
             backspace_sequence: terminal.backspace_sequence,
@@ -1061,6 +1176,7 @@ impl WorkspaceApp {
                     .i18n
                     .t("terminal.command_selection.replace_command_with_selection"),
                 find: self.i18n.t("terminal.command_selection.find"),
+                manage_triggers: self.i18n.t("terminal.command_selection.manage_triggers"),
                 select_command: self.i18n.t("terminal.command_selection.select_command"),
                 previous_command: self.i18n.t("terminal.command_selection.previous_command"),
                 next_command: self.i18n.t("terminal.command_selection.next_command"),
@@ -1106,6 +1222,22 @@ impl WorkspaceApp {
                 line_ending_cr: self.i18n.t("terminal.serial_control.line_ending_cr"),
                 line_ending_none: self.i18n.t("terminal.serial_control.line_ending_none"),
                 reconnect_failed: self.i18n.t("terminal.serial_control.reconnect_failed"),
+            },
+            session_log_options: Some(TerminalSessionLogOptions {
+                directory: session_log_directory,
+                include_control_sequences: session_log_settings.include_control_sequences,
+                retention_days: session_log_settings.retention_days.max(0) as u64,
+                max_file_bytes: (session_log_settings.max_file_size_mib.max(1) as u64)
+                    .saturating_mul(1024 * 1024),
+                file_name_template: session_log_settings.file_name_template.clone(),
+                content_template: session_log_settings.content_template.clone(),
+                file_mode: session_log_settings.file_mode,
+                context: TerminalSessionLogContext::default(),
+            }),
+            session_log_automatic: session_log_settings.automatic,
+            session_log_labels: TerminalSessionLogLabels {
+                start_failed: self.i18n.t("terminal.session_log.start_failed"),
+                write_failed: self.i18n.t("terminal.session_log.write_failed"),
             },
             trzsz_labels: TerminalTrzszLabels {
                 select_upload_directory_title: self
@@ -1177,40 +1309,7 @@ impl WorkspaceApp {
                     let _ = tx.send(notice);
                 })
             }),
-            highlight_rules: Arc::from(
-                terminal
-                    .highlight_rules
-                    .iter()
-                    .map(|rule| UiHighlightRule {
-                        id: rule.id.clone(),
-                        pattern: rule.pattern.clone(),
-                        is_regex: rule.is_regex,
-                        case_sensitive: rule.case_sensitive,
-                        foreground: rule.foreground.clone(),
-                        background: rule.background.clone(),
-                        render_mode: match rule.render_mode {
-                            HighlightRuleRenderMode::Background => {
-                                TerminalHighlightRenderMode::Background
-                            }
-                            HighlightRuleRenderMode::Underline => {
-                                TerminalHighlightRenderMode::Underline
-                            }
-                            HighlightRuleRenderMode::Outline => {
-                                TerminalHighlightRenderMode::Outline
-                            }
-                        },
-                        match_scope: match rule.match_scope {
-                            HighlightRuleMatchScope::Match => TerminalHighlightMatchScope::Match,
-                            HighlightRuleMatchScope::LogicalLine => {
-                                TerminalHighlightMatchScope::LogicalLine
-                            }
-                        },
-                        preserve_background: rule.preserve_background,
-                        enabled: rule.enabled,
-                        priority: rule.priority,
-                    })
-                    .collect::<Vec<_>>(),
-            ),
+            highlight_rules: terminal_highlight_rules(terminal.effective_highlight_rules()),
             trzsz_policy,
             theme: TerminalUiTheme::from_tokens(self.tokens),
         }
@@ -1298,7 +1397,36 @@ impl WorkspaceApp {
 
 pub(in crate::workspace) fn terminal_preference_overrides(
     options: ConnectionTerminalOptions,
+    terminal_settings: &oxideterm_settings::TerminalSettings,
 ) -> TerminalUiPreferenceOverrides {
+    let semantic_scheme_id = options.semantic_scheme.clone();
+    let semantic_scheme = options.semantic_scheme.as_deref().and_then(|id| match id {
+        "balanced" => Some(resolved_terminal_semantic_scheme(
+            oxideterm_settings::TerminalSemanticScheme::Balanced,
+            None,
+        )),
+        "conservative" => Some(resolved_terminal_semantic_scheme(
+            oxideterm_settings::TerminalSemanticScheme::Conservative,
+            None,
+        )),
+        custom_id => terminal_settings
+            .custom_semantic_schemes
+            .iter()
+            .find(|scheme| scheme.id == custom_id)
+            .map(|scheme| {
+                resolved_terminal_semantic_scheme(
+                    oxideterm_settings::TerminalSemanticScheme::Balanced,
+                    Some(scheme),
+                )
+            }),
+    });
+    let highlight_rule_set = options
+        .highlight_rule_set
+        .as_deref()
+        .and_then(|id| terminal_settings.highlight_rule_set(id));
+    let highlight_rule_set_id = highlight_rule_set.map(|rule_set| rule_set.id.clone());
+    let highlight_rules =
+        highlight_rule_set.map(|rule_set| terminal_highlight_rules(&rule_set.rules));
     TerminalUiPreferenceOverrides {
         terminal_encoding: options.encoding.map(terminal_encoding_from_connection),
         backspace_sequence: options
@@ -1307,6 +1435,168 @@ pub(in crate::workspace) fn terminal_preference_overrides(
         delete_sequence: options
             .delete_sequence
             .map(terminal_delete_sequence_from_connection),
+        semantic_scheme,
+        semantic_scheme_id,
+        highlight_rules,
+        highlight_rule_set_id,
+        semantic_shell: None,
+        local_shell_id: None,
+        session_log_available: match options.session_log_policy {
+            ConnectionTerminalSessionLogPolicy::Disabled => Some(false),
+            ConnectionTerminalSessionLogPolicy::Automatic
+            | ConnectionTerminalSessionLogPolicy::Manual => Some(true),
+            ConnectionTerminalSessionLogPolicy::Inherit => None,
+        },
+        session_log_automatic: match options.session_log_policy {
+            ConnectionTerminalSessionLogPolicy::Disabled => Some(false),
+            ConnectionTerminalSessionLogPolicy::Automatic => Some(true),
+            ConnectionTerminalSessionLogPolicy::Manual => Some(false),
+            ConnectionTerminalSessionLogPolicy::Inherit => None,
+        },
+        session_log_context: None,
+    }
+}
+
+pub(in crate::workspace) fn terminal_highlight_rules(
+    rules: &[HighlightRule],
+) -> Arc<[UiHighlightRule]> {
+    Arc::from(
+        rules
+            .iter()
+            .map(|rule| UiHighlightRule {
+                id: rule.id.clone(),
+                pattern: rule.pattern.clone(),
+                is_regex: rule.is_regex,
+                case_sensitive: rule.case_sensitive,
+                foreground: rule.foreground.clone(),
+                background: rule.background.clone(),
+                render_mode: match rule.render_mode {
+                    HighlightRuleRenderMode::Background => TerminalHighlightRenderMode::Background,
+                    HighlightRuleRenderMode::Underline => TerminalHighlightRenderMode::Underline,
+                    HighlightRuleRenderMode::Outline => TerminalHighlightRenderMode::Outline,
+                },
+                match_scope: match rule.match_scope {
+                    HighlightRuleMatchScope::Match => TerminalHighlightMatchScope::Match,
+                    HighlightRuleMatchScope::LogicalLine => {
+                        TerminalHighlightMatchScope::LogicalLine
+                    }
+                },
+                preserve_background: rule.preserve_background,
+                enabled: rule.enabled,
+                priority: rule.priority,
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn semantic_shell_dialect(shell_id: &str) -> SemanticShellDialect {
+    let shell_id = shell_id.to_ascii_lowercase();
+    if shell_id.contains("powershell") || shell_id == "pwsh" {
+        SemanticShellDialect::PowerShell
+    } else if shell_id.contains("zsh") {
+        SemanticShellDialect::Zsh
+    } else if shell_id.contains("fish") {
+        SemanticShellDialect::Fish
+    } else if shell_id.contains("bash") || shell_id.starts_with("wsl") {
+        SemanticShellDialect::Bash
+    } else {
+        SemanticShellDialect::Auto
+    }
+}
+
+#[cfg(test)]
+mod semantic_scheme_tests {
+    use super::*;
+
+    #[test]
+    fn local_shell_ids_select_the_matching_tree_sitter_dialect() {
+        assert_eq!(semantic_shell_dialect("bash"), SemanticShellDialect::Bash);
+        assert_eq!(
+            semantic_shell_dialect("pwsh"),
+            SemanticShellDialect::PowerShell
+        );
+        assert_eq!(semantic_shell_dialect("zsh"), SemanticShellDialect::Zsh);
+        assert_eq!(semantic_shell_dialect("fish"), SemanticShellDialect::Fish);
+        assert_eq!(
+            semantic_shell_dialect("custom-shell"),
+            SemanticShellDialect::Auto
+        );
+    }
+
+    #[test]
+    fn connection_highlight_rule_set_resolves_to_terminal_override() {
+        let mut terminal = oxideterm_settings::TerminalSettings::default();
+        terminal
+            .highlight_rule_sets
+            .push(oxideterm_settings::HighlightRuleSet {
+                id: "operations".to_string(),
+                name: "Operations".to_string(),
+                rules: vec![HighlightRule {
+                    id: "error".to_string(),
+                    pattern: "ERROR".to_string(),
+                    ..HighlightRule::default()
+                }],
+            });
+
+        let overrides = terminal_preference_overrides(
+            ConnectionTerminalOptions {
+                highlight_rule_set: Some("operations".to_string()),
+                ..ConnectionTerminalOptions::default()
+            },
+            &terminal,
+        );
+
+        assert_eq!(
+            overrides.highlight_rule_set_id.as_deref(),
+            Some("operations")
+        );
+        assert_eq!(
+            overrides
+                .highlight_rules
+                .as_deref()
+                .and_then(|rules| rules.first())
+                .map(|rule| rule.pattern.as_str()),
+            Some("ERROR")
+        );
+    }
+
+    #[test]
+    fn connection_session_log_policy_controls_availability_and_automatic_start() {
+        let terminal = oxideterm_settings::TerminalSettings::default();
+        let automatic = terminal_preference_overrides(
+            ConnectionTerminalOptions {
+                session_log_policy: ConnectionTerminalSessionLogPolicy::Automatic,
+                ..ConnectionTerminalOptions::default()
+            },
+            &terminal,
+        );
+        assert_eq!(automatic.session_log_available, Some(true));
+        assert_eq!(automatic.session_log_automatic, Some(true));
+
+        let manual = terminal_preference_overrides(
+            ConnectionTerminalOptions {
+                session_log_policy: ConnectionTerminalSessionLogPolicy::Manual,
+                ..ConnectionTerminalOptions::default()
+            },
+            &terminal,
+        );
+        assert_eq!(manual.session_log_available, Some(true));
+        assert_eq!(manual.session_log_automatic, Some(false));
+
+        let disabled = terminal_preference_overrides(
+            ConnectionTerminalOptions {
+                session_log_policy: ConnectionTerminalSessionLogPolicy::Disabled,
+                ..ConnectionTerminalOptions::default()
+            },
+            &terminal,
+        );
+        assert_eq!(disabled.session_log_available, Some(false));
+        assert_eq!(disabled.session_log_automatic, Some(false));
+
+        let inherited =
+            terminal_preference_overrides(ConnectionTerminalOptions::default(), &terminal);
+        assert_eq!(inherited.session_log_available, None);
+        assert_eq!(inherited.session_log_automatic, None);
     }
 }
 

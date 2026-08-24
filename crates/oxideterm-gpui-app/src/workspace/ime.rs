@@ -6,7 +6,7 @@ use gpui::{
     TextRun, Timer, UTF16Selection, Window, font, point, px, rgb,
 };
 use oxideterm_editor_core::utf16::{
-    control_k_delete_end, floor_char_boundary, line_end_for_utf16_offset,
+    byte_index_for_utf16, control_k_delete_end, floor_char_boundary, line_end_for_utf16_offset,
     line_range_for_utf16_offset, line_ranges_utf16, line_start_for_utf16_offset,
     next_utf16_boundary, next_word_boundary, previous_utf16_boundary, previous_word_boundary,
     replace_utf16, transpose_text_at_utf16_offset, utf16_offset_for_byte_index,
@@ -20,7 +20,10 @@ use super::file_manager::FileManagerInput;
 use super::forwards::ForwardInput;
 use super::graphics::GraphicsInput;
 use super::launcher::LauncherInput;
-use super::new_connection::{NewConnectionField, refresh_identity_agent_availability};
+use super::new_connection::{
+    CONNECTION_NOTES_LINE_HEIGHT, CONNECTION_NOTES_VERTICAL_PADDING, NewConnectionField,
+    refresh_connection_timeout_seconds, refresh_identity_agent_availability,
+};
 use super::quick_commands::QuickCommandInput;
 use super::session_manager::{SessionManagerInput, SessionManagerState};
 use super::sftp::SftpInput;
@@ -115,6 +118,7 @@ pub(super) enum WorkspaceImeTarget {
     TerminalGitBranchSearch,
     TerminalGitCommitMessage,
     TerminalProjectSearch,
+    TerminalBroadcastGroupName,
     TerminalCastSearch,
     HostProcessSearch,
     HostProcessRenice,
@@ -403,6 +407,17 @@ pub(super) struct WorkspaceImeSelection {
     reversed: bool,
 }
 
+impl WorkspaceImeSelection {
+    /// Returns the moving edge that a text viewport must keep visible.
+    fn active_offset(&self) -> usize {
+        if self.reversed {
+            self.range.start
+        } else {
+            self.range.end
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct WorkspaceImeDragSelection {
     target: WorkspaceImeTarget,
@@ -475,6 +490,7 @@ impl WorkspaceImeTarget {
             Self::TerminalGitBranchSearch => 17,
             Self::TerminalGitCommitMessage => 20,
             Self::TerminalProjectSearch => 19,
+            Self::TerminalBroadcastGroupName => 21,
             Self::TerminalCastSearch => 3,
             Self::HostProcessSearch => 6,
             Self::HostProcessRenice => 7,
@@ -758,7 +774,7 @@ impl InputHandler for WorkspaceInputHandler {
 
     fn bounds_for_range(
         &mut self,
-        _range_utf16: Range<usize>,
+        range_utf16: Range<usize>,
         _window: &mut Window,
         cx: &mut App,
     ) -> Option<Bounds<Pixels>> {
@@ -768,6 +784,21 @@ impl InputHandler for WorkspaceInputHandler {
                 .text_input_anchors
                 .bounds(target.anchor_id())
                 .unwrap_or(self.fallback_bounds);
+            if let WorkspaceImeTarget::QuickCommand(input) = target {
+                let visible_text = view.ime_text_with_marked_text_for_target(target, cx)?;
+                let byte_index = byte_index_for_utf16(&visible_text, range_utf16.end);
+                let viewport = view.terminal.read(cx).quick_commands.input_viewport(input);
+                if let Some(position) = viewport.position_for_byte_index(byte_index) {
+                    // Keep the platform candidate window aligned with the scrolled caret.
+                    return Some(Bounds {
+                        origin: point(position.x, bounds.bottom()),
+                        size: gpui::size(
+                            px(view.tokens.metrics.form_caret_width),
+                            bounds.size.height,
+                        ),
+                    });
+                }
+            }
             Some(Bounds {
                 origin: bounds.origin + point(px(0.0), bounds.size.height),
                 size: bounds.size,
@@ -962,6 +993,9 @@ impl WorkspaceApp {
 
         let terminal_tab_visible = self.active_tab(cx).is_some_and(is_terminal_tab);
         if terminal_tab_visible {
+            if self.terminal.read(cx).broadcast_group_editor().is_some() {
+                return Some(WorkspaceImeTarget::TerminalBroadcastGroupName);
+            }
             let quick_command_input = {
                 let quick_commands = &self.terminal.read(cx).quick_commands;
                 quick_commands
@@ -1030,11 +1064,11 @@ impl WorkspaceApp {
             return Some(WorkspaceImeTarget::Graphics(input));
         }
 
-        if self
-            .active_tab(cx)
-            .is_some_and(|tab| tab.kind == oxideterm_workspace::TabKind::Sftp)
+        if self.visible_sftp_remote_id(cx).is_some()
             && let Some(input) = self.sftp_view.read(cx).focused_input()
         {
+            // The input owner may be a full SFTP tab or the embedded terminal
+            // sidebar; visibility, not the active tab kind, defines ownership.
             return Some(WorkspaceImeTarget::Sftp(input));
         }
 
@@ -1136,6 +1170,19 @@ impl WorkspaceApp {
         cx: &App,
     ) -> Option<Range<usize>> {
         self.ime_selection_range_for_target(target, cx)
+    }
+
+    pub(in crate::workspace) fn ime_active_offset_for_target(
+        &self,
+        target: WorkspaceImeTarget,
+        cx: &App,
+    ) -> Option<usize> {
+        self.ime_selection_for_target(target)
+            .map(|selection| selection.active_offset())
+            .or_else(|| {
+                self.ime_selection_range_for_target(target, cx)
+                    .map(|range| range.end)
+            })
     }
 
     pub(super) fn ime_selection_range_for_target(
@@ -1407,6 +1454,19 @@ impl WorkspaceApp {
             return Some(index.min(text_len));
         }
 
+        if let WorkspaceImeTarget::QuickCommand(input) = target {
+            let viewport = self.terminal.read(cx).quick_commands.input_viewport(input);
+            if let Some(byte_index) = viewport.byte_index_for_position(position) {
+                let visible_text = self
+                    .ime_text_with_marked_text_for_target(target, cx)
+                    .unwrap_or_else(|| text.clone());
+                return Some(utf16_offset_for_byte_index(
+                    &visible_text,
+                    byte_index.min(visible_text.len()),
+                ));
+            }
+        }
+
         let bounds = self.text_input_anchors.bounds(target.anchor_id())?;
         let padding =
             Self::ime_target_horizontal_padding(target, self.tokens.metrics.ui_control_padding_x);
@@ -1496,6 +1556,9 @@ impl WorkspaceApp {
                 // y-to-line mapping tied to the shared textarea renderer.
                 px(input.textarea_line_height())
             }
+            WorkspaceImeTarget::NewConnection(NewConnectionField::Notes) => {
+                px(CONNECTION_NOTES_LINE_HEIGHT)
+            }
             _ if ime_target_is_read_only(target) && line_count > 0 => {
                 let inferred = f32::from(bounds.size.height) / line_count as f32;
                 px(inferred.clamp(16.0, 40.0))
@@ -1527,6 +1590,9 @@ impl WorkspaceApp {
                 // hit-testing starts from the content box, so subtract that top
                 // inset before mapping y to a UTF-16 line.
                 px(8.0)
+            }
+            WorkspaceImeTarget::NewConnection(NewConnectionField::Notes) => {
+                px(CONNECTION_NOTES_VERTICAL_PADDING)
             }
             _ => px(0.0),
         }
@@ -1713,6 +1779,9 @@ impl WorkspaceApp {
                 // across long JSON and command lines.
                 super::settings_mono_font_family(self.settings_store.settings())
             }
+            WorkspaceImeTarget::QuickCommand(_) => {
+                super::settings_mono_font_family(self.settings_store.settings())
+            }
             _ => tauri_ui_font_family(&self.settings_store.settings().appearance.ui_font_family),
         }
     }
@@ -1753,6 +1822,11 @@ impl WorkspaceApp {
                     .project_panel_open()
                     .then(|| terminal.project_query().to_string())
             }
+            WorkspaceImeTarget::TerminalBroadcastGroupName => self
+                .terminal
+                .read(cx)
+                .broadcast_group_editor()
+                .map(|(_, value)| value.to_string()),
             WorkspaceImeTarget::TerminalCastSearch => self
                 .terminal
                 .read(cx)
@@ -2558,6 +2632,14 @@ impl WorkspaceApp {
                     cx.notify();
                 }
             }
+            WorkspaceImeTarget::TerminalBroadcastGroupName => {
+                if self.terminal.update(cx, |terminal, _cx| {
+                    terminal.replace_broadcast_group_editor_text(replacement_range, text)
+                }) {
+                    self.show_active_input_caret(cx);
+                    cx.notify();
+                }
+            }
             WorkspaceImeTarget::TerminalCastSearch => {
                 if self.terminal.update(cx, |terminal, cx| {
                     terminal.replace_cast_search(replacement_range, text, cx)
@@ -2837,6 +2919,7 @@ impl WorkspaceApp {
                     );
                     form.selected_field = None;
                     form.error = None;
+                    refresh_connection_timeout_seconds(form, field);
                     if field == NewConnectionField::IdentityAgent {
                         refresh_identity_agent_availability(form);
                     }
@@ -2888,9 +2971,12 @@ fn new_connection_field_value(
         NewConnectionField::ManagedKeyId => &form.managed_key_id,
         NewConnectionField::CertPath => &form.cert_path,
         NewConnectionField::Passphrase => &form.passphrase,
+        NewConnectionField::GssapiServerIdentity => &form.gssapi_server_identity,
         NewConnectionField::IdentityAgent => &form.identity_agent,
         NewConnectionField::Group => &form.group,
+        NewConnectionField::Notes => &form.notes,
         NewConnectionField::PostConnectCommand => &form.post_connect_command,
+        NewConnectionField::ProxyCommand => &form.proxy_command,
         NewConnectionField::UpstreamProxyHost => &form.upstream_proxy_host,
         NewConnectionField::UpstreamProxyPort => &form.upstream_proxy_port,
         NewConnectionField::UpstreamProxyNoProxy => &form.upstream_proxy_no_proxy,
@@ -2906,6 +2992,58 @@ fn new_connection_field_value(
         NewConnectionField::MoshUdpHost => &form.mosh_udp_host,
         NewConnectionField::MoshUdpPort => &form.mosh_udp_port,
         NewConnectionField::MoshLocale => &form.mosh_locale,
+        NewConnectionField::InitialRemotePath => &form.sftp_initial_remote_path,
+        NewConnectionField::ConnectTimeoutSeconds => &form.connect_timeout_seconds_text,
+        NewConnectionField::StandaloneSftpSecondaryHost => &form.standalone_sftp_secondary.host,
+        NewConnectionField::StandaloneSftpSecondaryPort => &form.standalone_sftp_secondary.port,
+        NewConnectionField::StandaloneSftpSecondaryUsername => {
+            &form.standalone_sftp_secondary.username
+        }
+        NewConnectionField::StandaloneSftpSecondaryPassword => {
+            &form.standalone_sftp_secondary.password
+        }
+        NewConnectionField::StandaloneSftpSecondaryKeyPath => {
+            &form.standalone_sftp_secondary.key_path
+        }
+        NewConnectionField::StandaloneSftpSecondaryManagedKeyId => {
+            &form.standalone_sftp_secondary.managed_key_id
+        }
+        NewConnectionField::StandaloneSftpSecondaryCertPath => {
+            &form.standalone_sftp_secondary.cert_path
+        }
+        NewConnectionField::StandaloneSftpSecondaryPassphrase => {
+            &form.standalone_sftp_secondary.passphrase
+        }
+        NewConnectionField::StandaloneSftpSecondaryGssapiServerIdentity => {
+            &form.standalone_sftp_secondary.gssapi_server_identity
+        }
+        NewConnectionField::StandaloneSftpSecondaryIdentityAgent => {
+            &form.standalone_sftp_secondary.identity_agent
+        }
+        NewConnectionField::StandaloneSftpSecondaryInitialRemotePath => {
+            &form.standalone_sftp_secondary.initial_remote_path
+        }
+        NewConnectionField::StandaloneSftpSecondaryConnectTimeoutSeconds => {
+            &form.standalone_sftp_secondary.connect_timeout_seconds_text
+        }
+        NewConnectionField::StandaloneSftpSecondaryProxyCommand => {
+            &form.standalone_sftp_secondary.proxy_command
+        }
+        NewConnectionField::StandaloneSftpSecondaryUpstreamProxyHost => {
+            &form.standalone_sftp_secondary.upstream_proxy_host
+        }
+        NewConnectionField::StandaloneSftpSecondaryUpstreamProxyPort => {
+            &form.standalone_sftp_secondary.upstream_proxy_port
+        }
+        NewConnectionField::StandaloneSftpSecondaryUpstreamProxyNoProxy => {
+            &form.standalone_sftp_secondary.upstream_proxy_no_proxy
+        }
+        NewConnectionField::StandaloneSftpSecondaryUpstreamProxyUsername => {
+            &form.standalone_sftp_secondary.upstream_proxy_username
+        }
+        NewConnectionField::StandaloneSftpSecondaryUpstreamProxyPassword => {
+            &form.standalone_sftp_secondary.upstream_proxy_password
+        }
         NewConnectionField::JumpHost => &form.jump_server_form.as_ref()?.host,
         NewConnectionField::JumpPort => &form.jump_server_form.as_ref()?.port,
         NewConnectionField::JumpUsername => &form.jump_server_form.as_ref()?.username,
@@ -2914,6 +3052,9 @@ fn new_connection_field_value(
         NewConnectionField::JumpManagedKeyId => &form.jump_server_form.as_ref()?.managed_key_id,
         NewConnectionField::JumpCertPath => &form.jump_server_form.as_ref()?.cert_path,
         NewConnectionField::JumpPassphrase => &form.jump_server_form.as_ref()?.passphrase,
+        NewConnectionField::JumpGssapiServerIdentity => {
+            &form.jump_server_form.as_ref()?.gssapi_server_identity
+        }
         NewConnectionField::JumpIdentityAgent => &form.jump_server_form.as_ref()?.identity_agent,
     })
 }
@@ -2932,9 +3073,12 @@ fn connection_field_value_mut(
         NewConnectionField::ManagedKeyId => &mut form.managed_key_id,
         NewConnectionField::CertPath => &mut form.cert_path,
         NewConnectionField::Passphrase => &mut form.passphrase,
+        NewConnectionField::GssapiServerIdentity => &mut form.gssapi_server_identity,
         NewConnectionField::IdentityAgent => &mut form.identity_agent,
         NewConnectionField::Group => &mut form.group,
+        NewConnectionField::Notes => &mut form.notes,
         NewConnectionField::PostConnectCommand => &mut form.post_connect_command,
+        NewConnectionField::ProxyCommand => &mut form.proxy_command,
         NewConnectionField::UpstreamProxyHost => &mut form.upstream_proxy_host,
         NewConnectionField::UpstreamProxyPort => &mut form.upstream_proxy_port,
         NewConnectionField::UpstreamProxyNoProxy => &mut form.upstream_proxy_no_proxy,
@@ -2950,6 +3094,58 @@ fn connection_field_value_mut(
         NewConnectionField::MoshUdpHost => &mut form.mosh_udp_host,
         NewConnectionField::MoshUdpPort => &mut form.mosh_udp_port,
         NewConnectionField::MoshLocale => &mut form.mosh_locale,
+        NewConnectionField::InitialRemotePath => &mut form.sftp_initial_remote_path,
+        NewConnectionField::ConnectTimeoutSeconds => &mut form.connect_timeout_seconds_text,
+        NewConnectionField::StandaloneSftpSecondaryHost => &mut form.standalone_sftp_secondary.host,
+        NewConnectionField::StandaloneSftpSecondaryPort => &mut form.standalone_sftp_secondary.port,
+        NewConnectionField::StandaloneSftpSecondaryUsername => {
+            &mut form.standalone_sftp_secondary.username
+        }
+        NewConnectionField::StandaloneSftpSecondaryPassword => {
+            &mut form.standalone_sftp_secondary.password
+        }
+        NewConnectionField::StandaloneSftpSecondaryKeyPath => {
+            &mut form.standalone_sftp_secondary.key_path
+        }
+        NewConnectionField::StandaloneSftpSecondaryManagedKeyId => {
+            &mut form.standalone_sftp_secondary.managed_key_id
+        }
+        NewConnectionField::StandaloneSftpSecondaryCertPath => {
+            &mut form.standalone_sftp_secondary.cert_path
+        }
+        NewConnectionField::StandaloneSftpSecondaryPassphrase => {
+            &mut form.standalone_sftp_secondary.passphrase
+        }
+        NewConnectionField::StandaloneSftpSecondaryGssapiServerIdentity => {
+            &mut form.standalone_sftp_secondary.gssapi_server_identity
+        }
+        NewConnectionField::StandaloneSftpSecondaryIdentityAgent => {
+            &mut form.standalone_sftp_secondary.identity_agent
+        }
+        NewConnectionField::StandaloneSftpSecondaryInitialRemotePath => {
+            &mut form.standalone_sftp_secondary.initial_remote_path
+        }
+        NewConnectionField::StandaloneSftpSecondaryConnectTimeoutSeconds => {
+            &mut form.standalone_sftp_secondary.connect_timeout_seconds_text
+        }
+        NewConnectionField::StandaloneSftpSecondaryProxyCommand => {
+            &mut form.standalone_sftp_secondary.proxy_command
+        }
+        NewConnectionField::StandaloneSftpSecondaryUpstreamProxyHost => {
+            &mut form.standalone_sftp_secondary.upstream_proxy_host
+        }
+        NewConnectionField::StandaloneSftpSecondaryUpstreamProxyPort => {
+            &mut form.standalone_sftp_secondary.upstream_proxy_port
+        }
+        NewConnectionField::StandaloneSftpSecondaryUpstreamProxyNoProxy => {
+            &mut form.standalone_sftp_secondary.upstream_proxy_no_proxy
+        }
+        NewConnectionField::StandaloneSftpSecondaryUpstreamProxyUsername => {
+            &mut form.standalone_sftp_secondary.upstream_proxy_username
+        }
+        NewConnectionField::StandaloneSftpSecondaryUpstreamProxyPassword => {
+            &mut form.standalone_sftp_secondary.upstream_proxy_password
+        }
         NewConnectionField::JumpHost => {
             &mut form
                 .jump_server_form
@@ -3006,6 +3202,13 @@ fn connection_field_value_mut(
                 .expect("jump passphrase field without jump form")
                 .passphrase
         }
+        NewConnectionField::JumpGssapiServerIdentity => {
+            &mut form
+                .jump_server_form
+                .as_mut()
+                .expect("jump Kerberos server field without jump form")
+                .gssapi_server_identity
+        }
         NewConnectionField::JumpIdentityAgent => {
             &mut form
                 .jump_server_form
@@ -3046,6 +3249,7 @@ fn ime_target_accepts_newline(target: WorkspaceImeTarget) -> bool {
         WorkspaceImeTarget::ReadOnlyText(_) => true,
         WorkspaceImeTarget::Settings(input) => input.accepts_newline(),
         WorkspaceImeTarget::AiChatInput | WorkspaceImeTarget::AiMessageEdit => true,
+        WorkspaceImeTarget::NewConnection(NewConnectionField::Notes) => true,
         WorkspaceImeTarget::SessionManager(SessionManagerInput::OxideExportDescription) => true,
         _ => false,
     }
@@ -3295,23 +3499,22 @@ fn path_completion_owns_vertical_navigation(
 
 #[cfg(test)]
 mod tests {
-    use gpui::{Bounds, Keystroke, Modifiers, point, px, size};
+    use gpui::{Keystroke, Modifiers};
     use zeroize::{Zeroize, Zeroizing};
 
     use super::{
         CopyShortcutOwner, FileManagerInput, HostToolsPlainTextImeFrame, HostToolsTextInput,
-        NewConnectionField, PendingPlatformTextCommit, SettingsInput, SftpInput, TextInputAnchor,
-        TextInputAnchorId, TextInputAnchorStore, TextInputContentAlign, WorkspaceApp,
-        WorkspaceCaretState, WorkspaceCaretVisibility, WorkspaceImeMarkedText, WorkspaceImeTarget,
-        active_ime_should_defer_input_key, collapsed_copy_shortcut_is_owned_by_target,
-        control_k_delete_end, copy_shortcut_owner_for_target,
-        effective_platform_text_replacement_range, ime_target_is_secret, ime_text_snapshot,
-        keystroke_platform_text, keystroke_uses_text_edit_modifier, line_end_for_utf16_offset,
-        line_range_for_utf16_offset, line_start_for_utf16_offset, next_utf16_boundary,
-        next_word_boundary, normalize_clipboard_text_for_ime_target,
-        path_completion_owns_vertical_navigation, platform_text_commit_is_duplicate,
-        previous_utf16_boundary, previous_word_boundary, secret_ime_proxy,
-        soft_wrapped_line_ranges_utf16, transpose_text_at_utf16_offset,
+        NewConnectionField, PendingPlatformTextCommit, SettingsInput, SftpInput,
+        TextInputAnchorStore, WorkspaceCaretState, WorkspaceCaretVisibility,
+        WorkspaceImeMarkedText, WorkspaceImeTarget, active_ime_should_defer_input_key,
+        collapsed_copy_shortcut_is_owned_by_target, control_k_delete_end,
+        copy_shortcut_owner_for_target, effective_platform_text_replacement_range,
+        ime_target_is_secret, ime_text_snapshot, keystroke_platform_text,
+        keystroke_uses_text_edit_modifier, line_end_for_utf16_offset, line_range_for_utf16_offset,
+        line_start_for_utf16_offset, next_utf16_boundary, next_word_boundary,
+        normalize_clipboard_text_for_ime_target, path_completion_owns_vertical_navigation,
+        platform_text_commit_is_duplicate, previous_utf16_boundary, previous_word_boundary,
+        secret_ime_proxy, soft_wrapped_line_ranges_utf16, transpose_text_at_utf16_offset,
         utf16_offset_for_char_index, vertical_line_navigation_destination,
         word_range_for_utf16_offset, workspace_ime_target_for_plain_host_tools_input,
     };
@@ -3364,7 +3567,7 @@ mod tests {
     }
 
     #[test]
-    fn printable_keystrokes_are_platform_text_input() {
+    fn platform_text_input_accepts_printable_text_and_rejects_manual_keys() {
         assert!(keystroke_platform_text(&key("a", Some("a"), Modifiers::default())).is_some());
         assert!(keystroke_platform_text(&key("space", Some(" "), Modifiers::default())).is_some());
         assert!(
@@ -3378,10 +3581,6 @@ mod tests {
             ))
             .is_some()
         );
-    }
-
-    #[test]
-    fn shortcuts_and_control_keys_stay_on_manual_key_path() {
         assert!(keystroke_platform_text(&key("backspace", None, Modifiers::default())).is_none());
         assert!(
             keystroke_platform_text(&key(
@@ -3435,7 +3634,7 @@ mod tests {
     }
 
     #[test]
-    fn active_ime_defers_printable_keys_to_platform_text_owner() {
+    fn active_ime_defers_only_platform_owned_text_and_composition_keys() {
         let printable = key("a", Some("a"), Modifiers::default());
         let shortcut = key(
             "a",
@@ -3449,10 +3648,6 @@ mod tests {
         assert!(active_ime_should_defer_input_key(true, false, &printable));
         assert!(!active_ime_should_defer_input_key(false, false, &printable));
         assert!(!active_ime_should_defer_input_key(true, false, &shortcut));
-    }
-
-    #[test]
-    fn active_ime_defers_composition_control_keys_only_while_composing() {
         let space = key("space", None, Modifiers::default());
         let enter = key("enter", None, Modifiers::default());
         let modified_space = key(
@@ -3475,28 +3670,6 @@ mod tests {
     }
 
     #[test]
-    fn text_input_anchor_store_clones_share_geometry_updates() {
-        let store = TextInputAnchorStore::default();
-        let cloned = store.clone();
-        let anchor_id = TextInputAnchorId(42);
-        cloned.update(TextInputAnchor {
-            id: anchor_id,
-            bounds: Bounds {
-                origin: point(px(12.0), px(24.0)),
-                size: size(px(80.0), px(30.0)),
-            },
-        });
-
-        assert_eq!(
-            store.bounds(anchor_id),
-            Some(Bounds {
-                origin: point(px(12.0), px(24.0)),
-                size: size(px(80.0), px(30.0)),
-            })
-        );
-    }
-
-    #[test]
     fn plain_host_tools_ime_frame_rejects_secret_tmux_dialog_input() {
         assert_eq!(
             workspace_ime_target_for_plain_host_tools_input(HostToolsTextInput::ProcessRenice),
@@ -3515,47 +3688,6 @@ mod tests {
                 TextInputAnchorStore::default(),
             )
             .is_none()
-        );
-    }
-
-    #[test]
-    fn self_padded_text_targets_do_not_shift_hit_testing() {
-        assert_eq!(
-            WorkspaceApp::ime_target_horizontal_padding(WorkspaceImeTarget::AiChatInput, 12.0),
-            px(0.0)
-        );
-        assert_eq!(
-            WorkspaceApp::ime_target_horizontal_padding(WorkspaceImeTarget::CommandPalette, 12.0),
-            px(12.0)
-        );
-    }
-
-    #[test]
-    fn centered_settings_inputs_hit_test_against_centered_text_box() {
-        let target = WorkspaceImeTarget::Settings(SettingsInput::TerminalFontSize);
-        assert_eq!(
-            WorkspaceApp::ime_target_content_align(target),
-            TextInputContentAlign::Center
-        );
-        assert_eq!(
-            WorkspaceApp::ime_target_relative_x_for_hit_test(
-                target,
-                px(50.0),
-                px(0.0),
-                px(100.0),
-                px(40.0),
-            ),
-            px(20.0)
-        );
-        assert_eq!(
-            WorkspaceApp::ime_target_relative_x_for_hit_test(
-                WorkspaceImeTarget::Settings(SettingsInput::TerminalCustomFontFamily),
-                px(50.0),
-                px(0.0),
-                px(100.0),
-                px(40.0),
-            ),
-            px(50.0)
         );
     }
 
@@ -3616,28 +3748,23 @@ mod tests {
     }
 
     #[test]
-    fn platform_text_commit_without_range_uses_current_caret() {
-        let range = effective_platform_text_replacement_range(None, || Some(2..2), None);
+    fn platform_text_commit_resolves_explicit_current_and_marked_ranges() {
+        let cases = [
+            (None, Some(2..2), Some(2..2)),
+            (None, Some(1..4), Some(1..4)),
+            (Some(5..6), Some(1..4), Some(5..6)),
+        ];
+        for (platform_range, current_range, expected) in cases {
+            assert_eq!(
+                effective_platform_text_replacement_range(
+                    platform_range,
+                    || current_range.clone(),
+                    None,
+                ),
+                expected
+            );
+        }
 
-        assert_eq!(range, Some(2..2));
-    }
-
-    #[test]
-    fn platform_text_commit_without_range_uses_current_selection() {
-        let range = effective_platform_text_replacement_range(None, || Some(1..4), None);
-
-        assert_eq!(range, Some(1..4));
-    }
-
-    #[test]
-    fn platform_text_commit_keeps_explicit_platform_range() {
-        let range = effective_platform_text_replacement_range(Some(5..6), || Some(1..4), None);
-
-        assert_eq!(range, Some(5..6));
-    }
-
-    #[test]
-    fn platform_text_commit_maps_marked_virtual_range_to_original_range() {
         let marked = WorkspaceImeMarkedText {
             target: WorkspaceImeTarget::CommandPalette,
             replacement_range: 2..2,

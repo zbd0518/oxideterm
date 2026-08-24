@@ -2,6 +2,13 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+use gpui::StatefulInteractiveElement;
+use oxideterm_gpui_ui::dropdown_menu::{
+    DropdownMenuItemKind, dropdown_menu_content, dropdown_menu_item, dropdown_menu_separator,
+};
+
+const TERMINAL_RECORDING_MENU_WIDTH: f32 = 220.0;
+const TERMINAL_RECORDING_MENU_BOTTOM: f32 = 30.0;
 
 impl WorkspaceApp {
     pub(super) fn render_terminal_command_bar(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -91,16 +98,24 @@ impl WorkspaceApp {
         };
         let recording_status = self.active_terminal_recording_status(cx);
         let recording_active = recording_status.state != TerminalRecordingState::Idle;
+        let session_log_active =
+            self.active_terminal_session_log_status(cx).state != TerminalSessionLogState::Idle;
         let timestamps_active = self.active_terminal_timestamps_enabled(cx);
+        let highlight_override_active = self.active_terminal_highlight_override(cx);
         let timestamps_tooltip_title = if timestamps_active {
             self.i18n.t("terminal.recording.hide_timestamps")
         } else {
             self.i18n.t("terminal.recording.show_timestamps")
         };
         let recording_toggle_tooltip_title = match recording_status.state {
-            TerminalRecordingState::Idle => self.i18n.t("terminal.recording.start"),
+            TerminalRecordingState::Idle => self.i18n.t("terminal.recording.title"),
             TerminalRecordingState::Recording => self.i18n.t("terminal.recording.pause"),
             TerminalRecordingState::Paused => self.i18n.t("terminal.recording.resume"),
+        };
+        let capture_menu_tooltip_title = if session_log_active {
+            self.i18n.t("terminal.session_log.title")
+        } else {
+            self.i18n.t("terminal.recording.title")
         };
         let bar = div()
             .relative()
@@ -118,6 +133,9 @@ impl WorkspaceApp {
                 // through the root backdrop makes the existing bottom/right
                 // placement resolve against the wrong box.
                 bar.child(self.render_terminal_quick_commands_popover(cx))
+            })
+            .when(self.terminal_highlight_popover_open, |bar| {
+                bar.child(self.render_terminal_highlight_popover(cx))
             })
             .when(self.terminal.read(cx).git_panel_open(), |bar| {
                 bar.child(self.render_terminal_git_branch_picker(cx))
@@ -381,6 +399,8 @@ impl WorkspaceApp {
                                             this.close_terminal_cwd_picker(cx);
                                             this.close_terminal_git_branch_picker(cx);
                                             this.close_terminal_project_panel(cx);
+                                            this.dismiss_terminal_recording_menu();
+                                            this.terminal_highlight_popover_open = false;
                                             cx.stop_propagation();
                                             cx.notify();
                                         },
@@ -388,6 +408,24 @@ impl WorkspaceApp {
                                     ))
                                 },
                             )
+                            .when_some(active_pane_id, |actions, pane_id| {
+                                // Capture the visible pane so the shortcut cannot retarget after a tab switch.
+                                actions.child(self.terminal_command_action_button(
+                                    LucideIcon::Activity,
+                                    rgb(theme.text_muted),
+                                    false,
+                                    None,
+                                    "terminal-command-session-triggers",
+                                    self.i18n.t("terminal.command_selection.manage_triggers"),
+                                    move |this, _event, window, cx| {
+                                        this.open_terminal_trigger_settings_for_pane(
+                                            pane_id, window, cx,
+                                        );
+                                        cx.stop_propagation();
+                                    },
+                                    cx,
+                                ))
+                            })
                             .child(select_anchor_probe(
                                 SelectAnchorId::TerminalBroadcastMenu,
                                 self.terminal_command_action_button(
@@ -406,9 +444,43 @@ impl WorkspaceApp {
                                     "terminal-command-broadcast",
                                     self.i18n.t("terminal.broadcast.select_targets"),
                                     |this, _event, _window, cx| {
+                                        this.terminal_highlight_popover_open = false;
                                         this.toggle_terminal_broadcast_menu(cx);
                                         cx.stop_propagation();
                                         cx.notify();
+                                    },
+                                    cx,
+                                )
+                                .relative(),
+                                {
+                                    let workspace = workspace.clone();
+                                    move |anchor, _window, cx| {
+                                        let _ = workspace.update(cx, |this, cx| {
+                                            this.update_select_anchor(anchor, cx);
+                                        });
+                                    }
+                                },
+                            ))
+                            .child(select_anchor_probe(
+                                SelectAnchorId::TerminalHighlightRuleSet,
+                                self.terminal_command_action_button(
+                                    LucideIcon::Hash,
+                                    if highlight_override_active {
+                                        rgb(theme.accent)
+                                    } else {
+                                        rgb(theme.text_muted)
+                                    },
+                                    false,
+                                    Some(if highlight_override_active {
+                                        rgba((theme.accent << 8) | 0x26)
+                                    } else {
+                                        rgba(0x00000000)
+                                    }),
+                                    "terminal-command-highlight-rules",
+                                    self.i18n.t("terminal.highlight_override.title"),
+                                    |this, _event, _window, cx| {
+                                        this.toggle_terminal_highlight_popover(cx);
+                                        cx.stop_propagation();
                                     },
                                     cx,
                                 )
@@ -490,40 +562,101 @@ impl WorkspaceApp {
                                         .child(format_recording_elapsed(recording_status.elapsed)),
                                 )
                             })
-                            .child(self.terminal_command_action_button(
-                                match recording_status.state {
-                                    TerminalRecordingState::Paused => LucideIcon::Play,
-                                    _ => LucideIcon::Circle,
-                                },
-                                if recording_active {
-                                    rgb(theme.error)
-                                } else {
-                                    rgb(theme.text_muted)
-                                },
-                                false,
-                                Some(if recording_active {
-                                    rgba((theme.error << 8) | 0x26)
-                                } else {
-                                    rgba(0x00000000)
-                                }),
-                                "terminal-command-recording-toggle",
-                                recording_toggle_tooltip_title,
-                                move |this, _event, _window, cx| {
-                                    match recording_status.state {
-                                        TerminalRecordingState::Idle => {
-                                            this.start_active_terminal_recording(cx)
+                            .when(!recording_active, |actions| {
+                                actions.child(
+                                    div()
+                                        .relative()
+                                        .flex_none()
+                                        .child(self.terminal_command_action_button(
+                                            if session_log_active {
+                                                LucideIcon::FileText
+                                            } else {
+                                                LucideIcon::FileVideo
+                                            },
+                                            if session_log_active {
+                                                rgb(theme.accent)
+                                            } else {
+                                                rgb(theme.text_muted)
+                                            },
+                                            false,
+                                            Some(if self.terminal_recording_menu_open {
+                                                rgba((theme.accent << 8) | 0x26)
+                                            } else {
+                                                rgba(0x00000000)
+                                            }),
+                                            "terminal-command-recording-menu",
+                                            capture_menu_tooltip_title.clone(),
+                                            |this, _event, _window, cx| {
+                                                this.toggle_terminal_recording_menu(cx);
+                                                cx.stop_propagation();
+                                            },
+                                            cx,
+                                        ))
+                                        .when(self.terminal_recording_menu_open, |anchor| {
+                                            // Keep the menu in the toolbar button's local coordinate
+                                            // owner so its anchor is current in the same draw pass.
+                                            anchor.child(self.render_terminal_recording_menu(cx))
+                                        }),
+                                )
+                            })
+                            .when(recording_active, |actions| {
+                                actions.child(
+                                    div()
+                                        .relative()
+                                        .flex_none()
+                                        .child(self.terminal_command_action_button(
+                                            LucideIcon::FileText,
+                                            if session_log_active {
+                                                rgb(theme.accent)
+                                            } else {
+                                                rgb(theme.text_muted)
+                                            },
+                                            false,
+                                            Some(if self.terminal_recording_menu_open {
+                                                rgba((theme.accent << 8) | 0x26)
+                                            } else {
+                                                rgba(0x00000000)
+                                            }),
+                                            "terminal-command-session-log-menu",
+                                            self.i18n.t("terminal.session_log.title"),
+                                            |this, _event, _window, cx| {
+                                                this.toggle_terminal_recording_menu(cx);
+                                                cx.stop_propagation();
+                                            },
+                                            cx,
+                                        ))
+                                        .when(self.terminal_recording_menu_open, |anchor| {
+                                            anchor.child(self.render_terminal_recording_menu(cx))
+                                        }),
+                                )
+                            })
+                            .when(recording_active, |actions| {
+                                actions.child(self.terminal_command_action_button(
+                                    if recording_status.state == TerminalRecordingState::Paused {
+                                        LucideIcon::Play
+                                    } else {
+                                        LucideIcon::Circle
+                                    },
+                                    rgb(theme.error),
+                                    false,
+                                    Some(rgba((theme.error << 8) | 0x26)),
+                                    "terminal-command-recording-toggle",
+                                    recording_toggle_tooltip_title.clone(),
+                                    move |this, _event, _window, cx| {
+                                        match recording_status.state {
+                                            TerminalRecordingState::Recording => {
+                                                this.pause_active_terminal_recording(cx)
+                                            }
+                                            TerminalRecordingState::Paused => {
+                                                this.resume_active_terminal_recording(cx)
+                                            }
+                                            TerminalRecordingState::Idle => {}
                                         }
-                                        TerminalRecordingState::Recording => {
-                                            this.pause_active_terminal_recording(cx)
-                                        }
-                                        TerminalRecordingState::Paused => {
-                                            this.resume_active_terminal_recording(cx)
-                                        }
-                                    }
-                                    cx.stop_propagation();
-                                },
-                                cx,
-                            ))
+                                        cx.stop_propagation();
+                                    },
+                                    cx,
+                                ))
+                            })
                             .when(recording_active, |actions| {
                                 actions
                                     .child(self.terminal_command_action_button(
@@ -552,20 +685,7 @@ impl WorkspaceApp {
                                         },
                                         cx,
                                     ))
-                            })
-                            .child(self.terminal_command_action_button(
-                                LucideIcon::FilePlay,
-                                rgb(theme.text_muted),
-                                false,
-                                None,
-                                "terminal-command-recording-open",
-                                self.i18n.t("terminal.recording.open_cast"),
-                                |this, _event, window, cx| {
-                                    this.open_terminal_cast_file(window, cx);
-                                    cx.stop_propagation();
-                                },
-                                cx,
-                            )),
+                            }),
                     ),
             );
         select_anchor_probe(
@@ -587,6 +707,205 @@ impl WorkspaceApp {
         self.render_quick_commands_popover(cx)
     }
 
+    fn toggle_terminal_recording_menu(&mut self, cx: &mut Context<Self>) {
+        let should_open = !self.terminal_recording_menu_open;
+        self.terminal_recording_menu_open = should_open;
+        if should_open {
+            self.dismiss_terminal_broadcast_menu(cx);
+            self.dismiss_terminal_highlight_popover();
+            self.close_terminal_quick_commands_popover(cx);
+            self.close_terminal_cwd_picker(cx);
+            self.close_terminal_git_branch_picker(cx);
+            self.close_terminal_project_panel(cx);
+        }
+        cx.notify();
+    }
+
+    pub(in crate::workspace) fn dismiss_terminal_recording_menu(&mut self) -> bool {
+        std::mem::take(&mut self.terminal_recording_menu_open)
+    }
+
+    fn render_terminal_recording_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        let session_log_status = self.active_terminal_session_log_status(cx);
+        let session_log_available = self.active_terminal_session_log_available(cx);
+        let menu = context_menu_event_boundary(
+            dropdown_menu_content(&self.tokens)
+                .absolute()
+                .bottom(px(TERMINAL_RECORDING_MENU_BOTTOM))
+                .right(px(0.0))
+                .w(px(TERMINAL_RECORDING_MENU_WIDTH))
+                .occlude(),
+        );
+        let start_item = dropdown_menu_item(
+            &self.tokens,
+            self.i18n.t("terminal.recording.start"),
+            DropdownMenuItemKind::Plain,
+            false,
+            false,
+        );
+        let open_item = dropdown_menu_item(
+            &self.tokens,
+            self.i18n.t("terminal.recording.open_cast"),
+            DropdownMenuItemKind::Plain,
+            false,
+            false,
+        );
+
+        let menu = menu
+            .child(self.workspace_context_menu_styled_action(
+                start_item,
+                false,
+                false,
+                ContextMenuActionableStyle::default(),
+                |this| {
+                    this.terminal_recording_menu_open = false;
+                },
+                |this, _event, _window, cx| {
+                    this.start_active_terminal_recording(cx);
+                },
+                cx,
+            ))
+            .child(self.workspace_context_menu_styled_action(
+                open_item,
+                false,
+                false,
+                ContextMenuActionableStyle::default(),
+                |this| {
+                    this.terminal_recording_menu_open = false;
+                },
+                |this, _event, window, cx| {
+                    this.open_terminal_cast_file(window, cx);
+                },
+                cx,
+            ))
+            .child(dropdown_menu_separator(&self.tokens));
+
+        let menu = match session_log_status.state {
+            TerminalSessionLogState::Idle => {
+                let item = dropdown_menu_item(
+                    &self.tokens,
+                    self.i18n.t("terminal.session_log.start"),
+                    DropdownMenuItemKind::Plain,
+                    false,
+                    !session_log_available,
+                );
+                menu.child(self.workspace_context_menu_styled_action(
+                    item,
+                    !session_log_available,
+                    false,
+                    ContextMenuActionableStyle::default(),
+                    |this| this.terminal_recording_menu_open = false,
+                    |this, _event, _window, cx| this.start_active_terminal_session_log(cx),
+                    cx,
+                ))
+            }
+            TerminalSessionLogState::Logging => {
+                let pause_item = dropdown_menu_item(
+                    &self.tokens,
+                    self.i18n.t("terminal.session_log.pause"),
+                    DropdownMenuItemKind::Plain,
+                    false,
+                    false,
+                );
+                let stop_item = dropdown_menu_item(
+                    &self.tokens,
+                    self.i18n.t("terminal.session_log.stop"),
+                    DropdownMenuItemKind::Plain,
+                    false,
+                    false,
+                );
+                menu.child(self.workspace_context_menu_styled_action(
+                    pause_item,
+                    false,
+                    false,
+                    ContextMenuActionableStyle::default(),
+                    |this| this.terminal_recording_menu_open = false,
+                    |this, _event, _window, cx| this.pause_active_terminal_session_log(cx),
+                    cx,
+                ))
+                .child(self.workspace_context_menu_styled_action(
+                    stop_item,
+                    false,
+                    false,
+                    ContextMenuActionableStyle::default(),
+                    |this| this.terminal_recording_menu_open = false,
+                    |this, _event, _window, cx| this.stop_active_terminal_session_log(cx),
+                    cx,
+                ))
+            }
+            TerminalSessionLogState::Paused => {
+                let resume_item = dropdown_menu_item(
+                    &self.tokens,
+                    self.i18n.t("terminal.session_log.resume"),
+                    DropdownMenuItemKind::Plain,
+                    false,
+                    false,
+                );
+                let stop_item = dropdown_menu_item(
+                    &self.tokens,
+                    self.i18n.t("terminal.session_log.stop"),
+                    DropdownMenuItemKind::Plain,
+                    false,
+                    false,
+                );
+                menu.child(self.workspace_context_menu_styled_action(
+                    resume_item,
+                    false,
+                    false,
+                    ContextMenuActionableStyle::default(),
+                    |this| this.terminal_recording_menu_open = false,
+                    |this, _event, _window, cx| this.resume_active_terminal_session_log(cx),
+                    cx,
+                ))
+                .child(self.workspace_context_menu_styled_action(
+                    stop_item,
+                    false,
+                    false,
+                    ContextMenuActionableStyle::default(),
+                    |this| this.terminal_recording_menu_open = false,
+                    |this, _event, _window, cx| this.stop_active_terminal_session_log(cx),
+                    cx,
+                ))
+            }
+        };
+
+        let menu = menu.when(session_log_status.path.is_some(), |menu| {
+            let item = dropdown_menu_item(
+                &self.tokens,
+                self.i18n.t("terminal.session_log.open_file"),
+                DropdownMenuItemKind::Plain,
+                false,
+                false,
+            );
+            menu.child(self.workspace_context_menu_styled_action(
+                item,
+                false,
+                false,
+                ContextMenuActionableStyle::default(),
+                |this| this.terminal_recording_menu_open = false,
+                |this, _event, _window, cx| this.open_active_terminal_session_log(cx),
+                cx,
+            ))
+        });
+        let directory_item = dropdown_menu_item(
+            &self.tokens,
+            self.i18n.t("terminal.session_log.open_directory"),
+            DropdownMenuItemKind::Plain,
+            false,
+            false,
+        );
+        menu.child(self.workspace_context_menu_styled_action(
+            directory_item,
+            false,
+            false,
+            ContextMenuActionableStyle::default(),
+            |this| this.terminal_recording_menu_open = false,
+            |this, _event, _window, cx| this.open_terminal_session_log_directory(cx),
+            cx,
+        ))
+        .into_any_element()
+    }
+
     pub(in crate::workspace) fn render_terminal_broadcast_menu(
         &self,
         placement: TerminalBroadcastMenuPlacement,
@@ -594,11 +913,18 @@ impl WorkspaceApp {
     ) -> AnyElement {
         let theme = self.tokens.ui;
         let entries = self.terminal_broadcast_entries(cx);
+        let groups = self.terminal_broadcast_groups().to_vec();
         let active_pane_id = self.active_pane_id(cx);
+        let selected_group_id = self.terminal.read(cx).selected_broadcast_group_id();
+        let group_editor = self
+            .terminal
+            .read(cx)
+            .broadcast_group_editor()
+            .map(|(kind, value)| (kind, value.to_string()));
         let selectable = entries
             .iter()
-            .filter(|(pane_id, _, _)| Some(*pane_id) != active_pane_id)
-            .map(|(pane_id, _, _)| *pane_id)
+            .filter(|entry| Some(entry.pane_id) != active_pane_id)
+            .map(|entry| entry.pane_id)
             .collect::<Vec<_>>();
         let all_selected = !selectable.is_empty() && {
             let terminal = self.terminal.read(cx);
@@ -622,8 +948,7 @@ impl WorkspaceApp {
             let menu = div()
                 .absolute()
                 .w(px(TERMINAL_BROADCAST_MENU_WIDTH))
-                .max_h(px(320.0))
-                .overflow_hidden()
+                .max_h(px(TERMINAL_BROADCAST_MENU_MAX_HEIGHT))
                 .rounded(px(self.tokens.radii.lg))
                 .border_1()
                 .border_color(rgb(theme.border))
@@ -637,20 +962,380 @@ impl WorkspaceApp {
                 menu.right(px(12.0))
             }
         })
+        .id("terminal-broadcast-menu-scroll")
+        .overflow_y_scroll()
         .child(
             div()
+                .flex()
+                .items_center()
+                .justify_between()
                 .px(px(6.0))
                 .py(px(4.0))
                 .text_size(px(11.0))
                 .text_color(rgb(theme.text_muted))
-                .child(self.i18n.t("terminal.broadcast.select_targets")),
+                .child(self.i18n.t("terminal.broadcast.groups"))
+                .child(
+                    div()
+                        .h(px(24.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .px(px(6.0))
+                        .rounded(px(self.tokens.radii.sm))
+                        .cursor_pointer()
+                        .hover(|button| button.bg(rgb(theme.bg_hover)))
+                        .child(Self::render_lucide_icon(
+                            LucideIcon::Plus,
+                            12.0,
+                            rgb(theme.accent),
+                        ))
+                        .child(self.i18n.t("terminal.broadcast.create_group"))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, window, cx| {
+                                this.begin_terminal_broadcast_group_create(window, cx);
+                                cx.stop_propagation();
+                            }),
+                        ),
+                ),
         );
         menu = match placement {
             TerminalBroadcastMenuPlacement::Bottom(offset) => menu.bottom(px(offset)),
             TerminalBroadcastMenuPlacement::Top(offset) => menu.top(px(offset)),
         };
 
-        if entries.len() <= 1 {
+        if groups.is_empty() && group_editor.is_none() {
+            menu = menu.child(
+                div()
+                    .px(px(8.0))
+                    .pb(px(8.0))
+                    .text_size(px(11.0))
+                    .text_color(rgb(theme.text_muted))
+                    .child(self.i18n.t("terminal.broadcast.no_groups")),
+            );
+        }
+
+        menu = menu.child(
+            div()
+                .h(px(30.0))
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .px(px(8.0))
+                .rounded(px(self.tokens.radii.md))
+                .cursor_pointer()
+                .when(selected_group_id.is_none(), |row| {
+                    row.bg(rgba((theme.accent << 8) | 0x1f))
+                })
+                .hover(|row| row.bg(rgb(theme.bg_hover)))
+                .child(if selected_group_id.is_none() {
+                    Self::render_lucide_icon(LucideIcon::Check, 12.0, rgb(theme.accent))
+                } else {
+                    div().size(px(12.0)).into_any_element()
+                })
+                .child(self.i18n.t("terminal.broadcast.temporary_group"))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, _window, cx| {
+                        this.terminal.update(cx, |terminal, _cx| {
+                            terminal.clear_selected_broadcast_group();
+                        });
+                        cx.notify();
+                        cx.stop_propagation();
+                    }),
+                ),
+        );
+
+        for group in &groups {
+            let group_id = group.id;
+            let selected = selected_group_id == Some(group_id);
+            let member_count = self.resolve_terminal_broadcast_group(group_id, cx).len();
+            let name = group.name.clone();
+            menu = menu.child(
+                div()
+                    .h(px(30.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .px(px(8.0))
+                    .rounded(px(self.tokens.radii.md))
+                    .cursor_pointer()
+                    .when(selected, |row| row.bg(rgba((theme.accent << 8) | 0x1f)))
+                    .hover(|row| row.bg(rgb(theme.bg_hover)))
+                    .child(if selected {
+                        Self::render_lucide_icon(LucideIcon::Check, 12.0, rgb(theme.accent))
+                    } else {
+                        div().size(px(12.0)).into_any_element()
+                    })
+                    .child(div().flex_1().truncate().child(name))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgb(theme.text_muted))
+                            .child(member_count.to_string()),
+                    )
+                    .child(
+                        div()
+                            .size(px(22.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(self.tokens.radii.sm))
+                            .hover(|button| button.bg(rgb(theme.bg_panel)))
+                            .child(Self::render_lucide_icon(
+                                LucideIcon::Pencil,
+                                11.0,
+                                rgb(theme.text_muted),
+                            ))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _event, window, cx| {
+                                    this.begin_terminal_broadcast_group_rename(
+                                        group_id, window, cx,
+                                    );
+                                    cx.stop_propagation();
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .size(px(22.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(self.tokens.radii.sm))
+                            .hover(|button| button.bg(rgba((theme.error << 8) | 0x22)))
+                            .child(Self::render_lucide_icon(
+                                LucideIcon::Trash2,
+                                11.0,
+                                rgb(theme.error),
+                            ))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _event, _window, cx| {
+                                    this.delete_terminal_broadcast_group(group_id, cx);
+                                    cx.stop_propagation();
+                                }),
+                            ),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _event, _window, cx| {
+                            this.select_terminal_broadcast_group(group_id, cx);
+                            cx.stop_propagation();
+                        }),
+                    ),
+            );
+        }
+
+        if let Some((edit_kind, value)) = group_editor {
+            let target = WorkspaceImeTarget::TerminalBroadcastGroupName;
+            let workspace = cx.entity();
+            let valid = self.terminal_broadcast_group_name_valid(edit_kind, &value);
+            menu = menu.child(
+                div()
+                    .mt(px(4.0))
+                    .px(px(6.0))
+                    .pb(px(6.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(text_input_anchor_probe(
+                        target.anchor_id(),
+                        text_input(
+                            &self.tokens,
+                            TextInputView {
+                                value: &value,
+                                placeholder: self
+                                    .i18n
+                                    .t("terminal.broadcast.group_name_placeholder"),
+                                focused: true,
+                                caret_visible: self.input_caret.visible(),
+                                secret: false,
+                                selected_all: false,
+                                selected_range: self.ime_selected_range_for_target(target, cx),
+                                marked_text: self.marked_text_for_target(target, cx),
+                            },
+                        )
+                        .h(px(28.0))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event, window, cx| {
+                                window.focus(&this.focus_handle, cx);
+                                this.begin_ime_selection_from_mouse_down(target, event, window, cx);
+                                cx.stop_propagation();
+                            }),
+                        ),
+                        move |anchor, _window, cx| {
+                            let _ = workspace.update(cx, |this, cx| {
+                                this.update_text_input_anchor(anchor, cx);
+                            });
+                        },
+                    ))
+                    .child(
+                        div()
+                            .size(px(24.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(self.tokens.radii.sm))
+                            .when(valid, |button| {
+                                button
+                                    .cursor_pointer()
+                                    .hover(|button| button.bg(rgb(theme.bg_hover)))
+                            })
+                            .child(Self::render_lucide_icon(
+                                LucideIcon::Save,
+                                12.0,
+                                rgb(if valid {
+                                    theme.accent
+                                } else {
+                                    theme.text_muted
+                                }),
+                            ))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _event, _window, cx| {
+                                    if valid {
+                                        this.commit_terminal_broadcast_group_edit(cx);
+                                    }
+                                    cx.stop_propagation();
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .size(px(24.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(self.tokens.radii.sm))
+                            .cursor_pointer()
+                            .hover(|button| button.bg(rgb(theme.bg_hover)))
+                            .child(Self::render_lucide_icon(
+                                LucideIcon::X,
+                                12.0,
+                                rgb(theme.text_muted),
+                            ))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _event, _window, cx| {
+                                    this.terminal.update(cx, |terminal, _cx| {
+                                        terminal.cancel_broadcast_group_edit();
+                                    });
+                                    this.clear_ime_selection();
+                                    cx.notify();
+                                    cx.stop_propagation();
+                                }),
+                            ),
+                    ),
+            );
+        }
+
+        menu = menu.child(
+            div()
+                .mt(px(4.0))
+                .pt(px(6.0))
+                .border_t_1()
+                .border_color(rgba((theme.border << 8) | 0x99))
+                .px(px(6.0))
+                .py(px(4.0))
+                .text_size(px(11.0))
+                .text_color(rgb(theme.text_muted))
+                .child(if selected_group_id.is_some() {
+                    self.i18n.t("terminal.broadcast.group_members")
+                } else {
+                    self.i18n.t("terminal.broadcast.select_targets")
+                }),
+        );
+
+        if let Some(group_id) = selected_group_id {
+            // Membership editing follows the active terminal surface; closed members stay
+            // persisted but cannot cause a connection to open.
+            if entries.is_empty() {
+                menu = menu.child(
+                    div()
+                        .px(px(8.0))
+                        .py(px(12.0))
+                        .text_align(gpui::TextAlign::Center)
+                        .text_color(rgb(theme.text_muted))
+                        .child(self.i18n.t("terminal.broadcast.no_targets")),
+                );
+            } else {
+                let selected_members = groups
+                    .iter()
+                    .find(|group| group.id == group_id)
+                    .map(|group| group.members.as_slice())
+                    .unwrap_or_default();
+                for entry in entries {
+                    let target = entry.saved_connection;
+                    let checked = target
+                        .as_ref()
+                        .is_some_and(|target| selected_members.contains(target));
+                    let unavailable = target.is_none();
+                    let badge = match entry.kind {
+                        TabKind::LocalTerminal => self.i18n.t("terminal.typeLocal"),
+                        TabKind::SshTerminal => self.i18n.t("terminal.typeSsh"),
+                        TabKind::MoshTerminal => self.i18n.t("terminal.typeMosh"),
+                        _ => String::new(),
+                    };
+                    menu = menu.child(
+                        self.render_terminal_broadcast_menu_action(
+                            div()
+                                .h(px(30.0))
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .px(px(8.0))
+                                .rounded(px(self.tokens.radii.md))
+                                .child(if checked {
+                                    Self::render_lucide_icon(
+                                        LucideIcon::Check,
+                                        12.0,
+                                        rgb(theme.accent),
+                                    )
+                                } else {
+                                    div().size(px(12.0)).into_any_element()
+                                })
+                                .child(div().flex_1().truncate().child(entry.label))
+                                .when(!badge.is_empty(), |row| {
+                                    row.child(
+                                        div()
+                                            .px(px(5.0))
+                                            .py(px(1.0))
+                                            .rounded(px(self.tokens.radii.md))
+                                            .text_size(px(10.0))
+                                            .text_color(rgb(theme.text_muted))
+                                            .bg(rgba((theme.bg_panel << 8) | 0x99))
+                                            .child(badge),
+                                    )
+                                })
+                                .when(unavailable, |row| {
+                                    row.child(
+                                        div()
+                                            .text_size(px(10.0))
+                                            .text_color(rgb(theme.text_muted))
+                                            .child(
+                                                self.i18n.t("terminal.broadcast.unsaved_target"),
+                                            ),
+                                    )
+                                }),
+                            unavailable,
+                            false,
+                            Some(rgb(theme.bg_hover)),
+                            move |this, _event, _window, cx| {
+                                if let Some(target) = target.clone() {
+                                    this.toggle_terminal_broadcast_group_member(
+                                        group_id, target, cx,
+                                    );
+                                }
+                            },
+                            cx,
+                        ),
+                    );
+                }
+            }
+        } else if entries.len() <= 1 {
             menu = menu.child(
                 div()
                     .px(px(8.0))
@@ -660,7 +1345,10 @@ impl WorkspaceApp {
                     .child(self.i18n.t("terminal.broadcast.no_targets")),
             );
         } else {
-            for (pane_id, label, kind) in entries {
+            for entry in entries {
+                let pane_id = entry.pane_id;
+                let label = entry.label;
+                let kind = entry.kind;
                 let is_current = Some(pane_id) == active_pane_id;
                 let checked = self.terminal.read(cx).broadcast_target_selected(pane_id);
                 let badge = match kind {

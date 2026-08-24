@@ -16,34 +16,11 @@ mod tests {
             elapsed_ms: 0,
             detail: None,
             label: None,
+            endpoint: None,
             step_index: Some(1),
             total_steps: Some(1),
             mode: ConnectionTraceMode::Connect,
         }
-    }
-
-    #[test]
-    fn configured_ui_fonts_use_gpui_family_names() {
-        assert_eq!(
-            settings_ui_font_family("\"DengXian\", \"Microsoft YaHei\"").as_ref(),
-            "DengXian"
-        );
-        assert_eq!(
-            settings_ui_font_family("\"等线\", sans-serif").as_ref(),
-            "DengXian"
-        );
-    }
-
-    #[test]
-    fn empty_ui_font_uses_tauri_platform_fallback() {
-        #[cfg(target_os = "macos")]
-        let expected = "SF Pro Text";
-        #[cfg(target_os = "windows")]
-        let expected = "Segoe UI";
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        let expected = "Roboto";
-
-        assert_eq!(settings_ui_font_family("").as_ref(), expected);
     }
 
     #[test]

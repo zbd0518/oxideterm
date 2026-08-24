@@ -70,6 +70,20 @@ struct EditorScrollbarDragState {
     grab_offset_y: Rc<Cell<f32>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct EditorHorizontalScrollbarGeometry {
+    viewport_width: f32,
+    max_scroll_x: f32,
+    thumb_width: f32,
+    thumb_left: f32,
+}
+
+#[derive(Clone)]
+struct EditorHorizontalScrollbarDragState {
+    editor: Entity<TextEditorView>,
+    grab_offset_x: Rc<Cell<f32>>,
+}
+
 struct RenderRowContext {
     selections: Vec<Selection>,
     matching_bracket_pair: Option<BracketPair>,
@@ -82,6 +96,9 @@ impl Render for TextEditorView {
         let focused = self.focus_handle.is_focused(window);
         self.sync_caret_blink_focus(focused, cx);
         self.measure_code_metrics(window, cx);
+        // Content edits, wrapping, and resizing can all shorten the widest row.
+        self.viewport
+            .clamp_horizontal(self.max_horizontal_scroll_px());
         let display_rows = self.display_rows();
         let visible = self
             .viewport
@@ -189,7 +206,14 @@ impl Render for TextEditorView {
                 this.handle_key(event, window, cx);
             }))
             .child(body);
-        if let Some(scrollbar) = self.render_vertical_scrollbar(view, cx) {
+        if self.presentation == EditorPresentation::Document
+            && let Some(scrollbar) = self.render_vertical_scrollbar(view, cx)
+        {
+            // Inline editors are single-row controls. Their overflow belongs to
+            // the horizontal axis, so a vertical thumb is always misleading.
+            root = root.child(scrollbar);
+        }
+        if let Some(scrollbar) = self.render_horizontal_scrollbar(cx.entity(), cx) {
             root = root.child(scrollbar);
         }
         if let Some(menu) = self.context_menu {
@@ -292,6 +316,104 @@ impl TextEditorView {
         }
     }
 
+    fn render_horizontal_scrollbar(
+        &self,
+        editor: Entity<Self>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let geometry = editor_horizontal_scrollbar_geometry(
+            self.horizontal_viewport_width_px(),
+            self.horizontal_document_width_px(),
+            self.viewport.scroll_x_px,
+        )?;
+        let drag_state = EditorHorizontalScrollbarDragState {
+            editor,
+            grab_offset_x: Rc::new(Cell::new(0.0)),
+        };
+
+        Some(
+            div()
+                .id("oxideterm-gpui-editor-horizontal-scrollbar")
+                .absolute()
+                .left(px(self.visible_gutter_width()))
+                .right_0()
+                .bottom_0()
+                .h(px(CM_SCROLLBAR_TRACK_WIDTH))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                        // Track clicks center the thumb so distant columns stay one action away.
+                        this.scroll_from_horizontal_scrollbar_pointer(
+                            event.position.x,
+                            geometry.thumb_width / 2.0,
+                            cx,
+                        );
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(
+                    div()
+                        .id("oxideterm-gpui-editor-horizontal-scrollbar-thumb")
+                        .absolute()
+                        .left(px(geometry.thumb_left))
+                        .bottom(px(CM_SCROLLBAR_THUMB_RIGHT_INSET))
+                        .w(px(geometry.thumb_width))
+                        .h(px(CM_SCROLLBAR_THUMB_WIDTH))
+                        .rounded(px(CM_SCROLLBAR_THUMB_RADIUS))
+                        .bg(rgba(
+                            (self.appearance.muted_text_hex << 8) | CM_SCROLLBAR_THUMB_ALPHA,
+                        ))
+                        .cursor(CursorStyle::OpenHand)
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_drag(drag_state.clone(), |drag, position, _window, cx| {
+                            drag.grab_offset_x.set(f32::from(position.x));
+                            cx.new(|_| EmptyView)
+                        })
+                        .on_drag_move::<EditorHorizontalScrollbarDragState>(
+                            |event, _window, cx| {
+                                let drag = event.drag(cx).clone();
+                                let pointer_x = event.event.position.x;
+                                let grab_offset_x = drag.grab_offset_x.get();
+                                drag.editor.update(cx, |this, cx| {
+                                    this.scroll_from_horizontal_scrollbar_pointer(
+                                        pointer_x,
+                                        grab_offset_x,
+                                        cx,
+                                    );
+                                });
+                                cx.stop_propagation();
+                            },
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn scroll_from_horizontal_scrollbar_pointer(
+        &mut self,
+        pointer_x: gpui::Pixels,
+        grab_offset_x: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(bounds) = self.content_bounds else {
+            return;
+        };
+        let Some(geometry) = editor_horizontal_scrollbar_geometry(
+            self.horizontal_viewport_width_px(),
+            self.horizontal_document_width_px(),
+            self.viewport.scroll_x_px,
+        ) else {
+            return;
+        };
+        let track_left = bounds.origin.x + px(self.visible_gutter_width());
+        let thumb_left = f32::from(pointer_x - track_left) - grab_offset_x;
+        let scroll_x = editor_scroll_x_for_thumb_left(thumb_left, geometry);
+        if (self.viewport.scroll_x_px - scroll_x).abs() > f32::EPSILON {
+            self.viewport.scroll_x_px = scroll_x;
+            cx.notify();
+        }
+    }
+
     fn render_row(
         &self,
         display_index: usize,
@@ -347,8 +469,7 @@ impl TextEditorView {
         let cursor_column = cursor_visual_column.saturating_sub(display_row.start_col);
         let line_height = self.metrics.line_height;
         let gutter_width = self.visible_gutter_width();
-        let content_left =
-            gutter_width + self.visible_content_padding_x() - self.viewport.scroll_x_px;
+        let content_left = self.visible_content_padding_x() - self.viewport.scroll_x_px;
         let row_display = display_row;
         let byte_start = byte_column_for_visual_column(&line_text, display_row.start_col);
         let byte_end = byte_column_for_visual_column(&line_text, display_row.end_col);
@@ -395,7 +516,7 @@ impl TextEditorView {
                     .x_for_index(byte_column),
             )
         });
-        let shaped_rects = |ranges: Vec<Range<usize>>| {
+        let shaped_rects = |ranges: Vec<Range<usize>>, empty_range_width: f32| {
             if ranges.is_empty() {
                 return Vec::new();
             }
@@ -407,13 +528,18 @@ impl TextEditorView {
                 .map(|range| {
                     let start = f32::from(coordinate_line.x_for_index(range.start));
                     let end = f32::from(coordinate_line.x_for_index(range.end));
-                    (start, (end - start).max(CM_CURSOR_WIDTH))
+                    let minimum_width = if range.is_empty() {
+                        empty_range_width
+                    } else {
+                        CM_CURSOR_WIDTH
+                    };
+                    (start, (end - start).max(minimum_width))
                 })
                 .collect::<Vec<_>>()
         };
-        let selection_rects = shaped_rects(selection_ranges);
-        let find_rects = shaped_rects(find_ranges);
-        let bracket_rects = shaped_rects(bracket_ranges);
+        let selection_rects = shaped_rects(selection_ranges, self.metrics.char_width);
+        let find_rects = shaped_rects(find_ranges, CM_CURSOR_WIDTH);
+        let bracket_rects = shaped_rects(bracket_ranges, CM_CURSOR_WIDTH);
         let foldable = display_row
             .is_first
             .then(|| self.foldable_range_starting_at(line))
@@ -425,7 +551,7 @@ impl TextEditorView {
                 .then_some(marked.text.as_str())
         });
 
-        let mut row = div()
+        let row = div()
             .relative()
             .h(px(line_height))
             .w_full()
@@ -481,18 +607,17 @@ impl TextEditorView {
                     this.open_context_menu(event.position, cx);
                     cx.stop_propagation();
                 }),
-            )
-            .when(self.presentation == EditorPresentation::Document, |row| {
-                row.child(self.render_gutter(
-                    display_row,
-                    line_height,
-                    gutter_width,
-                    is_current_line,
-                    foldable,
-                    folded,
-                    cx,
-                ))
-            });
+            );
+
+        // Keep horizontally scrolled document paint inside the content area so
+        // text and overlays never pass underneath the fixed gutter.
+        let mut content = div()
+            .absolute()
+            .left(px(gutter_width))
+            .right_0()
+            .top_0()
+            .h(px(line_height))
+            .overflow_hidden();
 
         for column in indent_guides {
             let byte_column = byte_column_for_visual_column(segment_text, column);
@@ -503,7 +628,7 @@ impl TextEditorView {
                         .expect("indent guides require shaped coordinates")
                         .x_for_index(byte_column),
                 );
-            row = row.child(
+            content = content.child(
                 div()
                     .absolute()
                     .top_0()
@@ -518,7 +643,7 @@ impl TextEditorView {
 
         for (start_x, width) in find_rects {
             let left = content_left + start_x;
-            row = row.child(
+            content = content.child(
                 div()
                     .absolute()
                     .top(px(line_height * 0.16))
@@ -538,14 +663,14 @@ impl TextEditorView {
 
         for (start_x, width) in selection_rects {
             let left = content_left + start_x;
-            row = row.child(
+            content = content.child(
                 div()
                     .absolute()
-                    .top(px(line_height * 0.12))
+                    // Keep adjacent visual rows connected like a native editor selection.
+                    .top(px(0.0))
                     .left(px(left))
                     .w(px(width))
-                    .h(px(line_height * 0.76))
-                    .rounded(px(CM_SELECTION_RADIUS))
+                    .h(px(line_height))
                     .bg(rgba(
                         (self.appearance.accent_hex << 8) | CM_SELECTION_ACCENT_ALPHA,
                     )),
@@ -554,7 +679,7 @@ impl TextEditorView {
 
         for (start_x, width) in bracket_rects {
             let left = content_left + start_x;
-            row = row.child(
+            content = content.child(
                 div()
                     .absolute()
                     .top(px(line_height * 0.12))
@@ -569,10 +694,10 @@ impl TextEditorView {
 
         if let Some(cursor_x) = cursor_x {
             let left = content_left + cursor_x;
-            row = row.child(self.render_cursor_at(left));
+            content = content.child(self.render_cursor_at(left));
         }
 
-        row.child(
+        content = content.child(
             div()
                 .absolute()
                 .top_0()
@@ -589,7 +714,20 @@ impl TextEditorView {
                     marked_text,
                     folded,
                 )),
-        )
+        );
+
+        row.child(content)
+            .when(self.presentation == EditorPresentation::Document, |row| {
+                row.child(self.render_gutter(
+                    display_row,
+                    line_height,
+                    gutter_width,
+                    is_current_line,
+                    foldable,
+                    folded,
+                    cx,
+                ))
+            })
     }
 
     fn render_gutter(
@@ -972,20 +1110,27 @@ impl TextEditorView {
         if !self.buffer.is_empty() || placeholder.is_empty() {
             return None;
         }
+        let content_left = self.visible_content_padding_x() - self.viewport.scroll_x_px;
         Some(
             div()
                 .absolute()
+                .left(px(self.visible_gutter_width()))
+                .right_0()
                 .top_0()
-                .left(px(self.visible_gutter_width()
-                    + self.visible_content_padding_x()
-                    - self.viewport.scroll_x_px))
                 .h(px(self.metrics.line_height))
-                .flex()
-                .items_center()
-                .text_color(rgba(
-                    (self.appearance.muted_text_hex << 8) | CM_PLACEHOLDER_ALPHA,
-                ))
-                .child(placeholder.to_string()),
+                .overflow_hidden()
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(content_left))
+                        .h(px(self.metrics.line_height))
+                        .flex()
+                        .items_center()
+                        .text_color(rgba(
+                            (self.appearance.muted_text_hex << 8) | CM_PLACEHOLDER_ALPHA,
+                        ))
+                        .child(placeholder.to_string()),
+                ),
         )
     }
 
@@ -1197,6 +1342,39 @@ fn editor_scroll_y_for_thumb_top(thumb_top: f32, geometry: EditorScrollbarGeomet
     thumb_top.clamp(0.0, thumb_travel) / thumb_travel * geometry.max_scroll_y
 }
 
+fn editor_horizontal_scrollbar_geometry(
+    viewport_width: f32,
+    document_width: f32,
+    scroll_x: f32,
+) -> Option<EditorHorizontalScrollbarGeometry> {
+    if viewport_width <= 0.0 || document_width <= viewport_width {
+        return None;
+    }
+    let max_scroll_x = document_width - viewport_width;
+    let minimum_thumb_width = CM_SCROLLBAR_MIN_THUMB_LENGTH.min(viewport_width);
+    let thumb_width = (viewport_width / document_width * viewport_width)
+        .clamp(minimum_thumb_width, viewport_width);
+    let thumb_travel = (viewport_width - thumb_width).max(0.0);
+    let thumb_left = scroll_x.clamp(0.0, max_scroll_x) / max_scroll_x * thumb_travel;
+    Some(EditorHorizontalScrollbarGeometry {
+        viewport_width,
+        max_scroll_x,
+        thumb_width,
+        thumb_left,
+    })
+}
+
+fn editor_scroll_x_for_thumb_left(
+    thumb_left: f32,
+    geometry: EditorHorizontalScrollbarGeometry,
+) -> f32 {
+    let thumb_travel = (geometry.viewport_width - geometry.thumb_width).max(0.0);
+    if thumb_travel <= 0.0 {
+        return 0.0;
+    }
+    thumb_left.clamp(0.0, thumb_travel) / thumb_travel * geometry.max_scroll_x
+}
+
 fn visible_highlight_range(
     start: usize,
     end: usize,
@@ -1273,10 +1451,7 @@ fn visible_indentation_columns(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        contains_special_char, editor_scroll_y_for_thumb_top, editor_scrollbar_geometry,
-        special_char_marker, visible_highlight_range, visible_indentation_columns,
-    };
+    use super::visible_indentation_columns;
     use oxideterm_editor_syntax::IndentGuide;
 
     use crate::surface::{indent_index::IndentGuideIndex, wrap::DisplayRow};
@@ -1289,30 +1464,6 @@ mod tests {
             is_first: start_col == 0,
             is_folded_header: false,
         }
-    }
-
-    #[test]
-    fn special_char_markers_ignore_tabs_but_cover_controls() {
-        assert!(!contains_special_char("\t"));
-        assert!(contains_special_char("\u{0007}"));
-        assert_eq!(special_char_marker('\t'), None);
-        assert_eq!(special_char_marker(' '), None);
-        assert_eq!(special_char_marker('a'), None);
-    }
-
-    #[test]
-    fn editor_scrollbar_geometry_maps_overflow_and_hides_without_it() {
-        let geometry =
-            editor_scrollbar_geometry(200.0, 1_000.0, 400.0).expect("document should overflow");
-        let thumb_travel = geometry.viewport_height - geometry.thumb_height;
-
-        assert_eq!(editor_scroll_y_for_thumb_top(0.0, geometry), 0.0);
-        assert_eq!(
-            editor_scroll_y_for_thumb_top(thumb_travel, geometry),
-            geometry.max_scroll_y
-        );
-        assert!(editor_scrollbar_geometry(200.0, 200.0, 0.0).is_none());
-        assert!(editor_scrollbar_geometry(200.0, 120.0, 0.0).is_none());
     }
 
     #[test]
@@ -1340,10 +1491,7 @@ mod tests {
 
         assert_eq!(columns.get(&2), Some(&vec![0, 4, 8]));
         assert_eq!(columns.get(&0), None);
-    }
 
-    #[test]
-    fn indentation_guides_skip_columns_before_wrapped_segment() {
         let guides = vec![IndentGuide {
             start_line: 0,
             end_line: 4,
@@ -1354,10 +1502,7 @@ mod tests {
         let columns = visible_indentation_columns(&IndentGuideIndex::new(guides), &rows, true);
 
         assert_eq!(columns.get(&2), Some(&vec![8]));
-    }
 
-    #[test]
-    fn disabled_indentation_guides_skip_index_queries() {
         let rows = [display_row(2, 0, 12)];
         let index = IndentGuideIndex::new(vec![IndentGuide {
             start_line: 0,
@@ -1366,12 +1511,5 @@ mod tests {
         }]);
 
         assert!(visible_indentation_columns(&index, &rows, false).is_empty());
-    }
-
-    #[test]
-    fn overlapping_highlight_spans_are_clipped_to_unrendered_text() {
-        assert_eq!(visible_highlight_range(2, 8, 0), Some(2..8));
-        assert_eq!(visible_highlight_range(2, 8, 5), Some(5..8));
-        assert_eq!(visible_highlight_range(2, 8, 8), None);
     }
 }

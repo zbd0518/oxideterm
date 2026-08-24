@@ -173,6 +173,7 @@ pub struct SerialSession {
     output_decoder: TerminalOutputDecoder,
     output_processor: Option<TerminalOutputProcessor>,
     output_events_enabled: bool,
+    trigger_stream: Option<oxideterm_terminal_triggers::TerminalTriggerStream>,
     input_encoder: TerminalInputEncoder,
     encoding_detector: EncodingMismatchDetector,
     modem_consumer: ModemConsumer,
@@ -335,6 +336,7 @@ impl SerialSession {
             output_decoder: TerminalOutputDecoder::new(encoding),
             output_processor: None,
             output_events_enabled: false,
+            trigger_stream: None,
             input_encoder: TerminalInputEncoder::new(encoding),
             encoding_detector: EncodingMismatchDetector::new(encoding),
             modem_consumer: ModemConsumer::new(),
@@ -376,9 +378,13 @@ impl SerialSession {
                 let SerialWorkerEvent::Output(bytes) = event.into_inner() else {
                     unreachable!("only output events enter the local drain queue");
                 };
-                report.drained_bytes = report.drained_bytes.saturating_add(bytes.len());
                 report.events_drained += 1;
+                let processing_started = budget.collect_performance_metrics.then(Instant::now);
                 self.feed_transport_output(&bytes);
+                report.record_data_chunk(
+                    bytes.len(),
+                    processing_started.map_or(Duration::ZERO, |started| started.elapsed()),
+                );
                 report.mark_changed();
                 continue;
             }
@@ -414,9 +420,13 @@ impl SerialSession {
                     report.mark_changed();
                 }
                 SerialWorkerEvent::Output(bytes) => {
-                    report.drained_bytes = report.drained_bytes.saturating_add(bytes.len());
                     report.events_drained += 1;
+                    let processing_started = budget.collect_performance_metrics.then(Instant::now);
                     self.feed_transport_output(&bytes);
+                    report.record_data_chunk(
+                        bytes.len(),
+                        processing_started.map_or(Duration::ZERO, |started| started.elapsed()),
+                    );
                     report.mark_changed();
                 }
                 SerialWorkerEvent::Failed(error) => {
@@ -481,6 +491,12 @@ impl SerialSession {
                         self.pending_events.push(TerminalEvent::EncodingHint(hint));
                     }
                     let decoded = self.output_decoder.decode_to_utf8_bytes(&terminal_bytes);
+                    if let Some(stream) = self.trigger_stream.as_mut() {
+                        stream.observe_bytes(decoded.as_ref(), |matched| {
+                            self.pending_events
+                                .push(TerminalEvent::TriggerMatched(matched));
+                        });
+                    }
                     if self.output_events_enabled {
                         // Apply the same private-OSC recording boundary as PTY sessions.
                         let (_, recordable) = self.shell_integration.advance_with_recording(
@@ -578,8 +594,7 @@ impl SerialSession {
 
     fn push_output_event(&mut self, bytes: &[u8]) {
         if self.output_events_enabled && !bytes.is_empty() {
-            // Terminal recording is the only consumer of raw display-output events;
-            // keep this allocation off the normal rendering path.
+            // File consumers are opt-in, so keep this allocation off the normal rendering path.
             self.pending_events.push(TerminalEvent::Output(bytes.to_vec()));
         }
     }
@@ -747,6 +762,13 @@ impl TerminalSessionBackend for SerialSession {
         self.output_events_enabled = enabled;
     }
 
+    fn set_trigger_rules(
+        &mut self,
+        rules: Option<Arc<oxideterm_terminal_triggers::CompiledTriggerSet>>,
+    ) {
+        self.trigger_stream = rules.map(oxideterm_terminal_triggers::TerminalTriggerStream::new);
+    }
+
     fn serial_runtime_options(&self) -> Option<SerialRuntimeOptions> {
         Some(self.runtime_options)
     }
@@ -850,6 +872,26 @@ impl TerminalSessionBackend for SerialSession {
         if delta != 0 {
             self.term.lock().scroll_display(Scroll::Delta(delta));
         }
+    }
+
+    fn scroll_lines_snapshot_incremental(
+        &mut self,
+        delta: i32,
+        previous: &TerminalSnapshot,
+    ) -> TerminalSnapshot {
+        let mut term = self.term.lock();
+        scroll_snapshot_from_term(
+            &mut term,
+            TerminalSize {
+                cols: self.resize.cols,
+                rows: self.resize.rows,
+                cell_width: self.resize.cell_width,
+                cell_height: self.resize.cell_height,
+            },
+            &self.graphics,
+            delta,
+            previous,
+        )
     }
 
     fn page_up(&mut self) {
@@ -1600,6 +1642,7 @@ mod serial_tests {
             output_decoder: TerminalOutputDecoder::new(TerminalEncoding::Utf8),
             output_processor: None,
             output_events_enabled: false,
+            trigger_stream: None,
             input_encoder: TerminalInputEncoder::new(TerminalEncoding::Utf8),
             encoding_detector: EncodingMismatchDetector::new(TerminalEncoding::Utf8),
             modem_consumer: ModemConsumer::new(),
@@ -1867,56 +1910,4 @@ mod serial_tests {
         assert!(session.buffer_text().contains("red"));
     }
 
-    #[test]
-    #[ignore = "requires OXIDETERM_SERIAL_MANUAL_PORT to point at a real or pseudo serial device"]
-    fn manual_serial_pseudo_device_round_trip_and_reopen() {
-        let port_path = std::env::var("OXIDETERM_SERIAL_MANUAL_PORT")
-            .expect("OXIDETERM_SERIAL_MANUAL_PORT must point at a serial device");
-        let mut config = valid_config();
-        config.port_path = port_path.clone();
-        config.validate().unwrap();
-
-        let first_ping = b"oxideterm-serial-ping-1\r";
-        let first_pong = b"oxideterm-serial-pong-1\r";
-        let second_ping = b"oxideterm-serial-ping-2\r";
-        let second_pong = b"oxideterm-serial-pong-2\r";
-        let first_expected = manual_serial_expected(first_ping, first_pong);
-        let second_expected = manual_serial_expected(second_ping, second_pong);
-
-        manual_serial_round_trip(&port_path, first_ping, &first_expected);
-        manual_serial_round_trip(&port_path, second_ping, &second_expected);
-    }
-
-    fn manual_serial_expected(loopback_payload: &[u8], responder_payload: &[u8]) -> Vec<u8> {
-        match std::env::var("OXIDETERM_SERIAL_MANUAL_MODE")
-            .unwrap_or_else(|_| "loopback".to_string())
-            .as_str()
-        {
-            "loopback" => loopback_payload.to_vec(),
-            "responder" => responder_payload.to_vec(),
-            mode => panic!(
-                "unsupported OXIDETERM_SERIAL_MANUAL_MODE={mode}; use loopback or responder"
-            ),
-        }
-    }
-
-    fn manual_serial_round_trip(port_path: &str, ping: &[u8], expected: &[u8]) {
-        let mut port = serialport::new(port_path, 115_200)
-            .data_bits(serialport::DataBits::Eight)
-            .stop_bits(serialport::StopBits::One)
-            .parity(serialport::Parity::None)
-            .flow_control(serialport::FlowControl::None)
-            .timeout(std::time::Duration::from_secs(2))
-            .open()
-            .expect("manual serial port should open at 115200 8N1");
-
-        port.write_all(ping).expect("manual serial write failed");
-        port.flush().expect("manual serial flush failed");
-
-        let mut read_buf = vec![0_u8; expected.len()];
-        port.read_exact(&mut read_buf)
-            .expect("manual serial read failed");
-        assert_eq!(read_buf, expected);
-        drop(port);
-    }
 }

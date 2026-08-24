@@ -9,8 +9,10 @@ use oxideterm_connections::{
     DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS, MoshIpFamily as SavedMoshIpFamily, MoshPredictionMode,
     MoshUdpPortSelection as SavedMoshUdpPortSelection, SaveConnectionRequest,
     SaveMoshProfileRequest, SaveRemoteDesktopProfileRequest, SaveSerialProfileRequest,
-    SaveTelnetProfileRequest, SavedConnectionRuntimeSecrets, SavedMoshProfileRuntimeSecrets,
-    SavedUpstreamProxyProtocol, SecretString, first_available_default_key_path,
+    SaveStandaloneSftpProfileRequest, SaveTelnetProfileRequest, SavedConnectionRuntimeSecrets,
+    SavedMoshProfileRuntimeSecrets, SavedProxyCommand, SavedUpstreamProxyAuth,
+    SavedUpstreamProxyConfig, SavedUpstreamProxyPolicy, SavedUpstreamProxyProtocol, SecretString,
+    first_available_default_key_path,
 };
 use oxideterm_mosh::{MoshBootstrapConfig, MoshBootstrapContext};
 use oxideterm_remote_desktop::{
@@ -23,7 +25,8 @@ use oxideterm_ssh::{
     NativeSessionTreeConnectPlan, NativeSessionTreeConnectStep, NodeId, NodeReadiness,
     NodeTreeExpansion, ProxyHopConfig, SshConfig, SshPromptError, SshPromptHandler,
     SshTransportClient, UpstreamProxyAuth, UpstreamProxyConfig, UpstreamProxyProtocol,
-    X11ForwardPolicy, X11ForwardTrust, check_host_key_with_upstream_proxy,
+    X11ForwardPolicy, X11ForwardTrust, check_host_key_with_route,
+    check_host_key_with_upstream_proxy,
 };
 use tokio::sync::oneshot;
 
@@ -33,7 +36,8 @@ use super::{
         NewConnectionField, NewConnectionForm, NewConnectionFormMode, NewConnectionProxyHop,
         NewConnectionSubmitAction, NewConnectionTransport, NewConnectionUpstreamProxyAuth,
         NewConnectionUpstreamProxyPolicy, SavedConnectionPromptAction, SshAuthTab,
-        identity_agent_from_form, identity_agent_selector,
+        StandaloneSftpSecondaryForm, connection_timeout_drafts_valid, identity_agent_from_form,
+        identity_agent_selector, ssh_auth_tab_from_saved_auth,
     },
     host_key_dialog::HostKeyChallenge,
 };
@@ -42,14 +46,17 @@ use crate::workspace::{
     delivery::ActiveDeliverySender,
     session_manager::{
         RuntimeSecretHandoff, duplicate_connection_template_name, form_from_saved_connection,
-        restore_saved_proxy_chain_in_form, save_request_from_form_with_existing_auth,
+        restore_legacy_jump_host_in_form, save_request_from_form_with_existing_auth,
         save_request_from_form_with_proxy_hop_prefix, upstream_proxy_config_from_form,
     },
 };
 use oxideterm_session_adapter::{
     auth_method_from_saved_auth, managed_key_resolver_from_store,
-    proxy_chain_config_from_saved_connection, ssh_config_from_saved_connection,
+    proxy_chain_config_from_saved_connection, proxy_command_from_value,
+    ssh_config_from_saved_connection, ssh_config_from_saved_connection_with_auth,
     ssh_config_from_saved_connection_with_runtime_secrets,
+    ssh_config_from_standalone_sftp_endpoint_with_runtime_secrets,
+    ssh_config_from_standalone_sftp_profile_with_runtime_secrets,
 };
 use oxideterm_terminal::{MoshTerminalConfig, SerialSessionConfig, TelnetSessionConfig};
 
@@ -117,7 +124,7 @@ impl SshTerminalConnectionOptions {
     pub(in crate::workspace) fn from_form(form: &NewConnectionForm) -> Self {
         // Keep the SSH session ownership policy separate from terminal protocol overrides.
         Self {
-            terminal: form.terminal,
+            terminal: form.terminal.clone(),
             dedicated_new_terminal_connection: form.dedicated_new_terminal_connection,
         }
     }
@@ -135,6 +142,7 @@ impl Default for SshTerminalConnectionOptions {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::workspace) enum SshConnectionIntent {
     Test,
+    TestStandaloneSftp,
     Connect(SshTerminalConnectionOptions),
     ConnectSaved(String),
     DrillDown {
@@ -143,6 +151,39 @@ pub(in crate::workspace) enum SshConnectionIntent {
         terminal_options: SshTerminalConnectionOptions,
     },
     Mosh(MoshConnectionOptions),
+    StandaloneSftp {
+        saved_profile_id: Option<String>,
+        initial_remote_path: Option<String>,
+        pair_launch_token: Option<String>,
+    },
+    StandaloneSftpSecondary {
+        pair_launch_token: String,
+    },
+}
+
+impl SshConnectionIntent {
+    pub(in crate::workspace) fn standalone_sftp_pair_launch_token(&self) -> Option<&str> {
+        match self {
+            Self::StandaloneSftp {
+                pair_launch_token: Some(token),
+                ..
+            }
+            | Self::StandaloneSftpSecondary {
+                pair_launch_token: token,
+            } => Some(token),
+            _ => None,
+        }
+    }
+}
+
+/// Owns both secret-bearing endpoint configs only until host-key checks finish.
+pub(in crate::workspace) struct PendingStandaloneSftpPairLaunch {
+    pub(in crate::workspace) saved_profile_id: String,
+    pub(in crate::workspace) title: String,
+    pub(in crate::workspace) primary_initial_remote_path: Option<String>,
+    pub(in crate::workspace) secondary_initial_remote_path: Option<String>,
+    pub(in crate::workspace) primary_config: Option<SshConfig>,
+    pub(in crate::workspace) secondary_config: Option<SshConfig>,
 }
 
 /// Non-secret Mosh launch settings travel through SSH host-key preflight.
@@ -155,6 +196,7 @@ pub(in crate::workspace) struct MoshConnectionOptions {
     pub(in crate::workspace) ip_family: SavedMoshIpFamily,
     pub(in crate::workspace) prediction: MoshPredictionMode,
     pub(in crate::workspace) locale: Option<String>,
+    pub(in crate::workspace) terminal: ConnectionTerminalOptions,
     // Correlates an asynchronous verified Mosh launch without exposing a GPUI identity.
     pub(in crate::workspace) public_mcp_open_token: Option<String>,
 }
@@ -165,6 +207,8 @@ pub(in crate::workspace) enum SshConnectionWorkerResult {
         upstream_proxy: Option<UpstreamProxyConfig>,
         title: String,
         intent: SshConnectionIntent,
+        host: String,
+        port: u16,
         status: HostKeyStatus,
     },
     SessionTreePreflight {
@@ -175,6 +219,31 @@ pub(in crate::workspace) enum SshConnectionWorkerResult {
     },
     Test {
         result: StdResult<(), String>,
+    },
+    StandaloneSftpConnected {
+        endpoint_id: String,
+        saved_profile_id: Option<String>,
+        title: String,
+        initial_remote_path: Option<String>,
+        consumer: ConnectionConsumer,
+        result: StdResult<oxideterm_ssh::SshConnectionHandle, String>,
+    },
+    StandaloneSftpPairConnected {
+        saved_profile_id: String,
+        title: String,
+        primary_endpoint_id: String,
+        secondary_endpoint_id: String,
+        primary_initial_remote_path: Option<String>,
+        secondary_initial_remote_path: Option<String>,
+        primary_consumer: ConnectionConsumer,
+        secondary_consumer: ConnectionConsumer,
+        result: StdResult<
+            (
+                oxideterm_ssh::SshConnectionHandle,
+                oxideterm_ssh::SshConnectionHandle,
+            ),
+            String,
+        >,
     },
     KeyboardInteractivePrompt {
         request: KeyboardInteractivePromptRequest,
@@ -239,6 +308,53 @@ impl SshPromptHandler for NativeSshPromptHandler {
 }
 
 impl WorkspaceApp {
+    pub(in crate::workspace) fn ensure_kerberos_credentials_availability(
+        &self,
+        cx: &mut Context<Self>,
+    ) {
+        let should_check = self.update_connection_form_state(cx, |state| {
+            let Some(form) = state.form.as_mut() else {
+                return false;
+            };
+            let kerberos_enabled = form.gssapi_enabled
+                || form.standalone_sftp_secondary.gssapi_enabled
+                || form
+                    .jump_server_form
+                    .as_ref()
+                    .is_some_and(|jump| jump.gssapi_enabled);
+            if !kerberos_enabled
+                || form.gssapi_credentials_available.is_some()
+                || form.gssapi_credentials_check_pending
+            {
+                return false;
+            }
+            form.gssapi_credentials_check_pending = true;
+            true
+        });
+        if !should_check {
+            return;
+        }
+
+        let runtime = self.forwarding_runtime.handle().clone();
+        cx.spawn(async move |weak, cx| {
+            // Platform credential discovery may call GSSAPI or SSPI and must stay off GPUI.
+            let available = runtime
+                .spawn_blocking(oxideterm_ssh::kerberos_credentials_available)
+                .await
+                .unwrap_or(false);
+            let _ = weak.update(cx, |this, cx| {
+                this.update_connection_form_state(cx, |state| {
+                    if let Some(form) = state.form.as_mut() {
+                        form.gssapi_credentials_check_pending = false;
+                        form.gssapi_credentials_available = Some(available);
+                    }
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Borrows the entity-owned form state without copying secret drafts.
     pub(in crate::workspace) fn connection_form_state<'a>(
         &self,
@@ -281,13 +397,6 @@ impl WorkspaceApp {
             cx.notify();
         });
         result
-    }
-
-    pub(in crate::workspace) fn saved_connection_form_source_id<'a>(
-        &self,
-        cx: &'a App,
-    ) -> Option<&'a str> {
-        self.connection_form_state(cx).saved_connection_source_id()
     }
 
     pub(in crate::workspace) fn saved_connection_form_uses_unloaded_secret(

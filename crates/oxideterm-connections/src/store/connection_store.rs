@@ -84,6 +84,17 @@ impl ConnectionStore {
         self.data.mosh_profiles.iter().find(|profile| profile.id == id)
     }
 
+    pub fn standalone_sftp_profiles(&self) -> &[StandaloneSftpProfile] {
+        &self.data.standalone_sftp_profiles
+    }
+
+    pub fn get_standalone_sftp_profile(&self, id: &str) -> Option<&StandaloneSftpProfile> {
+        self.data
+            .standalone_sftp_profiles
+            .iter()
+            .find(|profile| profile.id == id)
+    }
+
     pub fn remote_desktop_profiles(&self) -> &[RemoteDesktopProfile] {
         &self.data.remote_desktop_profiles
     }
@@ -198,6 +209,10 @@ impl ConnectionStore {
         request: SaveConnectionRequest,
     ) -> Result<(ConnectionInfo, SavedConnectionRuntimeSecrets)> {
         let group = normalize_optional_group_name(request.group.as_deref())?;
+        let notes = request.notes.and_then(|notes| {
+            let notes = notes.trim().to_string();
+            (!notes.is_empty()).then_some(notes)
+        });
         let now = Utc::now();
         let id = request.id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let old_keychain_ids = self
@@ -221,6 +236,8 @@ impl ConnectionStore {
         options.identity_agent = request.identity_agent;
         options.agent_forwarding_socket = request.agent_forwarding_socket;
         options.legacy_ssh_compatibility = request.legacy_ssh_compatibility;
+        request.ssh_algorithms.validate()?;
+        options.ssh_algorithms = request.ssh_algorithms;
         options.dedicated_new_terminal_connection = request.dedicated_new_terminal_connection;
         options.x11_forwarding = request.x11_forwarding;
         options.terminal = request.terminal;
@@ -228,13 +245,28 @@ impl ConnectionStore {
             self.materialize_auth_with_runtime_secret(request.auth, existing_auth.as_ref())?;
         let (proxy_chain, proxy_chain_secrets) =
             self.materialize_proxy_chain_with_runtime_secrets(request.proxy_chain)?;
+        if !proxy_chain.is_empty() {
+            // A modern embedded route supersedes the legacy saved-connection reference.
+            options.jump_host = None;
+        }
         let (upstream_proxy, upstream_proxy_secret) = self
             .materialize_upstream_proxy_policy_with_runtime_secret(
                 request.upstream_proxy,
                 existing.as_ref().map(|conn| &conn.upstream_proxy),
             )?;
-        let next_keychain_ids =
-            collect_keychain_ids_for_parts(&auth, &proxy_chain, &upstream_proxy);
+        let (proxy_command, proxy_command_secret) = self
+            .materialize_proxy_command_with_runtime_secret(
+                request.proxy_command,
+                existing
+                    .as_ref()
+                    .and_then(|connection| connection.proxy_command.as_ref()),
+            )?;
+        let next_keychain_ids = collect_keychain_ids_for_parts(
+            &auth,
+            &proxy_chain,
+            &upstream_proxy,
+            proxy_command.as_ref(),
+        );
         let post_connect_command = request.post_connect_command.and_then(|command| {
             let command = command.trim().to_string();
             (!command.is_empty()).then_some(command)
@@ -254,12 +286,14 @@ impl ConnectionStore {
                 .unwrap_or(CONFIG_VERSION),
             name: non_empty(request.name.trim(), "Connection name")?.to_string(),
             group: group.clone(),
+            notes,
             host: non_empty(request.host.trim(), "Host")?.to_string(),
             port: request.port.max(1),
             username: non_empty(request.username.trim(), "Username")?.to_string(),
             auth,
             proxy_chain,
             upstream_proxy,
+            proxy_command,
             options,
             created_at: self.get(&id).map(|conn| conn.created_at).unwrap_or(now),
             // Editing metadata must not change recent-connection ordering.
@@ -296,6 +330,7 @@ impl ConnectionStore {
                 auth: auth_secret,
                 proxy_chain: proxy_chain_secrets,
                 upstream_proxy: upstream_proxy_secret,
+                proxy_command: proxy_command_secret,
             },
         ))
     }
@@ -550,6 +585,16 @@ impl ConnectionStore {
                 profile.updated_at = now;
             }
         }
+        for profile in &mut self.data.standalone_sftp_profiles {
+            if profile
+                .group
+                .as_deref()
+                .is_some_and(|group| group_path_is_within(group, &name))
+            {
+                profile.group = None;
+                profile.updated_at = now;
+            }
+        }
         for profile in &mut self.data.remote_desktop_profiles {
             if profile
                 .group
@@ -633,6 +678,17 @@ impl ConnectionStore {
                 updated += 1;
             }
         }
+        for profile in &mut self.data.standalone_sftp_profiles {
+            if let Some(renamed) = profile
+                .group
+                .as_deref()
+                .and_then(|group| rename_group_path(group, &old_name, &new_name))
+            {
+                profile.group = Some(renamed);
+                profile.updated_at = now;
+                updated += 1;
+            }
+        }
         for profile in &mut self.data.remote_desktop_profiles {
             if let Some(renamed) = profile
                 .group
@@ -652,7 +708,7 @@ impl ConnectionStore {
     }
 
     pub fn move_to_group(&mut self, ids: &[String], group: Option<&str>) -> Result<usize> {
-        self.move_session_assets_to_group(ids, &[], &[], &[], &[], group)
+        self.move_session_assets_to_group(ids, &[], &[], &[], &[], &[], group)
     }
 
     /// Moves all saved Session Manager asset types in one metadata save.
@@ -662,6 +718,7 @@ impl ConnectionStore {
         serial_profile_ids: &[String],
         telnet_profile_ids: &[String],
         mosh_profile_ids: &[String],
+        standalone_sftp_profile_ids: &[String],
         remote_desktop_ids: &[String],
         group: Option<&str>,
     ) -> Result<usize> {
@@ -670,6 +727,8 @@ impl ConnectionStore {
         let serial_profile_id_set = serial_profile_ids.iter().collect::<HashSet<_>>();
         let telnet_profile_id_set = telnet_profile_ids.iter().collect::<HashSet<_>>();
         let mosh_profile_id_set = mosh_profile_ids.iter().collect::<HashSet<_>>();
+        let standalone_sftp_profile_id_set =
+            standalone_sftp_profile_ids.iter().collect::<HashSet<_>>();
         let remote_desktop_id_set = remote_desktop_ids.iter().collect::<HashSet<_>>();
         let now = Utc::now();
         let mut updated = 0;
@@ -696,6 +755,13 @@ impl ConnectionStore {
         }
         for profile in &mut self.data.mosh_profiles {
             if mosh_profile_id_set.contains(&profile.id) {
+                profile.group = group.clone();
+                profile.updated_at = now;
+                updated += 1;
+            }
+        }
+        for profile in &mut self.data.standalone_sftp_profiles {
+            if standalone_sftp_profile_id_set.contains(&profile.id) {
                 profile.group = group.clone();
                 profile.updated_at = now;
                 updated += 1;
@@ -751,6 +817,49 @@ impl ConnectionStore {
         Ok(true)
     }
 
+    pub fn set_terminal_highlight_rule_set(
+        &mut self,
+        id: &str,
+        rule_set_id: Option<String>,
+    ) -> Result<bool> {
+        let rule_set_id = rule_set_id.and_then(|id| {
+            let id = id.trim();
+            (!id.is_empty()).then(|| id.to_string())
+        });
+
+        if let Some(connection) = self
+            .data
+            .connections
+            .iter_mut()
+            .find(|connection| connection.id == id)
+        {
+            if connection.options.terminal.highlight_rule_set == rule_set_id {
+                return Ok(true);
+            }
+            connection.options.terminal.highlight_rule_set = rule_set_id;
+            connection.updated_at = Some(Utc::now());
+            self.save()?;
+            return Ok(true);
+        }
+
+        // Telnet profiles own the same terminal presentation options without an SSH node.
+        let Some(profile) = self
+            .data
+            .telnet_profiles
+            .iter_mut()
+            .find(|profile| profile.id == id)
+        else {
+            return Ok(false);
+        };
+        if profile.terminal.highlight_rule_set == rule_set_id {
+            return Ok(true);
+        }
+        profile.terminal.highlight_rule_set = rule_set_id;
+        profile.updated_at = Utc::now();
+        self.save()?;
+        Ok(true)
+    }
+
     pub fn upsert_serial_profile(
         &mut self,
         request: SaveSerialProfileRequest,
@@ -772,6 +881,7 @@ impl ConnectionStore {
 
         profile.name = request.name.trim().to_string();
         profile.group = group;
+        profile.notes = normalize_optional_text(request.notes);
         profile.icon = normalize_optional_text(request.icon);
         profile.color = normalize_optional_text(request.color);
         profile.icon_background_color = normalize_optional_text(request.icon_background_color);
@@ -781,6 +891,7 @@ impl ConnectionStore {
         profile.stop_bits = request.stop_bits.unwrap_or(1);
         profile.parity = request.parity.unwrap_or(SerialParity::None);
         profile.flow_control = request.flow_control.unwrap_or(SerialFlowControl::None);
+        profile.terminal = request.terminal;
         profile.connect_on_open = request.connect_on_open.unwrap_or(false);
         if !self
             .data
@@ -856,6 +967,7 @@ impl ConnectionStore {
 
         profile.name = request.name.trim().to_string();
         profile.group = group;
+        profile.notes = normalize_optional_text(request.notes);
         profile.icon = normalize_optional_text(request.icon);
         profile.color = normalize_optional_text(request.color);
         profile.icon_background_color = normalize_optional_text(request.icon_background_color);
@@ -933,13 +1045,18 @@ impl ConnectionStore {
         let existing = self.get_mosh_profile(&id).cloned();
         let old_keychain_ids = existing
             .as_ref()
-            .map(|profile| collect_keychain_ids_for_auth(&profile.auth))
+            .map(collect_mosh_keychain_ids)
             .unwrap_or_default();
         let (auth, auth_secret) = self.materialize_auth_with_runtime_secret(
             request.auth,
             existing.as_ref().map(|profile| &profile.auth),
         )?;
-        let next_keychain_ids = collect_keychain_ids_for_auth(&auth);
+        let (proxy_chain, proxy_chain_secrets) =
+            self.materialize_proxy_chain_with_runtime_secrets(request.proxy_chain)?;
+        let mut next_keychain_ids = collect_keychain_ids_for_auth(&auth);
+        for hop in &proxy_chain {
+            next_keychain_ids.extend(collect_keychain_ids_for_auth(&hop.auth));
+        }
         let mut profile = existing.unwrap_or_else(|| {
             let mut profile = MoshProfile::new(
                 request.name.trim(),
@@ -953,6 +1070,7 @@ impl ConnectionStore {
         });
         profile.name = request.name.trim().to_string();
         profile.group = group.clone();
+        profile.notes = normalize_optional_text(request.notes);
         profile.icon = normalize_optional_text(request.icon);
         profile.color = normalize_optional_text(request.color);
         profile.icon_background_color = normalize_optional_text(request.icon_background_color);
@@ -960,6 +1078,7 @@ impl ConnectionStore {
         profile.ssh_port = request.ssh_port;
         profile.username = request.username.trim().to_string();
         profile.auth = auth;
+        profile.proxy_chain = proxy_chain;
         profile.server_executable = request.server_executable.trim().to_string();
         profile.udp_host_override = normalize_optional_text(request.udp_host_override);
         profile.udp_port = request.udp_port;
@@ -968,6 +1087,7 @@ impl ConnectionStore {
         profile.locale = normalize_optional_text(request.locale);
         profile.identity_agent = normalize_optional_text(request.identity_agent);
         profile.legacy_ssh_compatibility = request.legacy_ssh_compatibility;
+        profile.terminal = request.terminal;
         profile.updated_at = now;
         profile.validate()?;
 
@@ -995,14 +1115,17 @@ impl ConnectionStore {
         }
         Ok((
             profile,
-            SavedMoshProfileRuntimeSecrets { auth: auth_secret },
+            SavedMoshProfileRuntimeSecrets {
+                auth: auth_secret,
+                proxy_chain: proxy_chain_secrets,
+            },
         ))
     }
 
     pub fn delete_mosh_profile(&mut self, id: &str) -> Result<bool> {
         let keychain_ids = self
             .get_mosh_profile(id)
-            .map(|profile| collect_keychain_ids_for_auth(&profile.auth))
+            .map(collect_mosh_keychain_ids)
             .unwrap_or_default();
         let before = self.data.mosh_profiles.len();
         self.data.mosh_profiles.retain(|profile| profile.id != id);
@@ -1014,6 +1137,22 @@ impl ConnectionStore {
             }
         }
         Ok(deleted)
+    }
+
+    pub fn load_mosh_profile_runtime_secrets(
+        &self,
+        id: &str,
+    ) -> Result<SavedMoshProfileRuntimeSecrets> {
+        let profile = self
+            .get_mosh_profile(id)
+            .ok_or_else(|| anyhow::anyhow!("Mosh profile not found"))?;
+        let auth = self.load_saved_auth_runtime_secret(&profile.auth)?;
+        let proxy_chain = profile
+            .proxy_chain
+            .iter()
+            .map(|hop| self.load_saved_auth_runtime_secret(&hop.auth))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(SavedMoshProfileRuntimeSecrets { auth, proxy_chain })
     }
 
     /// Stores a Mosh primary credential without changing its recent-use timestamp.
@@ -1034,6 +1173,34 @@ impl ConnectionStore {
             .find(|profile| profile.id == id)
             .expect("Mosh profile checked above");
         profile.auth = next_auth;
+        profile.updated_at = Utc::now();
+        self.save()?;
+        Ok(true)
+    }
+
+    pub fn store_mosh_proxy_hop_credential(
+        &mut self,
+        id: &str,
+        hop_index: usize,
+        secret: &SecretString,
+    ) -> Result<bool> {
+        let Some(profile) = self.get_mosh_profile(id) else {
+            return Ok(false);
+        };
+        let auth = profile
+            .proxy_chain
+            .get(hop_index)
+            .map(|hop| hop.auth.clone())
+            .ok_or_else(|| anyhow::anyhow!("Mosh proxy hop credential slot not found"))?;
+        let (next_auth, reference) = auth_with_protected_credential(auth)?;
+        self.keychain.store(&reference, secret)?;
+        let profile = self
+            .data
+            .mosh_profiles
+            .iter_mut()
+            .find(|profile| profile.id == id)
+            .expect("Mosh profile checked above");
+        profile.proxy_chain[hop_index].auth = next_auth;
         profile.updated_at = Utc::now();
         self.save()?;
         Ok(true)
@@ -1061,10 +1228,295 @@ impl ConnectionStore {
         Ok(true)
     }
 
+    pub fn forget_mosh_proxy_hop_credential(
+        &mut self,
+        id: &str,
+        hop_index: usize,
+    ) -> Result<bool> {
+        let Some(profile) = self.get_mosh_profile(id) else {
+            return Ok(false);
+        };
+        let auth = profile
+            .proxy_chain
+            .get(hop_index)
+            .map(|hop| &hop.auth)
+            .ok_or_else(|| anyhow::anyhow!("Mosh proxy hop credential slot not found"))?;
+        let (next_auth, reference) = auth_without_protected_credential(auth);
+        let Some(reference) = reference else {
+            return Ok(false);
+        };
+        let profile = self
+            .data
+            .mosh_profiles
+            .iter_mut()
+            .find(|profile| profile.id == id)
+            .expect("Mosh profile checked above");
+        profile.proxy_chain[hop_index].auth = next_auth;
+        profile.updated_at = Utc::now();
+        self.save()?;
+        self.delete_or_queue_connection_keychain_entry(reference)?;
+        Ok(true)
+    }
+
     pub fn mark_mosh_profile_used(&mut self, id: &str) -> Result<bool> {
         let Some(profile) = self
             .data
             .mosh_profiles
+            .iter_mut()
+            .find(|profile| profile.id == id)
+        else {
+            return Ok(false);
+        };
+        let now = Utc::now();
+        profile.last_used_at = Some(now);
+        profile.updated_at = now;
+        self.save()?;
+        Ok(true)
+    }
+
+    pub fn upsert_standalone_sftp_profile(
+        &mut self,
+        request: SaveStandaloneSftpProfileRequest,
+    ) -> Result<StandaloneSftpProfile> {
+        self.upsert_standalone_sftp_profile_with_runtime_secrets(request)
+            .map(|(profile, _secrets)| profile)
+    }
+
+    pub fn upsert_standalone_sftp_profile_with_runtime_secrets(
+        &mut self,
+        request: SaveStandaloneSftpProfileRequest,
+    ) -> Result<(
+        StandaloneSftpProfile,
+        SavedStandaloneSftpProfileRuntimeSecrets,
+    )> {
+        let group = normalize_optional_group_name(request.group.as_deref())?;
+        let now = Utc::now();
+        let id = request.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+        // Validate portable metadata before any temporary credential crosses into keychain.
+        non_empty(id.trim(), "Standalone SFTP profile id")?;
+        non_empty(request.name.trim(), "Standalone SFTP profile name")?;
+        non_empty(request.host.trim(), "Standalone SFTP host")?;
+        non_empty(request.username.trim(), "Standalone SFTP username")?;
+        if request.port == 0 {
+            bail!("Standalone SFTP port must be greater than zero");
+        }
+        if request.connect_timeout_seconds == 0 {
+            bail!("Standalone SFTP connect timeout must be greater than zero");
+        }
+        if request.transfer_mode == StandaloneSftpTransferMode::RemoteRemote {
+            request
+                .secondary_endpoint
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Standalone SFTP secondary endpoint is required"))?
+                .validate()?;
+        }
+        let existing = self.get_standalone_sftp_profile(&id).cloned();
+        let old_keychain_ids = existing
+            .as_ref()
+            .map(collect_standalone_sftp_keychain_ids)
+            .unwrap_or_default();
+        let (auth, auth_secret) = self.materialize_auth_with_runtime_secret(
+            request.auth,
+            existing.as_ref().map(|profile| &profile.auth),
+        )?;
+        let (proxy_chain, proxy_chain_secrets) =
+            self.materialize_proxy_chain_with_runtime_secrets(request.proxy_chain)?;
+        let (upstream_proxy, upstream_proxy_secret) = self
+            .materialize_upstream_proxy_policy_with_runtime_secret(
+                request.upstream_proxy,
+                existing.as_ref().map(|profile| &profile.upstream_proxy),
+            )?;
+        let (proxy_command, proxy_command_secret) = self
+            .materialize_proxy_command_with_runtime_secret(
+                request.proxy_command,
+                existing
+                    .as_ref()
+                    .and_then(|profile| profile.proxy_command.as_ref()),
+            )?;
+        let (secondary_endpoint, secondary_endpoint_secrets) = match request.transfer_mode {
+            StandaloneSftpTransferMode::LocalRemote => (None, None),
+            StandaloneSftpTransferMode::RemoteRemote => {
+                let endpoint = request
+                    .secondary_endpoint
+                    .expect("secondary endpoint validated above");
+                let existing_endpoint = existing
+                    .as_ref()
+                    .and_then(|profile| profile.secondary_endpoint.as_ref());
+                let (endpoint, secrets) = self
+                    .materialize_standalone_sftp_endpoint_with_runtime_secrets(
+                        endpoint,
+                        existing_endpoint,
+                    )?;
+                (Some(endpoint), Some(secrets))
+            }
+        };
+        let mut next_keychain_ids = collect_keychain_ids_for_parts(
+            &auth,
+            &proxy_chain,
+            &upstream_proxy,
+            proxy_command.as_ref(),
+        );
+        if let Some(endpoint) = &secondary_endpoint {
+            next_keychain_ids.extend(collect_keychain_ids_for_parts(
+                &endpoint.auth,
+                &endpoint.proxy_chain,
+                &endpoint.upstream_proxy,
+                endpoint.proxy_command.as_ref(),
+            ));
+        }
+        let mut profile = existing.unwrap_or_else(|| {
+            let mut profile = StandaloneSftpProfile::new(
+                request.name.trim(),
+                request.host.trim(),
+                request.port,
+                request.username.trim(),
+                auth.clone(),
+            );
+            profile.id = id.clone();
+            profile
+        });
+        profile.name = request.name.trim().to_string();
+        profile.group = group.clone();
+        profile.notes = normalize_optional_text(request.notes);
+        profile.icon = normalize_optional_text(request.icon);
+        profile.color = normalize_optional_text(request.color);
+        profile.icon_background_color = normalize_optional_text(request.icon_background_color);
+        profile.host = request.host.trim().to_string();
+        profile.port = request.port;
+        profile.username = request.username.trim().to_string();
+        profile.auth = auth;
+        profile.connect_timeout_seconds = request.connect_timeout_seconds;
+        profile.proxy_chain = proxy_chain;
+        profile.upstream_proxy = upstream_proxy;
+        profile.proxy_command = proxy_command;
+        profile.identity_agent = normalize_optional_text(request.identity_agent);
+        profile.legacy_ssh_compatibility = request.legacy_ssh_compatibility;
+        profile.initial_remote_path = normalize_optional_text(request.initial_remote_path);
+        profile.transfer_mode = request.transfer_mode;
+        profile.secondary_endpoint = secondary_endpoint;
+        profile.updated_at = now;
+        profile.validate()?;
+
+        if let Some(existing) = self
+            .data
+            .standalone_sftp_profiles
+            .iter_mut()
+            .find(|existing| existing.id == id)
+        {
+            *existing = profile.clone();
+        } else {
+            profile.created_at = now;
+            self.data.standalone_sftp_profiles.push(profile.clone());
+        }
+        if let Some(group) = group {
+            self.ensure_group(group)?;
+        }
+        self.normalize();
+        self.save()?;
+        for stale_keychain_id in old_keychain_ids
+            .iter()
+            .filter(|keychain_id| !next_keychain_ids.contains(*keychain_id))
+        {
+            let _ = self.keychain.delete(stale_keychain_id);
+        }
+        Ok((
+            profile,
+            SavedStandaloneSftpProfileRuntimeSecrets {
+                auth: auth_secret,
+                proxy_chain: proxy_chain_secrets,
+                upstream_proxy: upstream_proxy_secret,
+                proxy_command: proxy_command_secret,
+                secondary_endpoint: secondary_endpoint_secrets,
+            },
+        ))
+    }
+
+    pub fn load_standalone_sftp_profile_runtime_secrets(
+        &self,
+        id: &str,
+    ) -> Result<SavedStandaloneSftpProfileRuntimeSecrets> {
+        let profile = self
+            .get_standalone_sftp_profile(id)
+            .ok_or_else(|| anyhow::anyhow!("Standalone SFTP profile not found"))?;
+        let primary = self.load_standalone_sftp_endpoint_runtime_secrets(
+            &profile.auth,
+            &profile.proxy_chain,
+            &profile.upstream_proxy,
+            profile.proxy_command.as_ref(),
+        )?;
+        let secondary_endpoint = profile
+            .secondary_endpoint
+            .as_ref()
+            .map(|endpoint| {
+                self.load_standalone_sftp_endpoint_runtime_secrets(
+                    &endpoint.auth,
+                    &endpoint.proxy_chain,
+                    &endpoint.upstream_proxy,
+                    endpoint.proxy_command.as_ref(),
+                )
+            })
+            .transpose()?;
+        Ok(SavedStandaloneSftpProfileRuntimeSecrets {
+            auth: primary.auth,
+            proxy_chain: primary.proxy_chain,
+            upstream_proxy: primary.upstream_proxy,
+            proxy_command: primary.proxy_command,
+            secondary_endpoint,
+        })
+    }
+
+    fn load_standalone_sftp_endpoint_runtime_secrets(
+        &self,
+        auth: &SavedAuth,
+        proxy_chain: &[SavedProxyHop],
+        upstream_proxy: &SavedUpstreamProxyPolicy,
+        proxy_command: Option<&SavedProxyCommand>,
+    ) -> Result<SavedStandaloneSftpEndpointRuntimeSecrets> {
+        let auth = self.load_saved_auth_runtime_secret(auth)?;
+        let proxy_chain = proxy_chain
+            .iter()
+            .map(|hop| self.load_saved_auth_runtime_secret(&hop.auth))
+            .collect::<Result<Vec<_>>>()?;
+        let upstream_proxy = match upstream_proxy {
+            SavedUpstreamProxyPolicy::Custom { proxy } => {
+                self.load_saved_upstream_proxy_runtime_secret(&proxy.auth)?
+            }
+            SavedUpstreamProxyPolicy::UseGlobal | SavedUpstreamProxyPolicy::Direct => None,
+        };
+        let proxy_command = proxy_command
+            .map(|command| self.get_saved_proxy_command(command))
+            .transpose()?;
+        Ok(SavedStandaloneSftpEndpointRuntimeSecrets {
+            auth,
+            proxy_chain,
+            upstream_proxy,
+            proxy_command,
+        })
+    }
+
+    pub fn delete_standalone_sftp_profile(&mut self, id: &str) -> Result<bool> {
+        let keychain_ids = self
+            .get_standalone_sftp_profile(id)
+            .map(collect_standalone_sftp_keychain_ids)
+            .unwrap_or_default();
+        let before = self.data.standalone_sftp_profiles.len();
+        self.data
+            .standalone_sftp_profiles
+            .retain(|profile| profile.id != id);
+        let deleted = self.data.standalone_sftp_profiles.len() != before;
+        if deleted {
+            self.save()?;
+            for keychain_id in keychain_ids {
+                let _ = self.keychain.delete(&keychain_id);
+            }
+        }
+        Ok(deleted)
+    }
+
+    pub fn mark_standalone_sftp_profile_used(&mut self, id: &str) -> Result<bool> {
+        let Some(profile) = self
+            .data
+            .standalone_sftp_profiles
             .iter_mut()
             .find(|profile| profile.id == id)
         else {
@@ -1115,6 +1567,7 @@ impl ConnectionStore {
         });
         profile.name = request.name.trim().to_string();
         profile.group = group.clone();
+        profile.notes = normalize_optional_text(request.notes);
         profile.icon = normalize_optional_text(request.icon);
         profile.color = normalize_optional_text(request.color);
         profile.icon_background_color = normalize_optional_text(request.icon_background_color);
@@ -1274,6 +1727,9 @@ impl ConnectionStore {
         connection.proxy_chain = self.materialize_proxy_chain(connection.proxy_chain)?;
         connection.upstream_proxy =
             self.materialize_upstream_proxy_policy(connection.upstream_proxy, None)?;
+        connection.proxy_command = self
+            .materialize_proxy_command_with_runtime_secret(connection.proxy_command, None)?
+            .0;
         // Third-party imports do not carry privilege helper secrets. The user
         // must explicitly create them after import.
         connection.privilege_credentials.clear();
@@ -1316,6 +1772,14 @@ impl ConnectionStore {
             connection.upstream_proxy,
             existing.as_ref().map(|conn| &conn.upstream_proxy),
         )?;
+        connection.proxy_command = self
+            .materialize_proxy_command_with_runtime_secret(
+                connection.proxy_command,
+                existing
+                    .as_ref()
+                    .and_then(|connection| connection.proxy_command.as_ref()),
+            )?
+            .0;
         if let Some(existing) = existing.as_ref() {
             connection.created_at = existing.created_at;
             connection.last_used_at = existing.last_used_at;
@@ -1329,6 +1793,7 @@ impl ConnectionStore {
             &connection.auth,
             &connection.proxy_chain,
             &connection.upstream_proxy,
+            connection.proxy_command.as_ref(),
         );
         if let Some(index) = self
             .data
@@ -1653,6 +2118,7 @@ impl ConnectionStore {
     }
 
     pub fn get_saved_auth_password(&self, auth: &SavedAuth) -> Result<SecretString> {
+        let auth = auth.conventional_fallback();
         match auth {
             SavedAuth::Password {
                 keychain_id: Some(keychain_id),
@@ -1669,6 +2135,51 @@ impl ConnectionStore {
         }
     }
 
+    fn load_saved_auth_runtime_secret(&self, auth: &SavedAuth) -> Result<Option<SecretString>> {
+        let auth = auth.conventional_fallback();
+        match auth {
+            SavedAuth::Password {
+                keychain_id: Some(keychain_id),
+                ..
+            }
+            | SavedAuth::Key {
+                passphrase_keychain_id: Some(keychain_id),
+                ..
+            }
+            | SavedAuth::Certificate {
+                passphrase_keychain_id: Some(keychain_id),
+                ..
+            }
+            | SavedAuth::ManagedKey {
+                passphrase_keychain_id: Some(keychain_id),
+                ..
+            } => self.keychain.get(keychain_id).map(Some),
+            SavedAuth::Password {
+                plaintext_password: Some(secret),
+                ..
+            }
+            | SavedAuth::Key {
+                plaintext_passphrase: Some(secret),
+                ..
+            }
+            | SavedAuth::Certificate {
+                plaintext_passphrase: Some(secret),
+                ..
+            }
+            | SavedAuth::ManagedKey {
+                plaintext_passphrase: Some(secret),
+                ..
+            } => Ok(Some(secret.clone())),
+            SavedAuth::Password { .. }
+            | SavedAuth::Key { .. }
+            | SavedAuth::Certificate { .. }
+            | SavedAuth::ManagedKey { .. }
+            | SavedAuth::KeyboardInteractive
+            | SavedAuth::Agent
+            | SavedAuth::KerberosPreferred { .. } => Ok(None),
+        }
+    }
+
     pub fn get_connection_passphrase(&self, id: &str) -> Result<Option<SecretString>> {
         let conn = self
             .get(id)
@@ -1677,6 +2188,7 @@ impl ConnectionStore {
     }
 
     pub fn get_saved_auth_passphrase(&self, auth: &SavedAuth) -> Result<Option<SecretString>> {
+        let auth = auth.conventional_fallback();
         match auth {
             SavedAuth::Key {
                 passphrase_keychain_id: Some(keychain_id),
@@ -1746,6 +2258,15 @@ impl ConnectionStore {
             }),
             SavedAuth::KeyboardInteractive => Ok(SavedAuth::KeyboardInteractive),
             SavedAuth::Agent => Ok(SavedAuth::Agent),
+            SavedAuth::KerberosPreferred {
+                server_identity,
+                delegate_credentials,
+                fallback,
+            } => Ok(SavedAuth::with_kerberos_preferred(
+                self.copy_saved_auth_for_new_owner(fallback)?,
+                server_identity.clone(),
+                *delegate_credentials,
+            )),
         }
     }
 
@@ -1767,6 +2288,33 @@ impl ConnectionStore {
             } => bail!("Upstream proxy password is not saved"),
             SavedUpstreamProxyAuth::None => bail!("Upstream proxy does not use password auth"),
         }
+    }
+
+    fn load_saved_upstream_proxy_runtime_secret(
+        &self,
+        auth: &SavedUpstreamProxyAuth,
+    ) -> Result<Option<SecretString>> {
+        match auth {
+            SavedUpstreamProxyAuth::Password {
+                keychain_id: Some(keychain_id),
+                ..
+            } => self.keychain.get(keychain_id).map(Some),
+            SavedUpstreamProxyAuth::Password {
+                plaintext_password: Some(password),
+                ..
+            } => Ok(Some(password.clone())),
+            SavedUpstreamProxyAuth::Password { .. } | SavedUpstreamProxyAuth::None => Ok(None),
+        }
+    }
+
+    pub fn get_saved_proxy_command(&self, command: &SavedProxyCommand) -> Result<SecretString> {
+        let keychain_id = command
+            .keychain_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("ProxyCommand is not saved"))?;
+        self.keychain
+            .get(keychain_id)
+            .context("failed to load ProxyCommand from protected storage")
     }
 
     pub fn save_global_upstream_proxy_password(&self, password: &SecretString) -> Result<String> {
@@ -2160,6 +2708,7 @@ impl ConnectionStore {
         let mut materialized = Vec::with_capacity(proxy_chain.len());
         let mut runtime_secrets = Vec::with_capacity(proxy_chain.len());
         for hop in proxy_chain {
+            hop.ssh_algorithms.validate()?;
             let (auth, runtime_secret) =
                 self.materialize_auth_with_runtime_secret(hop.auth, None)?;
             materialized.push(SavedProxyHop {
@@ -2171,6 +2720,7 @@ impl ConnectionStore {
                 identity_agent: hop.identity_agent,
                 agent_forwarding_socket: hop.agent_forwarding_socket,
                 legacy_ssh_compatibility: hop.legacy_ssh_compatibility,
+                ssh_algorithms: hop.ssh_algorithms,
             });
             runtime_secrets.push(runtime_secret);
         }
@@ -2259,6 +2809,91 @@ impl ConnectionStore {
         }
     }
 
+    fn materialize_proxy_command_with_runtime_secret(
+        &self,
+        command: Option<SavedProxyCommand>,
+        existing_command: Option<&SavedProxyCommand>,
+    ) -> Result<(Option<SavedProxyCommand>, Option<SecretString>)> {
+        let Some(command) = command else {
+            return Ok((None, None));
+        };
+        if let Some(plaintext_command) = command.plaintext_command {
+            let keychain_id = existing_proxy_command_keychain_id(existing_command)
+                .or(command.keychain_id)
+                .unwrap_or_else(new_proxy_command_keychain_id);
+            self.keychain.store(&keychain_id, &plaintext_command)?;
+            return Ok((
+                Some(SavedProxyCommand {
+                    keychain_id: Some(keychain_id),
+                    plaintext_command: None,
+                }),
+                Some(plaintext_command),
+            ));
+        }
+
+        let keychain_id = command
+            .keychain_id
+            .or_else(|| existing_proxy_command_keychain_id(existing_command))
+            .ok_or_else(|| anyhow::anyhow!("ProxyCommand value is required"))?;
+        Ok((
+            Some(SavedProxyCommand {
+                keychain_id: Some(keychain_id),
+                plaintext_command: None,
+            }),
+            None,
+        ))
+    }
+
+    fn materialize_standalone_sftp_endpoint_with_runtime_secrets(
+        &self,
+        endpoint: StandaloneSftpEndpoint,
+        existing_endpoint: Option<&StandaloneSftpEndpoint>,
+    ) -> Result<(
+        StandaloneSftpEndpoint,
+        SavedStandaloneSftpEndpointRuntimeSecrets,
+    )> {
+        let (auth, auth_secret) = self.materialize_auth_with_runtime_secret(
+            endpoint.auth,
+            existing_endpoint.map(|existing| &existing.auth),
+        )?;
+        let (proxy_chain, proxy_chain_secrets) =
+            self.materialize_proxy_chain_with_runtime_secrets(endpoint.proxy_chain)?;
+        let (upstream_proxy, upstream_proxy_secret) = self
+            .materialize_upstream_proxy_policy_with_runtime_secret(
+                endpoint.upstream_proxy,
+                existing_endpoint.map(|existing| &existing.upstream_proxy),
+            )?;
+        let (proxy_command, proxy_command_secret) = self
+            .materialize_proxy_command_with_runtime_secret(
+                endpoint.proxy_command,
+                existing_endpoint.and_then(|existing| existing.proxy_command.as_ref()),
+            )?;
+        let endpoint = StandaloneSftpEndpoint {
+            host: endpoint.host.trim().to_string(),
+            port: endpoint.port,
+            username: endpoint.username.trim().to_string(),
+            auth,
+            connect_timeout_seconds: endpoint.connect_timeout_seconds,
+            proxy_chain,
+            upstream_proxy,
+            proxy_command,
+            identity_agent: normalize_optional_text(endpoint.identity_agent),
+            legacy_ssh_compatibility: endpoint.legacy_ssh_compatibility,
+            ssh_algorithms: endpoint.ssh_algorithms,
+            initial_remote_path: normalize_optional_text(endpoint.initial_remote_path),
+        };
+        endpoint.validate()?;
+        Ok((
+            endpoint,
+            SavedStandaloneSftpEndpointRuntimeSecrets {
+                auth: auth_secret,
+                proxy_chain: proxy_chain_secrets,
+                upstream_proxy: upstream_proxy_secret,
+                proxy_command: proxy_command_secret,
+            },
+        ))
+    }
+
     fn stage_imported_connection(
         &mut self,
         mut connection: SavedConnection,
@@ -2282,9 +2917,11 @@ impl ConnectionStore {
         connection.host = non_empty(connection.host.trim(), "Host")?.to_string();
         connection.port = connection.port.max(1);
         connection.username = non_empty(connection.username.trim(), "Username")?.to_string();
+        connection.options.ssh_algorithms.validate()?;
         for hop in &connection.proxy_chain {
             non_empty(hop.host.trim(), "Proxy host")?;
             non_empty(hop.username.trim(), "Proxy username")?;
+            hop.ssh_algorithms.validate()?;
         }
 
         let auth = self.materialize_auth(connection.auth, existing_auth.as_ref())?;
@@ -2302,6 +2939,7 @@ impl ConnectionStore {
                 identity_agent: hop.identity_agent,
                 agent_forwarding_socket: hop.agent_forwarding_socket,
                 legacy_ssh_compatibility: hop.legacy_ssh_compatibility,
+                ssh_algorithms: hop.ssh_algorithms,
             });
         }
 
@@ -2310,9 +2948,23 @@ impl ConnectionStore {
             existing.as_ref().map(|conn| &conn.upstream_proxy),
         )?;
         touched_keychain_ids.extend(collect_keychain_ids_for_upstream_proxy(&upstream_proxy));
+        let proxy_command = self
+            .materialize_proxy_command_with_runtime_secret(
+                connection.proxy_command,
+                existing
+                    .as_ref()
+                    .and_then(|connection| connection.proxy_command.as_ref()),
+            )?
+            .0;
+        touched_keychain_ids.extend(
+            proxy_command
+                .as_ref()
+                .and_then(|command| command.keychain_id.clone()),
+        );
         connection.auth = auth;
         connection.proxy_chain = proxy_chain;
         connection.upstream_proxy = upstream_proxy;
+        connection.proxy_command = proxy_command;
         if let Some(existing) = existing.as_ref() {
             connection.created_at = existing.created_at;
             connection.last_used_at = existing.last_used_at;
@@ -2334,6 +2986,7 @@ impl ConnectionStore {
             &connection.auth,
             &connection.proxy_chain,
             &connection.upstream_proxy,
+            connection.proxy_command.as_ref(),
         );
         let stale_old_keychain_ids = old_keychain_ids
             .into_iter()
@@ -2373,6 +3026,11 @@ impl ConnectionStore {
                 data.mosh_profiles
                     .iter()
                     .flat_map(|profile| collect_keychain_ids_for_auth(&profile.auth)),
+            )
+            .chain(
+                data.standalone_sftp_profiles
+                    .iter()
+                    .flat_map(collect_standalone_sftp_keychain_ids),
             )
             .map(|keychain_id| {
                 let value = self.keychain.get_optional(&keychain_id)?;
@@ -2571,6 +3229,18 @@ impl ConnectionStore {
         for profile in &mut self.data.mosh_profiles {
             migrated |= migrate_legacy_auth_credentials(&mut profile.auth, &self.keychain)?;
         }
+        for profile in &mut self.data.standalone_sftp_profiles {
+            migrated |= migrate_legacy_auth_credentials(&mut profile.auth, &self.keychain)?;
+            for hop in &mut profile.proxy_chain {
+                migrated |= migrate_legacy_auth_credentials(&mut hop.auth, &self.keychain)?;
+            }
+            if let Some(endpoint) = &mut profile.secondary_endpoint {
+                migrated |= migrate_legacy_auth_credentials(&mut endpoint.auth, &self.keychain)?;
+                for hop in &mut endpoint.proxy_chain {
+                    migrated |= migrate_legacy_auth_credentials(&mut hop.auth, &self.keychain)?;
+                }
+            }
+        }
         Ok(migrated)
     }
 
@@ -2619,6 +3289,12 @@ impl ConnectionStore {
                     .iter()
                     .filter_map(|profile| profile.group.clone()),
             )
+            .chain(
+                self.data
+                    .standalone_sftp_profiles
+                    .iter()
+                    .filter_map(|profile| profile.group.clone()),
+            )
             .collect::<Vec<_>>();
         for group in implicit_local_groups {
             if !self.data.groups.contains(&group) {
@@ -2646,6 +3322,9 @@ impl ConnectionStore {
             .sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
         self.data
             .mosh_profiles
+            .sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+        self.data
+            .standalone_sftp_profiles
             .sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
     }
 

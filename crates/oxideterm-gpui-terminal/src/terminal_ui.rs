@@ -5,11 +5,19 @@ use gpui::{
     Window, px, rgb,
 };
 use oxideterm_render_policy::EffectiveRenderPolicy;
-use oxideterm_settings::{TerminalBackspaceSequence, TerminalDeleteSequence};
+use oxideterm_settings::{
+    TerminalBackspaceSequence, TerminalDeleteSequence, TerminalSemanticScheme,
+};
 use oxideterm_terminal::{
     TerminalColor, TerminalCursorShape, TerminalEncoding, TrzszTransferPolicy,
 };
+use oxideterm_terminal_semantic::{
+    CompiledSemanticScheme, SemanticScheme, SemanticSchemeDocument, SemanticShellDialect,
+    compile_scheme_document, compiled_builtin_scheme,
+};
 use oxideterm_theme::{ThemeTokens, default_tokens};
+
+use crate::session_log::{TerminalSessionLogContext, TerminalSessionLogOptions};
 
 pub const MAX_HIGHLIGHT_RULES: usize = 32;
 pub const MAX_HIGHLIGHT_PATTERN_LENGTH: usize = 512;
@@ -30,7 +38,7 @@ pub(crate) const SCROLLBAR_WIDTH: f32 = 10.0;
 pub(crate) const SCROLLBAR_GAP: f32 = 0.0;
 pub(crate) const SCROLLBAR_RESERVED_WIDTH: f32 = SCROLLBAR_WIDTH;
 pub(crate) const SCROLLBAR_MIN_THUMB: f32 = 24.0;
-pub(crate) const TERMINAL_TIMESTAMP_LABEL_CELLS: usize = 12;
+pub(crate) const TERMINAL_TIMESTAMP_LABEL_CELLS: usize = 14;
 pub(crate) const TERMINAL_TIMESTAMP_GUTTER_GAP_CELLS: f32 = 1.0;
 pub(crate) const TERMINAL_SCROLL_MULTIPLIER: f32 = 1.0;
 pub(crate) const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
@@ -75,6 +83,9 @@ pub struct TerminalUiPreferences {
     pub right_click_paste: bool,
     pub open_links_with_modifier: bool,
     pub detect_file_paths_as_links: bool,
+    pub semantic_coloring: bool,
+    pub semantic_scheme: Arc<CompiledSemanticScheme>,
+    pub semantic_shell: SemanticShellDialect,
     pub selection_requires_shift: bool,
     pub free_type_mode: bool,
     pub backspace_sequence: TerminalBackspaceSequence,
@@ -96,20 +107,33 @@ pub struct TerminalUiPreferences {
     pub modem_labels: TerminalModemLabels,
     pub trzsz_labels: TerminalTrzszLabels,
     pub serial_control_labels: TerminalSerialControlLabels,
+    pub session_log_options: Option<TerminalSessionLogOptions>,
+    pub session_log_automatic: bool,
+    pub session_log_labels: TerminalSessionLogLabels,
     pub notice_sink: Option<Arc<dyn Fn(TerminalNotice) + Send + Sync + 'static>>,
     pub highlight_rules: Arc<[TerminalHighlightRule]>,
     pub trzsz_policy: Option<TrzszTransferPolicy>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default)]
 pub struct TerminalUiPreferenceOverrides {
     pub terminal_encoding: Option<TerminalEncoding>,
     pub backspace_sequence: Option<TerminalBackspaceSequence>,
     pub delete_sequence: Option<TerminalDeleteSequence>,
+    pub semantic_scheme: Option<Arc<CompiledSemanticScheme>>,
+    pub semantic_scheme_id: Option<String>,
+    pub highlight_rules: Option<Arc<[TerminalHighlightRule]>>,
+    pub highlight_rule_set_id: Option<String>,
+    pub semantic_shell: Option<SemanticShellDialect>,
+    // Retain the local shell identity so settings refreshes can resolve its Scheme again.
+    pub local_shell_id: Option<String>,
+    pub session_log_available: Option<bool>,
+    pub session_log_automatic: Option<bool>,
+    pub session_log_context: Option<TerminalSessionLogContext>,
 }
 
 impl TerminalUiPreferenceOverrides {
-    pub fn apply_to(self, preferences: &mut TerminalUiPreferences) {
+    pub fn apply_to(&self, preferences: &mut TerminalUiPreferences) {
         // These protocol-facing values belong to the terminal session. Apply
         // them after application defaults so later settings refreshes cannot
         // erase a saved host's explicit behavior.
@@ -121,6 +145,26 @@ impl TerminalUiPreferenceOverrides {
         }
         if let Some(delete_sequence) = self.delete_sequence {
             preferences.delete_sequence = delete_sequence;
+        }
+        if let Some(semantic_scheme) = &self.semantic_scheme {
+            preferences.semantic_scheme = semantic_scheme.clone();
+        }
+        if let Some(highlight_rules) = &self.highlight_rules {
+            preferences.highlight_rules = highlight_rules.clone();
+        }
+        if let Some(semantic_shell) = self.semantic_shell {
+            preferences.semantic_shell = semantic_shell;
+        }
+        if self.session_log_available == Some(false) {
+            preferences.session_log_options = None;
+        }
+        if let Some(automatic) = self.session_log_automatic {
+            preferences.session_log_automatic = automatic;
+        }
+        if let Some(context) = &self.session_log_context
+            && let Some(options) = preferences.session_log_options.as_mut()
+        {
+            options.context = context.clone();
         }
     }
 }
@@ -146,6 +190,13 @@ impl Default for TerminalUiPreferences {
             right_click_paste: TERMINAL_RIGHT_CLICK_PASTE,
             open_links_with_modifier: TERMINAL_OPEN_LINKS_WITH_MODIFIER,
             detect_file_paths_as_links: TERMINAL_DETECT_FILE_PATHS_AS_LINKS,
+            // Match persisted settings so standalone terminal views remain opt-in as well.
+            semantic_coloring: false,
+            semantic_scheme: resolved_terminal_semantic_scheme(
+                TerminalSemanticScheme::default(),
+                None,
+            ),
+            semantic_shell: SemanticShellDialect::Auto,
             selection_requires_shift: TERMINAL_SELECTION_REQUIRES_SHIFT,
             free_type_mode: TERMINAL_FREE_TYPE_MODE,
             backspace_sequence: TERMINAL_BACKSPACE_SEQUENCE,
@@ -167,11 +218,30 @@ impl Default for TerminalUiPreferences {
             modem_labels: TerminalModemLabels::default(),
             trzsz_labels: TerminalTrzszLabels::default(),
             serial_control_labels: TerminalSerialControlLabels::default(),
+            session_log_options: None,
+            session_log_automatic: false,
+            session_log_labels: TerminalSessionLogLabels::default(),
             notice_sink: None,
             highlight_rules: Arc::from(Vec::<TerminalHighlightRule>::new()),
             trzsz_policy: None,
         }
     }
+}
+
+pub fn resolved_terminal_semantic_scheme(
+    built_in: TerminalSemanticScheme,
+    custom: Option<&SemanticSchemeDocument>,
+) -> Arc<CompiledSemanticScheme> {
+    if let Some(custom) = custom
+        && let Ok(compiled) = compile_scheme_document(custom)
+    {
+        return Arc::new(compiled);
+    }
+    let built_in = match built_in {
+        TerminalSemanticScheme::Balanced => SemanticScheme::Balanced,
+        TerminalSemanticScheme::Conservative => SemanticScheme::Conservative,
+    };
+    Arc::new(compiled_builtin_scheme(built_in).clone())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -212,7 +282,17 @@ pub(crate) struct TerminalRenderStats {
     pub writes_per_sec: u32,
     pub pending_bytes: usize,
     pub drain_micros: u64,
+    pub drain_p95_micros: u64,
+    pub drained_bytes: usize,
+    pub max_data_chunk_bytes: usize,
+    pub output_processing_micros: u64,
+    pub terminal_lock_wait_micros: u64,
     pub snapshot_micros: u64,
+    pub layout_micros: u64,
+    pub paint_micros: u64,
+    pub layout_cache_hit_percent: u8,
+    pub scroll_snapshot_micros: u64,
+    pub scroll_snapshot_count: u64,
     pub search_micros: u64,
     pub image_prepare_micros: u64,
     pub input_latency_p50_micros: u64,
@@ -227,7 +307,17 @@ impl Default for TerminalRenderStats {
             writes_per_sec: 0,
             pending_bytes: 0,
             drain_micros: 0,
+            drain_p95_micros: 0,
+            drained_bytes: 0,
+            max_data_chunk_bytes: 0,
+            output_processing_micros: 0,
+            terminal_lock_wait_micros: 0,
             snapshot_micros: 0,
+            layout_micros: 0,
+            paint_micros: 0,
+            layout_cache_hit_percent: 0,
+            scroll_snapshot_micros: 0,
+            scroll_snapshot_count: 0,
             search_micros: 0,
             image_prepare_micros: 0,
             input_latency_p50_micros: 0,
@@ -265,6 +355,7 @@ pub struct TerminalCommandSelectionLabels {
     pub insert_selection_into_command: String,
     pub replace_command_with_selection: String,
     pub find: String,
+    pub manage_triggers: String,
     pub select_command: String,
     pub previous_command: String,
     pub next_command: String,
@@ -284,6 +375,7 @@ impl Default for TerminalCommandSelectionLabels {
             insert_selection_into_command: "Insert selection here".to_string(),
             replace_command_with_selection: "Replace command with selection".to_string(),
             find: "Find...".to_string(),
+            manage_triggers: "Manage triggers...".to_string(),
             select_command: "Select command".to_string(),
             previous_command: "Previous command".to_string(),
             next_command: "Next command".to_string(),
@@ -385,6 +477,12 @@ impl Default for TerminalSerialControlLabels {
             reconnect_failed: "Serial reconnect failed".to_string(),
         }
     }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TerminalSessionLogLabels {
+    pub start_failed: String,
+    pub write_failed: String,
 }
 
 #[derive(Clone, Debug)]
@@ -532,6 +630,12 @@ pub struct TerminalHighlightRule {
     pub preserve_background: bool,
     pub enabled: bool,
     pub priority: i64,
+}
+
+#[derive(Clone)]
+pub struct TerminalHighlightRuleSetOverride {
+    pub id: String,
+    pub rules: Arc<[TerminalHighlightRule]>,
 }
 
 #[derive(Clone, Debug)]
@@ -823,6 +927,7 @@ mod tests {
             terminal_encoding: Some(TerminalEncoding::Gb18030),
             backspace_sequence: Some(TerminalBackspaceSequence::ControlH),
             delete_sequence: Some(TerminalDeleteSequence::Delete),
+            ..TerminalUiPreferenceOverrides::default()
         }
         .apply_to(&mut preferences);
 

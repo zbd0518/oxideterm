@@ -35,7 +35,8 @@ pub use path_utils::{
 };
 pub use progress::{
     DummyProgressStore, LazyProgressStore, ProgressStore, RedbProgressStore,
-    StoredTransferProgress, TransferProtocol, TransferStatus, TransferStrategy, TransferType,
+    RemoteRelayProgressContext, StoredRemoteRelayProgress, StoredTransferProgress,
+    TransferProtocol, TransferStatus, TransferStrategy, TransferType,
 };
 pub use retry::{
     RetryConfig, calculate_backoff, error_is_auth_failure, error_is_connection_unavailable,
@@ -48,8 +49,9 @@ pub use scp::{
 };
 pub use session::{SftpChannelOpener, SftpSession, WriteContentResult};
 pub use tar_transfer::{
-    SftpExecChannelOpener, TarCapabilities, TarCompression, probe_tar_capabilities,
-    probe_tar_compression, probe_tar_support, tar_download_directory, tar_upload_directory,
+    SftpExecChannelOpener, TarCapabilities, TarCompression, TarDirectoryProfile,
+    TarTransferOptions, TarTransferResult, probe_tar_capabilities, probe_tar_compression,
+    probe_tar_support, profile_local_directory, tar_download_directory, tar_upload_directory,
 };
 pub use text_diff::{
     TextDiffLine, TextDiffLineKind, TextDiffStats, compute_text_diff, text_diff_stats,
@@ -63,5 +65,6 @@ pub use transfer_manager::{
 };
 pub use types::{
     AssetFileKind, FileInfo, FileType, ListFilter, LocalDownloadDisposition, PreviewContent,
-    SortOrder, TransferDirection, TransferProgress, TransferState, encode_to_encoding,
+    RemoteRelayDisposition, SortOrder, TransferDirection, TransferProgress, TransferState,
+    encode_to_encoding,
 };

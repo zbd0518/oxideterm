@@ -37,8 +37,8 @@
       "import_connections": "Importar conexões",
       "import_connections_hint": "Importe a configuração SSH e dados de aplicativos compatíveis",
       "open_session_manager": "Gerenciador de sessões",
-      "open_session_manager_hint": "Navegue, edite, importe e exporte conexões salvas",
-      "cloud_sync_hint": "Faça backup dos dados criptografados no seu próprio serviço"
+      "open_session_manager_hint": "Navegue, edite e importe conexões salvas",
+      "cloud_sync_hint": "Faça backup dos dados criptografados localmente ou no seu próprio serviço"
     },
     "connection_monitor": {
       "title": "Monitor de conexão"
@@ -55,6 +55,7 @@
     "cmd_new_terminal": "Novo terminal local",
     "cmd_new_connection": "Nova conexão SSH",
     "cmd_settings": "Abrir configurações",
+    "cmd_manage_terminal_triggers": "Gerenciar gatilhos do terminal",
     "cmd_toggle_sidebar": "Alternar barra lateral",
     "cmd_toggle_panel": "Alternar painel",
     "cmd_toggle_ai_sidebar": "Alternar OxideSens",
@@ -236,7 +237,9 @@
         "enable_sensitive_sync": "Ativar sincronização sensível",
         "github_oauth_login": "Login no GitHub",
         "microsoft_oauth_login": "Entrar com Microsoft",
-        "google_oauth_login": "Login do Google"
+        "google_oauth_login": "Login do Google",
+        "import_local": "Importar de arquivo local",
+        "export_local": "Exportar para arquivo local"
       },
       "fields": {
         "backend": "Backend",
@@ -275,6 +278,8 @@
         "sync_coverage": "Cobertura da sincronização",
         "sync_preflight": "Pré-verificação de sincronização",
         "sync_health": "Integridade da sincronização",
+        "local_backup": "Backup e restauração locais",
+        "local_backup_description": "Faça backup ou restaure um arquivo .oxide criptografado sem configurar a sincronização em nuvem.",
         "notes": "Observações",
         "version_info": "Informações de versão"
       },
@@ -614,6 +619,8 @@
       },
       "confirm": {
         "import_title": "Importar snapshot remoto?",
+        "force_upload_title": "Forçar a substituição do snapshot remoto?",
+        "force_upload_description": "Isso substitui o snapshot remoto pelos dados locais selecionados, mesmo que ele tenha sido alterado em outro dispositivo. Essas alterações remotas podem ser perdidas.",
         "clear_secret_title": "Limpar credenciais armazenadas?",
         "clear_secret_description": "Isso remove o valor armazenado para {{label}} do armazenamento seguro. Esta ação não pode ser desfeita.",
         "restore_backup_title": "Restaurar o backup local anterior?",
@@ -727,11 +734,19 @@
         "key_path": "Caminho da chave",
         "cert_path": "Caminho do certificado",
         "managed_key": "Chave gerenciada",
+        "gssapi_authentication": "Preferir Kerberos",
+        "gssapi_server_identity": "Nome do servidor Kerberos",
+        "gssapi_delegate_credentials": "Delegação de credenciais Kerberos",
         "proxy_chain": "Cadeia de proxy",
         "agent_forwarding": "Encaminhamento do agente",
         "post_connect_command": "Comando pós-conexão",
         "color": "Cor",
         "tags": "Tags",
+        "ssh_kex_algorithms": "Algoritmos de troca de chaves SSH",
+        "ssh_host_key_algorithms": "Algoritmos de chave do host SSH",
+        "ssh_cipher_algorithms": "Algoritmos de cifra SSH",
+        "ssh_mac_algorithms": "Algoritmos de integridade SSH",
+        "ssh_compression_algorithms": "Algoritmos de compressão SSH",
         "forward_type": "Tipo de encaminhamento",
         "bind_address": "Endereço de escuta",
         "bind_port": "Porta de escuta",

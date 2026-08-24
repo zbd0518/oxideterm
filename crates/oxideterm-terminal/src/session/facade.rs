@@ -8,6 +8,25 @@ pub struct TelnetSessionConfig {
     pub port: u16,
 }
 
+/// One-shot URI credentials consumed by the Telnet worker and never persisted.
+pub struct TelnetLoginCredentials {
+    pub username: zeroize::Zeroizing<String>,
+    pub password: Option<zeroize::Zeroizing<String>>,
+}
+
+impl std::fmt::Debug for TelnetLoginCredentials {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TelnetLoginCredentials")
+            .field("username", &"[redacted userinfo]")
+            .field(
+                "password",
+                &self.password.as_ref().map(|_| "[redacted secret]"),
+            )
+            .finish()
+    }
+}
+
 pub struct MoshTerminalConfig {
     pub title: String,
     pub bootstrap: oxideterm_mosh::MoshBootstrapConfig,
@@ -152,9 +171,30 @@ impl TerminalSession {
         encoding: TerminalEncoding,
         scrollback_lines: usize,
     ) -> Self {
+        Self::telnet_with_login_and_encoding(
+            config,
+            None,
+            cols,
+            rows,
+            graphics_options,
+            encoding,
+            scrollback_lines,
+        )
+    }
+
+    pub fn telnet_with_login_and_encoding(
+        config: TelnetSessionConfig,
+        login: Option<TelnetLoginCredentials>,
+        cols: usize,
+        rows: usize,
+        graphics_options: GraphicsOptions,
+        encoding: TerminalEncoding,
+        scrollback_lines: usize,
+    ) -> Self {
         Self {
-            backend: Box::new(TelnetSession::new(
+            backend: Box::new(TelnetSession::new_with_login(
                 config,
+                login,
                 cols,
                 rows,
                 graphics_options,
@@ -260,6 +300,13 @@ impl TerminalSession {
 
     pub fn set_output_events_enabled(&mut self, enabled: bool) {
         self.backend.set_output_events_enabled(enabled);
+    }
+
+    pub fn set_trigger_rules(
+        &mut self,
+        rules: Option<Arc<oxideterm_terminal_triggers::CompiledTriggerSet>>,
+    ) {
+        self.backend.set_trigger_rules(rules);
     }
 
     pub fn serial_runtime_options(&self) -> Option<SerialRuntimeOptions> {
@@ -394,6 +441,15 @@ impl TerminalSession {
 
     pub fn scroll_lines(&mut self, delta: i32) {
         self.backend.scroll_lines(delta);
+    }
+
+    pub fn scroll_lines_snapshot_incremental(
+        &mut self,
+        delta: i32,
+        previous: &TerminalSnapshot,
+    ) -> TerminalSnapshot {
+        self.backend
+            .scroll_lines_snapshot_incremental(delta, previous)
     }
 
     pub fn page_up(&mut self) {

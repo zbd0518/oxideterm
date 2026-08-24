@@ -100,6 +100,7 @@ fn apply_oxide_import_with_options_inner(
         serial_profiles_json,
         telnet_profiles_json,
         mosh_profiles_json,
+        standalone_sftp_profiles_json,
         remote_desktop_profiles_json,
         plugin_settings,
         portable_secrets,
@@ -178,6 +179,31 @@ fn apply_oxide_import_with_options_inner(
             })?;
         }
     }
+    let standalone_sftp_profiles_snapshot = standalone_sftp_profiles_json
+        .as_deref()
+        .map(|snapshot_json| {
+            serde_json::from_str::<StandaloneSftpProfilesSyncSnapshot>(snapshot_json).map_err(
+                |error| {
+                    OxideFileError::InvalidFormat(format!(
+                        "Invalid standalone SFTP profiles snapshot in .oxide payload: {error}"
+                    ))
+                },
+            )
+        })
+        .transpose()?;
+    if options.import_standalone_sftp_profiles {
+        for profile in standalone_sftp_profiles_snapshot
+            .as_ref()
+            .into_iter()
+            .flat_map(|snapshot| &snapshot.records)
+        {
+            profile.validate().map_err(|error| {
+                OxideFileError::InvalidFormat(format!(
+                    "Failed to validate standalone SFTP profiles from .oxide payload: {error}"
+                ))
+            })?;
+        }
+    }
     let mut remote_desktop_profiles_snapshot = remote_desktop_profiles_json
         .as_deref()
         .map(|snapshot_json| {
@@ -226,6 +252,7 @@ fn apply_oxide_import_with_options_inner(
         serial_profiles_json,
         telnet_profiles_json,
         mosh_profiles_json,
+        standalone_sftp_profiles_json,
         remote_desktop_profiles_json,
         plugin_settings,
         portable_secrets: if options.import_portable_secrets {
@@ -452,6 +479,22 @@ fn apply_oxide_import_with_options_inner(
                 result.skipped_mosh_profiles = profile_count;
             }
         }
+        if let Some(standalone_sftp_profiles_snapshot) = standalone_sftp_profiles_snapshot {
+            let profile_count = standalone_sftp_profiles_snapshot.records.len();
+            if options.import_standalone_sftp_profiles {
+                result.imported_standalone_sftp_profiles = store
+                    .apply_standalone_sftp_profiles_snapshot(standalone_sftp_profiles_snapshot)
+                    .map_err(|error| {
+                        OxideFileError::InvalidFormat(format!(
+                            "Failed to import standalone SFTP profiles from .oxide payload: {error}"
+                        ))
+                    })?;
+                result.skipped_standalone_sftp_profiles = profile_count
+                    .saturating_sub(result.imported_standalone_sftp_profiles);
+            } else {
+                result.skipped_standalone_sftp_profiles = profile_count;
+            }
+        }
         if let Some(remote_desktop_profiles_snapshot) = remote_desktop_profiles_snapshot {
             let profile_count = remote_desktop_profiles_snapshot.records.len();
             if options.import_remote_desktop_profiles {
@@ -598,6 +641,9 @@ fn count_sensitive_credentials_for_auth(
         }
         EncryptedAuth::KeyboardInteractive => {}
         EncryptedAuth::Agent => {}
+        EncryptedAuth::KerberosPreferred { fallback, .. } => {
+            count_sensitive_credentials_for_auth(fallback, options, counts);
+        }
     }
 }
 
@@ -664,6 +710,7 @@ fn encrypted_connection_to_saved(
             version: CONFIG_VERSION,
             name: name_override.unwrap_or(conn.name),
             group: conn.group,
+            notes: conn.notes,
             host: conn.host,
             port: conn.port,
             username: conn.username,
@@ -688,6 +735,7 @@ fn encrypted_connection_to_saved(
                 })
                 .collect::<Result<_, _>>()?,
             upstream_proxy: import_upstream_proxy_policy(conn.upstream_proxy),
+            proxy_command: None,
             options,
             created_at: now,
             last_used_at: None,
@@ -771,6 +819,7 @@ fn import_proxy_hop(
         identity_agent: None,
         agent_forwarding_socket: None,
         legacy_ssh_compatibility: false,
+        ssh_algorithms: SshAlgorithmPreferences::default(),
     })
 }
 
@@ -873,6 +922,21 @@ fn import_auth(
         },
         EncryptedAuth::KeyboardInteractive => SavedAuth::KeyboardInteractive,
         EncryptedAuth::Agent => SavedAuth::Agent,
+        EncryptedAuth::KerberosPreferred {
+            server_identity,
+            delegate_credentials,
+            fallback,
+        } => SavedAuth::with_kerberos_preferred(
+            import_auth(
+                store,
+                *fallback,
+                restored_managed_keys,
+                imported_managed_keys,
+                import_options,
+            )?,
+            server_identity,
+            delegate_credentials,
+        ),
     })
 }
 
@@ -1034,6 +1098,7 @@ fn merge_saved_connection(
     imported: SavedConnection,
 ) -> SavedConnection {
     existing.group = imported.group.or(existing.group);
+    existing.notes = imported.notes.or(existing.notes);
     existing.host = imported.host;
     existing.port = imported.port;
     existing.username = imported.username;
