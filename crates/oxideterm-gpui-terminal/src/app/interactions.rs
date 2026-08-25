@@ -14,6 +14,7 @@ use oxideterm_terminal::{
 use oxideterm_terminal_unicode::visual_line_for_row;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+use zeroize::Zeroizing;
 
 use super::{
     FreeTypeDragAction, FreeTypeDragState, PendingTerminalEditorClipboard, ScrollbarDrag,
@@ -125,6 +126,10 @@ impl TerminalPane {
             return true;
         }
 
+        if self.handle_terminal_autosuggest_key(key, modifiers, cx) {
+            return true;
+        }
+
         if modifiers.platform && modifiers.shift && key.eq_ignore_ascii_case("k") {
             let result = if modifiers.alt {
                 self.terminal.lock().kill_active_task()
@@ -224,6 +229,77 @@ impl TerminalPane {
         }
 
         false
+    }
+
+    fn handle_terminal_autosuggest_key(
+        &mut self,
+        key: &str,
+        modifiers: Modifiers,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if modifiers.platform || modifiers.control || modifiers.alt {
+            return false;
+        }
+        let candidates = self.terminal_autosuggest_candidates();
+        if candidates.is_empty() {
+            self.autosuggest_selected_index = None;
+            return false;
+        }
+
+        match key {
+            "escape" => {
+                self.dismiss_terminal_autosuggest(cx);
+                true
+            }
+            "down" if !modifiers.shift => {
+                self.autosuggest_selected_index = Some(
+                    self.autosuggest_selected_index
+                        .map(|index| (index + 1) % candidates.len())
+                        .unwrap_or(0),
+                );
+                cx.notify();
+                true
+            }
+            "up" if !modifiers.shift => {
+                self.autosuggest_selected_index = Some(
+                    self.autosuggest_selected_index
+                        .map(|index| index.checked_sub(1).unwrap_or(candidates.len() - 1))
+                        .unwrap_or(candidates.len() - 1),
+                );
+                cx.notify();
+                true
+            }
+            "delete" if modifiers.shift => {
+                let Some(index) = self.autosuggest_selected_index else {
+                    return false;
+                };
+                let Some(candidate) = candidates.get(index) else {
+                    self.autosuggest_selected_index = None;
+                    return false;
+                };
+                let removed_from_shared_history = self.command_history.remove(&candidate.command);
+                self.command_fact_ledger
+                    .remove_autosuggest_command(&candidate.command);
+                if removed_from_shared_history {
+                    self.autosuggest_selected_index = None;
+                    cx.notify();
+                }
+                true
+            }
+            "enter" if !modifiers.shift => {
+                let Some(index) = self.autosuggest_selected_index else {
+                    // WindTerm leaves the list unselected so Enter keeps the shell's normal meaning.
+                    return false;
+                };
+                let Some(candidate) = candidates.get(index) else {
+                    self.autosuggest_selected_index = None;
+                    return false;
+                };
+                let command = Zeroizing::new(candidate.command.clone());
+                self.fill_terminal_autosuggest_command(&command, true, cx)
+            }
+            _ => false,
+        }
     }
 
     pub fn handle_unfocused_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
@@ -424,12 +500,12 @@ impl TerminalPane {
         scroll_multiplier: f32,
     ) -> Option<TerminalWheelScrollDelta> {
         match event.touch_phase {
-            TouchPhase::Started => Some(TerminalWheelScrollDelta {
+            TouchPhase::Started if !event.delta.precise() => Some(TerminalWheelScrollDelta {
                 rows: 0,
                 repaint: self.clear_smooth_scroll_remainder(),
                 animate_rows: false,
             }),
-            TouchPhase::Moved => {
+            TouchPhase::Started | TouchPhase::Moved => {
                 let precise = event.delta.precise();
                 if precise && self.smooth_scroll_animation.is_some() {
                     let _ = self.advance_smooth_scroll_animation(Instant::now());
@@ -440,6 +516,8 @@ impl TerminalPane {
                 }
                 let line_height = self.metrics.line_height;
                 let previous_visual_offset = self.smooth_scroll_offset_px;
+                // Precise begin events may carry the first touchpad delta. Preserve the existing
+                // fractional position so a new gesture continues without a one-frame snap.
                 self.scroll_input_remainder_px +=
                     event.delta.pixel_delta(line_height).y * scroll_multiplier;
                 let rows = (self.scroll_input_remainder_px / line_height) as i32;
@@ -2769,6 +2847,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use gpui::{AppContext, IntoElement, Render, ScrollDelta, TestAppContext, Window, div, point};
     #[cfg(unix)]
     use oxideterm_terminal::{
         GraphicsOptions, LocalPtyConfig, ShellInfo, TerminalEncoding, TerminalEvent,
@@ -2779,6 +2858,56 @@ mod tests {
         TerminalEditorApplication, TerminalEditorCapabilities, TerminalEditorClipboardOperation,
         TerminalEditorIntegrationEvent, TerminalEditorMode, TerminalEditorSelection,
     };
+
+    struct TerminalScrollTestRoot;
+
+    impl Render for TerminalScrollTestRoot {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    #[gpui::test]
+    fn touchpad_scroll_start_preserves_fractional_visual_position(cx: &mut TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_window, _cx| TerminalScrollTestRoot);
+        let pane = cx.update(|window, cx| {
+            cx.new(|cx| {
+                TerminalPane::new_recording_playback(
+                    DEFAULT_COLS,
+                    DEFAULT_ROWS,
+                    TerminalUiPreferences::default(),
+                    window,
+                    cx,
+                )
+                .expect("test terminal pane")
+            })
+        });
+
+        pane.update(cx, |pane, _cx| {
+            let previous_offset = px(pane.metrics.line_height_f32() * 0.25);
+            let event_offset = px(pane.metrics.line_height_f32() * 0.125);
+            pane.scroll_input_remainder_px = previous_offset;
+            pane.smooth_scroll_offset_px = previous_offset;
+
+            let scroll_delta = pane
+                .determine_scroll_delta(
+                    &ScrollWheelEvent {
+                        delta: ScrollDelta::Pixels(point(px(0.0), event_offset)),
+                        touch_phase: TouchPhase::Started,
+                        ..Default::default()
+                    },
+                    1.0,
+                )
+                .expect("touchpad start should consume its first pixel delta");
+
+            assert_eq!(scroll_delta.rows, 0);
+            assert_eq!(
+                pane.scroll_input_remainder_px,
+                previous_offset + event_offset
+            );
+            assert_eq!(pane.smooth_scroll_offset_px, previous_offset + event_offset);
+        });
+    }
 
     fn test_cell(ch: char) -> TerminalCell {
         TerminalCell {

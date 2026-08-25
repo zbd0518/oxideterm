@@ -12,12 +12,15 @@ use std::{
 use oxideterm_atomic_file::{durable_remove, durable_write_with_before_replace};
 
 use crate::model::{
-    QUICK_COMMANDS_SCHEMA_VERSION, QuickCommand, QuickCommandCategory, QuickCommandIcon,
-    QuickCommandImportResult, QuickCommandImportStrategy, QuickCommandsSnapshot,
+    QUICK_COMMANDS_SCHEMA_VERSION, QuickCommand, QuickCommandAvailability, QuickCommandCategory,
+    QuickCommandConfirmationPolicy, QuickCommandIcon, QuickCommandImportResult,
+    QuickCommandImportStrategy, QuickCommandParameter, QuickCommandParameterKind,
+    QuickCommandsSnapshot,
 };
+use crate::{decode_snapshot_json, encode_snapshot_json, validate_quick_command_template};
 
 const QUICK_COMMANDS_FILENAME: &str = "quick-commands.json";
-const MAX_QUICK_COMMANDS_FILE_BYTES: u64 = 512 * 1024;
+pub const MAX_QUICK_COMMANDS_FILE_BYTES: u64 = 512 * 1024;
 pub const MAX_CATEGORIES: usize = 100;
 const MAX_COMMANDS: usize = 1000;
 const MAX_ID_LEN: usize = 128;
@@ -25,6 +28,12 @@ const MAX_NAME_LEN: usize = 160;
 const MAX_COMMAND_LEN: usize = 4096;
 const MAX_DESCRIPTION_LEN: usize = 1024;
 const MAX_HOST_PATTERN_LEN: usize = 256;
+const MAX_PARAMETERS_PER_COMMAND: usize = 32;
+const MAX_PARAMETER_NAME_LEN: usize = 64;
+const MAX_PARAMETER_LABEL_LEN: usize = 160;
+const MAX_PARAMETER_VALUE_LEN: usize = 1024;
+const MAX_PARAMETER_CHOICES: usize = 64;
+const MAX_HOST_PATTERNS: usize = 32;
 const BUILTIN_CATEGORY_IDS: &[&str] = &["system", "network", "files", "docker", "custom"];
 static QUICK_COMMAND_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -54,7 +63,7 @@ pub fn quick_commands_path(settings_path: &Path) -> PathBuf {
 pub fn export_snapshot_json(settings_path: &Path) -> Result<String, String> {
     let path = quick_commands_path(settings_path);
     let snapshot = load_snapshot_from_path(&path)?.unwrap_or_else(default_snapshot);
-    serde_json::to_string_pretty(&snapshot).map_err(|error| error.to_string())
+    encode_snapshot_json(&snapshot)
 }
 
 pub fn load_snapshot(settings_path: &Path) -> Result<QuickCommandsSnapshot, String> {
@@ -110,9 +119,16 @@ pub fn apply_snapshot_json(
     snapshot_json: &str,
     strategy: QuickCommandImportStrategy,
 ) -> QuickCommandImportResult {
-    let incoming = serde_json::from_str::<QuickCommandsSnapshot>(snapshot_json)
-        .map_err(|error| error.to_string())
-        .and_then(sanitize_snapshot);
+    if snapshot_json.len() as u64 > MAX_QUICK_COMMANDS_FILE_BYTES {
+        return QuickCommandImportResult {
+            imported: 0,
+            skipped: 0,
+            errors: vec!["Quick Commands snapshot exceeds size limit".to_string()],
+        };
+    }
+    let incoming = decode_snapshot_json(snapshot_json)
+        .and_then(sanitize_snapshot)
+        .and_then(validate_imported_templates);
     let Ok(incoming) = incoming else {
         return QuickCommandImportResult {
             imported: 0,
@@ -144,6 +160,20 @@ pub fn apply_snapshot_json(
     }
 }
 
+fn validate_imported_templates(
+    snapshot: QuickCommandsSnapshot,
+) -> Result<QuickCommandsSnapshot, String> {
+    for command in &snapshot.commands {
+        if validate_quick_command_template(&command.command, &command.parameters).is_err() {
+            return Err(format!(
+                "Quick Command {} contains an invalid template",
+                command.id
+            ));
+        }
+    }
+    Ok(snapshot)
+}
+
 fn default_snapshot() -> QuickCommandsSnapshot {
     QuickCommandsSnapshot {
         version: QUICK_COMMANDS_SCHEMA_VERSION,
@@ -167,7 +197,7 @@ fn load_snapshot_from_path(path: &Path) -> Result<Option<QuickCommandsSnapshot>,
     if contents.trim().is_empty() {
         return Ok(None);
     }
-    serde_json::from_str::<QuickCommandsSnapshot>(&contents)
+    decode_snapshot_json(&contents)
         .map_err(|error| format!("failed to parse Quick Commands file: {error}"))
         .and_then(sanitize_snapshot)
         .map(Some)
@@ -179,8 +209,9 @@ fn save_snapshot_to_path(path: &Path, snapshot: &QuickCommandsSnapshot) -> Resul
         fs::create_dir_all(parent)
             .map_err(|error| format!("failed to create Quick Commands directory: {error}"))?;
     }
-    let json = serde_json::to_vec_pretty(&snapshot)
-        .map_err(|error| format!("failed to serialize Quick Commands: {error}"))?;
+    let json = encode_snapshot_json(&snapshot)
+        .map_err(|error| format!("failed to serialize Quick Commands: {error}"))?
+        .into_bytes();
     if json.len() as u64 > MAX_QUICK_COMMANDS_FILE_BYTES {
         return Err("Quick Commands snapshot exceeds size limit".to_string());
     }
@@ -297,6 +328,7 @@ fn merge_snapshot(
                         &format!("{} (Imported)", incoming_category.name),
                     ),
                     icon: incoming_category.icon,
+                    sort_order: next_category_sort_order(&categories),
                 };
                 category_remap.insert(incoming_category.id, renamed.id.clone());
                 categories.push(renamed);
@@ -311,6 +343,7 @@ fn merge_snapshot(
                     if category.id == conflict.id {
                         category.name = incoming_category.name.clone();
                         category.icon = incoming_category.icon;
+                        category.sort_order = incoming_category.sort_order;
                     }
                 }
                 imported += 1;
@@ -410,7 +443,10 @@ fn same_command_content(a: &QuickCommand, b: &QuickCommand) -> bool {
         && a.command.trim() == b.command.trim()
         && a.category == b.category
         && a.description.as_deref().map(str::trim) == b.description.as_deref().map(str::trim)
-        && a.host_pattern.as_deref().map(str::trim) == b.host_pattern.as_deref().map(str::trim)
+        && a.parameters == b.parameters
+        && a.availability == b.availability
+        && a.confirmation == b.confirmation
+        && a.sort_order == b.sort_order
 }
 
 fn sanitize_snapshot(snapshot: QuickCommandsSnapshot) -> Result<QuickCommandsSnapshot, String> {
@@ -430,20 +466,22 @@ fn sanitize_snapshot(snapshot: QuickCommandsSnapshot) -> Result<QuickCommandsSna
             "Quick Commands command count exceeds limit {MAX_COMMANDS}"
         ));
     }
-    let categories = snapshot
+    let mut categories = snapshot
         .categories
         .into_iter()
         .map(sanitize_category)
         .collect::<Result<Vec<_>, _>>()?;
+    categories.sort_by_key(|category| category.sort_order);
     let category_ids = categories
         .iter()
         .map(|category| category.id.clone())
         .collect::<HashSet<_>>();
-    let commands = snapshot
+    let mut commands = snapshot
         .commands
         .into_iter()
         .map(|command| sanitize_command(command, &category_ids))
         .collect::<Result<Vec<_>, _>>()?;
+    commands.sort_by_key(|command| command.sort_order);
     Ok(QuickCommandsSnapshot {
         version: QUICK_COMMANDS_SCHEMA_VERSION,
         categories,
@@ -457,6 +495,7 @@ fn sanitize_category(category: QuickCommandCategory) -> Result<QuickCommandCateg
         id: bounded_required(category.id, "category.id", MAX_ID_LEN)?,
         name: bounded_required(category.name, "category.name", MAX_NAME_LEN)?,
         icon: category.icon,
+        sort_order: category.sort_order,
     })
 }
 
@@ -465,6 +504,40 @@ fn sanitize_command(
     category_ids: &HashSet<String>,
 ) -> Result<QuickCommand, String> {
     let category = bounded_required(command.category, "command.category", MAX_ID_LEN)?;
+    if command.parameters.len() > MAX_PARAMETERS_PER_COMMAND {
+        return Err(format!(
+            "Quick Commands parameter count exceeds limit {MAX_PARAMETERS_PER_COMMAND}"
+        ));
+    }
+    if command.availability.host_patterns.len() > MAX_HOST_PATTERNS {
+        return Err(format!(
+            "Quick Commands host pattern count exceeds limit {MAX_HOST_PATTERNS}"
+        ));
+    }
+    let mut parameter_names = HashSet::new();
+    let parameters = command
+        .parameters
+        .into_iter()
+        .map(|parameter| sanitize_parameter(parameter, &mut parameter_names))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut protocols = Vec::new();
+    for protocol in command.availability.protocols {
+        if !protocols.contains(&protocol) {
+            protocols.push(protocol);
+        }
+    }
+    let mut seen_host_patterns = HashSet::new();
+    let mut host_patterns = Vec::new();
+    for host_pattern in command.availability.host_patterns {
+        let host_pattern = bounded_required(
+            host_pattern,
+            "command.availability.hostPatterns",
+            MAX_HOST_PATTERN_LEN,
+        )?;
+        if seen_host_patterns.insert(host_pattern.clone()) {
+            host_patterns.push(host_pattern);
+        }
+    }
     Ok(QuickCommand {
         id: bounded_required(command.id, "command.id", MAX_ID_LEN)?,
         name: bounded_required(command.name, "command.name", MAX_NAME_LEN)?,
@@ -479,14 +552,97 @@ fn sanitize_command(
             "command.description",
             MAX_DESCRIPTION_LEN,
         )?,
-        host_pattern: bounded_optional(
-            command.host_pattern,
-            "command.hostPattern",
-            MAX_HOST_PATTERN_LEN,
-        )?,
+        parameters,
+        availability: QuickCommandAvailability {
+            protocols,
+            host_patterns,
+        },
+        confirmation: command.confirmation,
+        sort_order: command.sort_order,
         created_at: command.created_at,
         updated_at: command.updated_at,
     })
+}
+
+fn sanitize_parameter(
+    parameter: QuickCommandParameter,
+    parameter_names: &mut HashSet<String>,
+) -> Result<QuickCommandParameter, String> {
+    let name = bounded_required(
+        parameter.name,
+        "command.parameters.name",
+        MAX_PARAMETER_NAME_LEN,
+    )?;
+    if !valid_parameter_name(&name) {
+        return Err(format!("Invalid Quick Commands parameter name {name}"));
+    }
+    if !parameter_names.insert(name.clone()) {
+        return Err(format!("Duplicate Quick Commands parameter name {name}"));
+    }
+    if parameter.choices.len() > MAX_PARAMETER_CHOICES {
+        return Err(format!(
+            "Quick Commands parameter choice count exceeds limit {MAX_PARAMETER_CHOICES}"
+        ));
+    }
+    let mut seen_choices = HashSet::new();
+    let mut choices = Vec::new();
+    for choice in parameter.choices {
+        let choice = bounded_required(
+            choice,
+            "command.parameters.choices",
+            MAX_PARAMETER_VALUE_LEN,
+        )?;
+        if seen_choices.insert(choice.clone()) {
+            choices.push(choice);
+        }
+    }
+    if parameter.kind == QuickCommandParameterKind::Choice && choices.is_empty() {
+        return Err(format!(
+            "Quick Commands choice parameter {name} must define at least one choice"
+        ));
+    }
+    let default_value = bounded_optional(
+        parameter.default_value,
+        "command.parameters.defaultValue",
+        MAX_PARAMETER_VALUE_LEN,
+    )?;
+    if parameter.kind == QuickCommandParameterKind::Choice
+        && default_value
+            .as_ref()
+            .is_some_and(|value| !choices.contains(value))
+    {
+        return Err(format!(
+            "Quick Commands choice parameter {name} has an invalid default value"
+        ));
+    }
+    if parameter.kind == QuickCommandParameterKind::Secret
+        && (default_value.is_some() || !choices.is_empty())
+    {
+        return Err(format!(
+            "Quick Commands secret parameter {name} cannot persist defaults or choices"
+        ));
+    }
+    Ok(QuickCommandParameter {
+        name,
+        label: bounded_required(
+            parameter.label,
+            "command.parameters.label",
+            MAX_PARAMETER_LABEL_LEN,
+        )?,
+        kind: parameter.kind,
+        default_value,
+        choices,
+        required: parameter.required,
+    })
+}
+
+fn valid_parameter_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
 fn bounded_required(value: String, field: &str, max_len: usize) -> Result<String, String> {
@@ -518,17 +674,21 @@ fn bounded_optional(
 }
 
 pub fn default_quick_command_categories() -> Vec<QuickCommandCategory> {
-    vec![
-        quick_category("system", "System", QuickCommandIcon::Server),
-        quick_category("network", "Network", QuickCommandIcon::Terminal),
-        quick_category("files", "Files", QuickCommandIcon::Folder),
-        quick_category("docker", "Docker", QuickCommandIcon::Docker),
-        quick_category("custom", "Custom", QuickCommandIcon::Zap),
+    [
+        ("system", "System", QuickCommandIcon::Server),
+        ("network", "Network", QuickCommandIcon::Terminal),
+        ("files", "Files", QuickCommandIcon::Folder),
+        ("docker", "Docker", QuickCommandIcon::Docker),
+        ("custom", "Custom", QuickCommandIcon::Zap),
     ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, (id, name, icon))| quick_category(id, name, icon, index as i64))
+    .collect()
 }
 
 pub fn default_quick_commands() -> Vec<QuickCommand> {
-    vec![
+    let mut commands = vec![
         quick_command(
             "qc-pwd",
             "Print Working Directory",
@@ -606,14 +766,24 @@ pub fn default_quick_commands() -> Vec<QuickCommand> {
             "system",
             "Show recent system journal errors.",
         ),
-    ]
+    ];
+    for (index, command) in commands.iter_mut().enumerate() {
+        command.sort_order = index as i64;
+    }
+    commands
 }
 
-fn quick_category(id: &str, name: &str, icon: QuickCommandIcon) -> QuickCommandCategory {
+fn quick_category(
+    id: &str,
+    name: &str,
+    icon: QuickCommandIcon,
+    sort_order: i64,
+) -> QuickCommandCategory {
     QuickCommandCategory {
         id: id.to_string(),
         name: name.to_string(),
         icon,
+        sort_order,
     }
 }
 
@@ -630,7 +800,10 @@ fn quick_command(
         command: command.to_string(),
         category: category.to_string(),
         description: Some(description.to_string()),
-        host_pattern: None,
+        parameters: Vec::new(),
+        availability: QuickCommandAvailability::default(),
+        confirmation: QuickCommandConfirmationPolicy::Inherit,
+        sort_order: 0,
         created_at: 0,
         updated_at: 0,
     }
@@ -665,6 +838,15 @@ fn unique_category_name(categories: &[QuickCommandCategory], desired_name: &str)
         .map(|category| category.name.trim().to_lowercase())
         .collect::<HashSet<_>>();
     unique_name(desired_name, &existing)
+}
+
+fn next_category_sort_order(categories: &[QuickCommandCategory]) -> i64 {
+    categories
+        .iter()
+        .map(|category| category.sort_order)
+        .max()
+        .unwrap_or(-1)
+        .saturating_add(1)
 }
 
 fn unique_command_name(commands: &[QuickCommand], category: &str, desired_name: &str) -> String {
@@ -716,7 +898,7 @@ mod tests {
         let settings_path = temp_settings_path("apply");
         let incoming = QuickCommandsSnapshot {
             version: QUICK_COMMANDS_SCHEMA_VERSION,
-            categories: vec![quick_category("ops", "Ops", QuickCommandIcon::Zap)],
+            categories: vec![quick_category("ops", "Ops", QuickCommandIcon::Zap, 0)],
             commands: vec![quick_command(
                 "ops-uptime",
                 "Ops Uptime",
@@ -733,6 +915,57 @@ mod tests {
 
         assert!(result.imported > 0);
         assert!(exported.contains("Ops Uptime"));
+    }
+
+    #[test]
+    fn invalid_imported_template_is_rejected_without_replacing_current_state() {
+        let settings_path = temp_settings_path("invalid-import-template");
+        save_snapshot(&settings_path, &default_snapshot()).unwrap();
+        let path = quick_commands_path(&settings_path);
+        let previous = fs::read(&path).unwrap();
+        let mut incoming = default_snapshot();
+        incoming.commands[0].command = "echo {{param.missing}}".to_string();
+        let json = serde_json::to_string(&incoming).unwrap();
+
+        let result =
+            apply_snapshot_json(&settings_path, &json, QuickCommandImportStrategy::Replace);
+
+        assert_eq!(result.imported, 0);
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(fs::read(&path).unwrap(), previous);
+    }
+
+    #[test]
+    fn oversized_import_is_rejected_before_parsing() {
+        let settings_path = temp_settings_path("oversized-import");
+        let oversized = " ".repeat(MAX_QUICK_COMMANDS_FILE_BYTES as usize + 1);
+
+        let result = apply_snapshot_json(
+            &settings_path,
+            &oversized,
+            QuickCommandImportStrategy::Rename,
+        );
+
+        assert_eq!(result.imported, 0);
+        assert_eq!(result.errors.len(), 1);
+        assert!(!quick_commands_path(&settings_path).exists());
+    }
+
+    #[test]
+    fn secret_parameter_defaults_are_rejected_before_persistence() {
+        let settings_path = temp_settings_path("secret-default");
+        let mut snapshot = default_snapshot();
+        snapshot.commands[0].parameters = vec![QuickCommandParameter {
+            name: "password".to_string(),
+            label: "Password".to_string(),
+            kind: QuickCommandParameterKind::Secret,
+            default_value: Some("must-not-persist".to_string()),
+            choices: Vec::new(),
+            required: true,
+        }];
+
+        assert!(save_snapshot(&settings_path, &snapshot).is_err());
+        assert!(!quick_commands_path(&settings_path).exists());
     }
 
     #[test]

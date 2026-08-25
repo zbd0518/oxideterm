@@ -15,44 +15,23 @@ impl WorkspaceApp {
 
         let mut entries: HashMap<String, TerminalHistoryEntry> = HashMap::new();
         let tab_host = self.tab_host.read(cx);
-        for pane in tab_host.panes().values() {
-            for record in pane.read(cx).autosuggest_command_records() {
+        if let Some(pane) = context
+            .pane_id
+            .and_then(|pane_id| tab_host.panes().get(&pane_id))
+        {
+            for (sequence, record) in pane
+                .read(cx)
+                .history_command_records()
+                .into_iter()
+                .enumerate()
+            {
                 put_terminal_history_entry(
                     &mut entries,
                     record.command,
                     TerminalHistorySource::Runtime,
                     record.finished_at as i64,
-                    false,
-                    record.started_at as usize,
-                );
-            }
-        }
-        for (sequence, record) in self.ai_runtime_command_records(cx).into_iter().enumerate() {
-            put_terminal_history_entry(
-                &mut entries,
-                record.command,
-                TerminalHistorySource::AiLedger,
-                record.finished_at.unwrap_or(record.started_at),
-                false,
-                sequence,
-            );
-        }
-        if self
-            .settings_store
-            .settings()
-            .terminal
-            .autosuggest
-            .local_shell_history
-            && context.is_local_terminal()
-        {
-            for (index, command) in load_local_shell_history_commands().into_iter().enumerate() {
-                put_terminal_history_entry(
-                    &mut entries,
-                    command,
-                    TerminalHistorySource::LocalHistory,
-                    terminal_command_bar_now_ms().saturating_sub(index as i64),
-                    false,
-                    index,
+                    true,
+                    sequence,
                 );
             }
         }
@@ -76,8 +55,7 @@ impl WorkspaceApp {
                 } else {
                     fuzzy + recency + entry.uses as f64 * 5.0
                 } + entry.sequence as f64 / 1_000_000.0
-                    + 1000.0
-                    - terminal_command_risk_score_penalty(risk);
+                    + 1000.0;
                 Some(TerminalCommandSuggestion {
                     kind: TerminalCommandSuggestionKind::History,
                     label: entry.command.clone(),

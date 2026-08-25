@@ -39,8 +39,9 @@ use zeroize::Zeroizing;
 
 use crate::background_cache::BackgroundImageRenderCache;
 use crate::command_facts::{
-    CommandFactLedger, TerminalAiCommandRecord, TerminalAutosuggestCommandRecord,
-    TerminalAutosuggestInputState, TerminalCommandFact,
+    CommandFactLedger, SharedTerminalCommandHistory, TerminalAiCommandRecord,
+    TerminalAutosuggestCandidate, TerminalAutosuggestCommandRecord, TerminalAutosuggestInputState,
+    TerminalCommandFact,
 };
 use crate::privilege_prompt::{
     PrivilegeInputObservation, PrivilegePromptMatch, PrivilegePromptSnapshot,
@@ -110,6 +111,7 @@ const EDITOR_INTEGRATION_HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(250
 const EDITOR_CLIPBOARD_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const TERMINAL_SEARCH_DEBOUNCE: Duration = Duration::from_millis(24);
 const BACKGROUND_IMAGE_COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(32);
+const TERMINAL_AUTOSUGGEST_MAX_CANDIDATES: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TerminalPaneEvent {
@@ -457,6 +459,11 @@ pub struct TerminalPane {
     selected_command_mark_id: Option<String>,
     command_mark_id_aliases: HashMap<String, String>,
     input_tracker: TerminalInputTracker,
+    command_history: SharedTerminalCommandHistory,
+    // Shell integration opens this boundary at a prompt and command submission closes it.
+    autosuggest_prompt_active: bool,
+    autosuggest_selected_index: Option<usize>,
+    autosuggest_dismissed_query: Option<String>,
     privilege_prompt_tracker: PrivilegePromptTracker,
     privilege_prompt_expiry_generation: u64,
     privilege_prompt_expiry_task: Option<gpui::Task<()>>,
@@ -1083,6 +1090,10 @@ impl TerminalPane {
             selected_command_mark_id: None,
             command_mark_id_aliases: HashMap::new(),
             input_tracker: TerminalInputTracker::default(),
+            command_history: preferences.command_history.clone(),
+            autosuggest_prompt_active: false,
+            autosuggest_selected_index: None,
+            autosuggest_dismissed_query: None,
             privilege_prompt_tracker: PrivilegePromptTracker::default(),
             privilege_prompt_expiry_generation: 0,
             privilege_prompt_expiry_task: None,
@@ -1378,8 +1389,75 @@ impl TerminalPane {
             .autosuggest_ghost_text(&self.input_tracker.state())
     }
 
+    pub fn history_ghost_text_for_input(&self, input: &str) -> Option<String> {
+        self.command_history
+            .ghost_text(&TerminalAutosuggestInputState {
+                value: input.to_string(),
+                cursor_index: input.len(),
+                is_cursor_at_end: true,
+            })
+    }
+
+    pub fn history_command_records(&self) -> Vec<TerminalAutosuggestCommandRecord> {
+        self.command_history.records()
+    }
+
+    fn terminal_autosuggest_candidates(&self) -> Vec<TerminalAutosuggestCandidate> {
+        let mode = self.terminal.lock().mode();
+        let state = self.input_tracker.state();
+        let cursor_row_is_active_input = self
+            .snapshot
+            .lines
+            .get(self.snapshot.cursor_row)
+            .is_some_and(|row| row.active_input);
+        if !self.autosuggest_prompt_active
+            || !self.terminal_accepts_input()
+            || mode.contains(TermMode::ALT_SCREEN)
+            || self.marked_text.is_some()
+            || self.tmux_prompt.is_some()
+            || self.pending_paste.is_some()
+            || self.context_menu.is_some()
+            || self.privilege_prompt_inline_hint.is_some()
+            || !cursor_row_is_active_input
+            || self.snapshot.display_offset != 0
+            || self.autosuggest_dismissed_query.as_deref() == Some(state.value.as_str())
+        {
+            return Vec::new();
+        }
+        self.command_history
+            .candidates(&state, TERMINAL_AUTOSUGGEST_MAX_CANDIDATES)
+    }
+
+    fn dismiss_terminal_autosuggest(&mut self, cx: &mut Context<Self>) {
+        self.autosuggest_dismissed_query = Some(self.input_tracker.state().value);
+        self.autosuggest_selected_index = None;
+        cx.notify();
+    }
+
+    fn fill_terminal_autosuggest_command(
+        &mut self,
+        command: &str,
+        append_enter: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let state = self.input_tracker.state();
+        let Some(suffix) = command.strip_prefix(&state.value) else {
+            return false;
+        };
+        let mut bytes =
+            Zeroizing::new(Vec::with_capacity(suffix.len() + usize::from(append_enter)));
+        bytes.extend_from_slice(suffix.as_bytes());
+        if append_enter {
+            bytes.push(b'\r');
+        }
+        self.autosuggest_selected_index = None;
+        self.autosuggest_dismissed_query = Some(command.to_string());
+        self.send_user_protocol_bytes(&bytes, cx);
+        true
+    }
+
     fn terminal_ghost_text(&self) -> Option<String> {
-        // Keep the terminal grid shell-owned; OxideTerm suggestions belong to the command bar.
+        // Keep ordinary terminal suggestions in the pane-owned list instead of painting ghost text.
         self.privilege_prompt_inline_hint.clone()
     }
 
@@ -1524,6 +1602,7 @@ impl TerminalPane {
         }
         self.settings = next_settings;
         self.theme = preferences.theme.clone();
+        self.command_history = preferences.command_history.clone();
         self.image_cache
             .set_byte_limit(preferences.render_policy.image_cache_bytes);
         self.background_image_cache
@@ -1632,6 +1711,12 @@ impl TerminalPane {
 
     pub fn session_kind(&self) -> TerminalSessionKind {
         self.session_kind
+    }
+
+    pub fn is_tmux_control_mode(&self) -> bool {
+        // Control mode changes the command target semantics while retaining the
+        // transport session kind, so callers need an explicit runtime signal.
+        self.terminal.lock().tmux_state().is_some()
     }
 
     pub fn is_serial_transport(&self) -> bool {
@@ -2128,10 +2213,12 @@ impl TerminalPane {
         let mode = self.terminal.lock().mode();
         self.delete_free_type_selection_if_active(mode, cx);
         let now = Instant::now();
-        // Pasted terminal input can include the sudo command while the later
-        // prompt is a bare `Password:`. Feed it through the privilege tracker
-        // without recording the paste as command history or exposing content.
-        self.observe_privilege_input("paste", &bytes, now, cx);
+        // Privilege input classification runs before command tracking so a password answer never
+        // becomes a command merely because it arrived through the clipboard path.
+        let privilege_observation = self.observe_privilege_input("paste", &bytes, now, cx);
+        let trackable_single_line_paste = std::str::from_utf8(&bytes)
+            .ok()
+            .filter(|text| !text.contains(['\r', '\n']));
         // Preserve bracketed paste encoding when hook output is still text;
         // binary hook output falls back to raw protocol bytes.
         let result = match std::str::from_utf8(&bytes) {
@@ -2140,7 +2227,14 @@ impl TerminalPane {
         };
         if result.is_ok() {
             self.restore_live_output_after_user_input();
-            self.input_tracker.reset();
+            if privilege_observation == PrivilegeInputObservation::SecretEntry {
+                self.input_tracker.reset();
+            } else if let Some(text) = trackable_single_line_paste {
+                self.observe_autosuggest_input_bytes(text.as_bytes(), cx);
+            } else {
+                // Multi-line and binary pastes do not have one reliable shell submission boundary.
+                self.input_tracker.reset();
+            }
             self.last_terminal_input = Instant::now();
             self.reset_cursor_blink();
             cx.notify();
@@ -2973,6 +3067,11 @@ impl TerminalPane {
                 TerminalEventEffect::default()
             }
             TerminalEvent::ShellIntegration(event) => {
+                self.autosuggest_prompt_active = matches!(
+                    event.kind,
+                    oxideterm_terminal::ShellIntegrationEventKind::PromptStart
+                        | oxideterm_terminal::ShellIntegrationEventKind::CommandStart
+                );
                 self.shell_integration_status = ShellIntegrationStatus {
                     detected: true,
                     state: match event.kind {
@@ -3084,6 +3183,9 @@ impl TerminalPane {
             TerminalEvent::CwdChanged { cwd, host } => {
                 self.cwd = Some(cwd);
                 self.cwd_source = Some(TerminalWorkingDirectorySource::ShellIntegration);
+                // Managed OSC 7 hooks emit at the shell prompt, which establishes the minimum
+                // reliable boundary for terminal-side history suggestions.
+                self.autosuggest_prompt_active = true;
                 // A prepared startup profile becomes active only after the
                 // terminal parser receives a valid directory report.
                 self.cwd_shell_integration_status = TerminalCwdShellIntegrationStatus::Active;
@@ -3284,9 +3386,18 @@ impl TerminalPane {
         bytes: &[u8],
         _cx: &mut Context<Self>,
     ) -> Option<String> {
-        let command = self.input_tracker.apply_bytes(bytes)?;
+        let previous_state = self.input_tracker.state();
+        let command = self.input_tracker.apply_bytes(bytes);
+        let next_state = self.input_tracker.state();
+        if next_state != previous_state {
+            self.autosuggest_selected_index = None;
+            self.autosuggest_dismissed_query = None;
+        }
+        let command = command?;
+        self.autosuggest_prompt_active = false;
         self.command_fact_ledger
             .record_runtime_autosuggest_command(&command);
+        self.command_history.record(&command);
         Some(command)
     }
 
@@ -3894,6 +4005,49 @@ mod tests {
             recorder.read_with(cx, |recorder, _cx| recorder.delivered.len()),
             3
         );
+    }
+
+    #[gpui::test]
+    fn history_suggestions_follow_prompt_capability_without_requiring_direct_focus(
+        cx: &mut TestAppContext,
+    ) {
+        let (_, cx) = cx.add_window_view(|_window, _cx| TerminalTestRoot);
+        let pane = cx.update(|window, cx| {
+            let mut preferences = TerminalUiPreferences::default();
+            preferences.command_history =
+                SharedTerminalCommandHistory::from_commands(vec!["docker ps".to_string()]);
+            cx.new(|cx| {
+                TerminalPane::new_recording_playback(
+                    DEFAULT_COLS,
+                    DEFAULT_ROWS,
+                    preferences,
+                    window,
+                    cx,
+                )
+                .expect("test terminal pane")
+            })
+        });
+
+        pane.update(cx, |pane, cx| {
+            pane.test_accepts_input = true;
+            pane.focused = false;
+            pane.snapshot.lines[pane.snapshot.cursor_row].active_input = true;
+            pane.observe_autosuggest_input_bytes(b"dock", cx);
+
+            assert!(pane.terminal_autosuggest_candidates().is_empty());
+            pane.autosuggest_prompt_active = true;
+            assert_eq!(
+                pane.terminal_autosuggest_candidates()
+                    .into_iter()
+                    .map(|candidate| candidate.command)
+                    .collect::<Vec<_>>(),
+                ["docker ps"]
+            );
+
+            pane.observe_autosuggest_input_bytes(b"\r", cx);
+            assert!(!pane.autosuggest_prompt_active);
+            assert!(pane.terminal_autosuggest_candidates().is_empty());
+        });
     }
 
     #[test]

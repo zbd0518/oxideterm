@@ -30,6 +30,10 @@ impl WorkspaceApp {
         let connection_store = ConnectionStore::load(default_connections_path())?;
         let settings = settings_store.settings().clone();
         let i18n = I18n::new(locale_from_settings(settings.general.language));
+        // Shell history is already the user's persistence boundary; OxideTerm keeps only a
+        // process-owned index and never copies the document into credential storage.
+        let local_terminal_command_history =
+            SharedTerminalCommandHistory::from_commands(load_local_shell_history_commands());
         let session_log_directory = settings_store
             .path()
             .parent()
@@ -642,6 +646,8 @@ impl WorkspaceApp {
             terminal_command_context_highlight_section_expanded: true,
             terminal_command_sender,
             _terminal_command_sender_observation: terminal_command_sender_observation,
+            local_terminal_command_history,
+            ssh_terminal_command_histories: HashMap::new(),
             detached_local_terminals: HashMap::new(),
             detached_local_terminal_order: Vec::new(),
             serial_terminal_configs: HashMap::new(),
@@ -928,7 +934,12 @@ impl WorkspaceApp {
                 "failed to load bundled CJK terminal fallback; falling back to system fonts: {error}"
             );
         }
-        self.terminal_preferences_for_background_key(tab_background_key(kind), cx)
+        let mut preferences =
+            self.terminal_preferences_for_background_key(tab_background_key(kind), cx);
+        if *kind == TabKind::LocalTerminal {
+            preferences.command_history = self.local_terminal_command_history.clone();
+        }
+        preferences
     }
 
     pub(crate) fn terminal_preferences_for_pane(
@@ -936,17 +947,34 @@ impl WorkspaceApp {
         pane_id: PaneId,
         cx: &App,
     ) -> TerminalUiPreferences {
-        let key = self
+        let (key, session_id, kind) = self
             .tabs(cx)
             .iter()
             .find_map(|tab| {
-                tab.root_pane
-                    .as_ref()
-                    .is_some_and(|root| root.contains_pane(pane_id))
-                    .then_some(tab_background_key(&tab.kind))
+                let root = tab.root_pane.as_ref()?;
+                root.contains_pane(pane_id).then(|| {
+                    (
+                        tab_background_key(&tab.kind),
+                        root.session_id_for_pane(pane_id),
+                        tab.kind.clone(),
+                    )
+                })
             })
-            .unwrap_or("local_terminal");
-        self.terminal_preferences_for_background_key(key, cx)
+            .unwrap_or(("local_terminal", None, TabKind::LocalTerminal));
+        let mut preferences = self.terminal_preferences_for_background_key(key, cx);
+        preferences.command_history = match kind {
+            TabKind::LocalTerminal => self.local_terminal_command_history.clone(),
+            TabKind::SshTerminal => session_id
+                .and_then(|session_id| {
+                    self.workspace_runtime
+                        .read(cx)
+                        .ssh_terminal_node_id(session_id)
+                })
+                .and_then(|node_id| self.ssh_terminal_command_histories.get(&node_id).cloned())
+                .unwrap_or_default(),
+            _ => SharedTerminalCommandHistory::default(),
+        };
+        preferences
     }
 
     pub(in crate::workspace) fn terminal_preference_overrides_for_saved_connection(
@@ -1150,6 +1178,7 @@ impl WorkspaceApp {
             command_marks_user_input_observed: terminal.command_marks.user_input_observed,
             command_marks_heuristic_detection: terminal.command_marks.heuristic_detection,
             command_marks_show_hover_actions: terminal.command_marks.show_hover_actions,
+            command_history: SharedTerminalCommandHistory::default(),
             terminal_encoding: session_terminal_encoding(terminal.terminal_encoding),
             show_performance_overlay: terminal.show_fps_overlay,
             render_policy: self.render_policy,
@@ -1161,6 +1190,9 @@ impl WorkspaceApp {
                 confirm: self.i18n.t("terminal.paste.confirm"),
                 cancel: self.i18n.t("terminal.paste.cancel"),
                 paste: self.i18n.t("terminal.paste.paste"),
+            },
+            autosuggest_labels: TerminalAutosuggestLabels {
+                history_source: self.i18n.t("terminal.command_bar.source_history"),
             },
             command_selection_labels: TerminalCommandSelectionLabels {
                 actions: self.i18n.t("terminal.command_selection.actions"),

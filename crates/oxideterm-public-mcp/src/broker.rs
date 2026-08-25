@@ -43,6 +43,7 @@ pub enum DomainMessage {
 pub struct DomainRequest {
     pub client_ref: ClientRef,
     pub call: PublicToolCall,
+    approval_mode: ClientApprovalMode,
     response: oneshot::Sender<ToolEnvelope>,
     cancellation: CancellationToken,
 }
@@ -69,6 +70,10 @@ impl DomainRequest {
 
     pub fn cancellation_token(&self) -> CancellationToken {
         self.cancellation.clone()
+    }
+
+    pub fn requires_standard_approval(&self) -> bool {
+        self.approval_mode == ClientApprovalMode::Standard
     }
 
     /// Retargets a protocol-level alias while preserving the original response and cancellation.
@@ -160,6 +165,7 @@ impl DomainBroker {
             .send(DomainMessage::Request(Box::new(DomainRequest {
                 client_ref,
                 call,
+                approval_mode: expected_approval_mode,
                 response,
                 cancellation,
             })))

@@ -1211,6 +1211,65 @@ pub struct QuickCommandsDescribeArgs {
     pub quickcommand_ref: QuickCommandRef,
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicQuickCommandParameterKind {
+    #[default]
+    Text,
+    Choice,
+    Secret,
+}
+
+#[derive(Clone, Deserialize, JsonSchema, Serialize)]
+pub struct PublicQuickCommandParameter {
+    pub name: String,
+    pub label: String,
+    #[serde(default)]
+    pub kind: PublicQuickCommandParameterKind,
+    #[serde(default)]
+    pub default_value: Option<String>,
+    #[serde(default)]
+    pub choices: Vec<String>,
+    #[serde(default)]
+    pub required: bool,
+}
+
+impl fmt::Debug for PublicQuickCommandParameter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublicQuickCommandParameter")
+            .field("name", &self.name)
+            .field("label", &self.label)
+            .field("kind", &self.kind)
+            // Defaults may contain credentials or other sensitive shell input.
+            .field(
+                "default_value",
+                &self.default_value.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("choice_count", &self.choices.len())
+            .field("required", &self.required)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicQuickCommandTargetProtocol {
+    Local,
+    Ssh,
+    Mosh,
+    Telnet,
+    Serial,
+    Tmux,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicQuickCommandConfirmationPolicy {
+    Inherit,
+    Always,
+}
+
 pub struct QuickCommandsSaveArgs {
     pub quickcommand_ref: Option<QuickCommandRef>,
     pub name: String,
@@ -1218,6 +1277,10 @@ pub struct QuickCommandsSaveArgs {
     pub category: String,
     pub description: Option<String>,
     pub host_pattern: Option<String>,
+    pub host_patterns: Option<Vec<String>>,
+    pub parameters: Option<Vec<PublicQuickCommandParameter>>,
+    pub protocols: Option<Vec<PublicQuickCommandTargetProtocol>>,
+    pub confirmation: Option<PublicQuickCommandConfirmationPolicy>,
     pub expected_revision: u64,
 }
 
@@ -1231,6 +1294,11 @@ impl fmt::Debug for QuickCommandsSaveArgs {
             .field("category", &self.category)
             .field("description", &self.description)
             .field("host_pattern", &self.host_pattern)
+            .field("host_patterns", &self.host_patterns)
+            // Parameter defaults may contain sensitive shell input.
+            .field("parameter_count", &self.parameters.as_ref().map(Vec::len))
+            .field("protocols", &self.protocols)
+            .field("confirmation", &self.confirmation)
             .field("expected_revision", &self.expected_revision)
             .finish()
     }
@@ -1242,13 +1310,42 @@ pub struct QuickCommandsRemoveArgs {
     pub expected_revision: u64,
 }
 
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Clone)]
 pub struct QuickCommandsRunArgs {
     pub quickcommand_ref: QuickCommandRef,
     pub node_ref: NodeRef,
     pub expected_revision: u64,
-    #[serde(default)]
-    pub arguments: BTreeMap<String, String>,
+    pub arguments: BTreeMap<String, Zeroizing<String>>,
+}
+
+impl fmt::Debug for QuickCommandsRunArgs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QuickCommandsRunArgs")
+            .field("quickcommand_ref", &self.quickcommand_ref)
+            .field("node_ref", &self.node_ref)
+            .field("expected_revision", &self.expected_revision)
+            // Values may contain credentials or other shell-sensitive material.
+            .field("arguments", &self.arguments.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+pub struct PreparedQuickCommandRunArgs {
+    pub quickcommand_ref: QuickCommandRef,
+    pub node_ref: NodeRef,
+    pub command: Zeroizing<String>,
+}
+
+impl fmt::Debug for PreparedQuickCommandRunArgs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedQuickCommandRunArgs")
+            .field("quickcommand_ref", &self.quickcommand_ref)
+            .field("node_ref", &self.node_ref)
+            .field("command", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
@@ -1618,6 +1715,8 @@ pub enum PublicToolCall {
     QuickCommandsSave(Box<QuickCommandsSaveArgs>),
     QuickCommandsRemove(QuickCommandsRemoveArgs),
     QuickCommandsRun(QuickCommandsRunArgs),
+    /// Internal frozen payload created only after workspace-side expansion.
+    PreparedQuickCommandRun(PreparedQuickCommandRunArgs),
     AddonsList(AddonsListArgs),
     AddonsInstall(AddonsInstallArgs),
     AddonsSetEnabled(AddonsSetEnabledArgs),
@@ -1710,6 +1809,7 @@ impl PublicToolCall {
             Self::QuickCommandsSave(_) => "quickcommands_save",
             Self::QuickCommandsRemove(_) => "quickcommands_remove",
             Self::QuickCommandsRun(_) => "quickcommands_run",
+            Self::PreparedQuickCommandRun(_) => "quickcommands_run",
             Self::AddonsList(_) => "addons_list",
             Self::AddonsInstall(_) => "addons_install",
             Self::AddonsSetEnabled(_) => "addons_set_enabled",
@@ -1793,7 +1893,9 @@ impl PublicToolCall {
             Self::QuickCommandsSave(_) | Self::QuickCommandsRemove(_) => {
                 ToolGroup::QuickCommandManage
             }
-            Self::QuickCommandsRun(_) => ToolGroup::QuickCommandExecute,
+            Self::QuickCommandsRun(_) | Self::PreparedQuickCommandRun(_) => {
+                ToolGroup::QuickCommandExecute
+            }
             Self::AddonsList(_) => ToolGroup::AddonRead,
             Self::AddonsInstall(_) | Self::AddonsSetEnabled(_) | Self::AddonsRemove(_) => {
                 ToolGroup::AddonManage
@@ -1897,6 +1999,10 @@ impl PublicToolCall {
 
     pub fn requires_explicit_app_approval(&self) -> bool {
         matches!(self, Self::RequestAccess(_))
+    }
+
+    pub fn requires_domain_preparation(&self) -> bool {
+        matches!(self, Self::QuickCommandsRun(_))
     }
 
     pub fn target_summary(&self) -> String {
@@ -2032,6 +2138,9 @@ impl PublicToolCall {
                 .map_or_else(|| "new quick command".to_owned(), ToString::to_string),
             Self::QuickCommandsRemove(args) => args.quickcommand_ref.to_string(),
             Self::QuickCommandsRun(args) => {
+                format!("{} on {}", args.quickcommand_ref, args.node_ref)
+            }
+            Self::PreparedQuickCommandRun(args) => {
                 format!("{} on {}", args.quickcommand_ref, args.node_ref)
             }
             Self::AddonsList(_) => "addon catalog".to_owned(),
@@ -2238,5 +2347,13 @@ impl ToolEnvelope {
             data: None,
             error: Some(error.into()),
         }
+    }
+
+    pub fn accepted(data: impl Serialize) -> Result<Self, serde_json::Error> {
+        Ok(Self {
+            outcome: ToolOutcome::Accepted,
+            data: Some(serde_json::to_value(data)?),
+            error: None,
+        })
     }
 }

@@ -13,7 +13,6 @@ pub(super) struct TerminalHistoryEntry {
 pub(super) enum TerminalHistorySource {
     Runtime,
     LocalHistory,
-    AiLedger,
 }
 
 impl TerminalHistorySource {
@@ -23,7 +22,7 @@ impl TerminalHistorySource {
             // Tauri's command-bar history provider preserves these underlying
             // autosuggest sources internally, but renders completion rows with
             // the generic history source badge.
-            Self::LocalHistory | Self::AiLedger => "terminal.command_bar.source_history",
+            Self::LocalHistory => "terminal.command_bar.source_history",
         }
     }
 }
@@ -69,9 +68,6 @@ impl TerminalCommandContext {
         let mut fields = vec![self.target_label.clone()];
         if let Some(cwd_host) = &self.cwd_host {
             fields.push(cwd_host.clone());
-        }
-        if let Some(node_id) = &self.node_id {
-            fields.push(node_id.0.clone());
         }
         fields.retain(|field| !field.trim().is_empty());
         fields.dedup();

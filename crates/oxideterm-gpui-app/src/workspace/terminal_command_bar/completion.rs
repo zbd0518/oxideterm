@@ -1,10 +1,7 @@
-// The legacy input owner is retired. Keep its data providers available for the
-// custom-spec settings surface and a sender-editor completion adapter without
-// retaining the old draft, focus, IME, or rendering state.
+// Compact Rich Input consumes history here; the remaining providers still back settings data.
 #![allow(dead_code, unused_imports)]
 
 use super::actions::classify_command_risk;
-use super::quick_commands::match_quick_command_host_pattern;
 use super::*;
 use oxideterm_ai::infer_ai_cwd;
 use oxideterm_sftp::{FileType as RemotePathFileType, ListFilter, SortOrder};
@@ -16,6 +13,7 @@ mod fig_specs;
 mod history_provider;
 mod path_provider;
 mod quick_command_provider;
+mod render;
 mod types;
 
 pub(self) use common::{
@@ -28,9 +26,9 @@ pub(self) use fig_specs::{
 };
 pub(self) use oxideterm_terminal::{TerminalShellParseResult, TerminalShellToken};
 pub(self) use oxideterm_terminal::{
-    escape_terminal_path_for_shell, is_likely_secret_terminal_command,
-    load_local_shell_history_commands, normalize_terminal_autosuggest_command,
-    terminal_autosuggest_fuzzy_score, tokenize_terminal_command_line,
+    escape_terminal_path_for_shell, load_local_shell_history_commands,
+    normalize_terminal_autosuggest_command, terminal_autosuggest_fuzzy_score,
+    tokenize_terminal_command_line,
 };
 pub(self) use quick_command_provider::{
     infer_terminal_ssh_identity_from_buffer, terminal_cwd_looks_remote,

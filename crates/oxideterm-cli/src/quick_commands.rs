@@ -3,14 +3,18 @@
 
 use std::fs;
 
-use oxideterm_quick_commands::{QuickCommand, QuickCommandsSnapshot, load_snapshot, save_snapshot};
+use oxideterm_quick_commands::{
+    QuickCommand, QuickCommandAvailability, QuickCommandConfirmationPolicy, QuickCommandParameter,
+    QuickCommandTargetProtocol, QuickCommandsSnapshot, decode_snapshot_json, load_snapshot,
+    save_snapshot, validate_quick_command_template,
+};
 use serde::Serialize;
 
 use crate::{
     args::{
-        JsonArgs, QuickCommandCreateArgs, QuickCommandDeleteArgs, QuickCommandEditArgs,
-        QuickCommandImportArgs, QuickCommandShowArgs, QuickCommandsAction, QuickCommandsCommand,
-        WriteArgs,
+        JsonArgs, QuickCommandConfirmationArg, QuickCommandCreateArgs, QuickCommandDeleteArgs,
+        QuickCommandEditArgs, QuickCommandImportArgs, QuickCommandProtocolArg,
+        QuickCommandShowArgs, QuickCommandsAction, QuickCommandsCommand, WriteArgs,
     },
     error::{CliError, CliResult},
     output::{self, OutputFormat},
@@ -120,6 +124,8 @@ fn show(args: QuickCommandShowArgs) -> CliResult<()> {
 
 fn create(args: QuickCommandCreateArgs) -> CliResult<i32> {
     let mut snapshot = read_snapshot(args.write.json)?;
+    let parameters = parse_parameters_json(args.parameters_json.as_deref(), args.write.json)?
+        .unwrap_or_default();
     let now = now_ms();
     let command = QuickCommand {
         id: format!("qc-cli-{now}"),
@@ -127,10 +133,23 @@ fn create(args: QuickCommandCreateArgs) -> CliResult<i32> {
         command: args.command,
         category: args.category,
         description: args.description,
-        host_pattern: args.host_pattern,
+        parameters,
+        availability: QuickCommandAvailability {
+            protocols: args.protocol.into_iter().map(core_protocol).collect(),
+            host_patterns: args.host_pattern,
+        },
+        confirmation: core_confirmation(args.confirmation),
+        sort_order: snapshot
+            .commands
+            .iter()
+            .map(|command| command.sort_order)
+            .max()
+            .unwrap_or(-1)
+            .saturating_add(1),
         created_at: now,
         updated_at: now,
     };
+    validate_command_template(&command, args.write.json)?;
     let change = QuickCommandChange {
         action: "create",
         target: command.id.clone(),
@@ -161,12 +180,32 @@ fn edit(args: QuickCommandEditArgs) -> CliResult<i32> {
     if let Some(category) = args.category {
         command.category = category;
     }
-    if let Some(description) = args.description {
+    if args.clear_description {
+        command.description = None;
+    } else if let Some(description) = args.description {
         command.description = Some(description);
     }
-    if let Some(host_pattern) = args.host_pattern {
-        command.host_pattern = Some(host_pattern);
+    if args.clear_host_patterns {
+        command.availability.host_patterns.clear();
+    } else if !args.host_pattern.is_empty() {
+        command.availability.host_patterns = args.host_pattern;
     }
+    if args.clear_protocols {
+        command.availability.protocols.clear();
+    } else if !args.protocol.is_empty() {
+        command.availability.protocols = args.protocol.into_iter().map(core_protocol).collect();
+    }
+    if args.clear_parameters {
+        command.parameters.clear();
+    } else if let Some(parameters) =
+        parse_parameters_json(args.parameters_json.as_deref(), args.write.json)?
+    {
+        command.parameters = parameters;
+    }
+    if let Some(confirmation) = args.confirmation {
+        command.confirmation = core_confirmation(confirmation);
+    }
+    validate_command_template(command, args.write.json)?;
     command.updated_at = now_ms();
     let after = format_quick_command_identity(command);
     snapshot.updated_at = command.updated_at;
@@ -180,6 +219,54 @@ fn edit(args: QuickCommandEditArgs) -> CliResult<i32> {
         .into_iter()
         .collect();
     finish_write(args.write, changes, snapshot)
+}
+
+fn parse_parameters_json(
+    value: Option<&str>,
+    json_output: bool,
+) -> CliResult<Option<Vec<QuickCommandParameter>>> {
+    value
+        .map(|value| {
+            serde_json::from_str(value).map_err(|error| {
+                CliError::new(
+                    "invalid_quick_command_parameters",
+                    format!("Quick Command parameters must be a valid JSON array: {error}"),
+                    json_output,
+                )
+            })
+        })
+        .transpose()
+}
+
+fn core_protocol(protocol: QuickCommandProtocolArg) -> QuickCommandTargetProtocol {
+    match protocol {
+        QuickCommandProtocolArg::Local => QuickCommandTargetProtocol::Local,
+        QuickCommandProtocolArg::Ssh => QuickCommandTargetProtocol::Ssh,
+        QuickCommandProtocolArg::Mosh => QuickCommandTargetProtocol::Mosh,
+        QuickCommandProtocolArg::Telnet => QuickCommandTargetProtocol::Telnet,
+        QuickCommandProtocolArg::Serial => QuickCommandTargetProtocol::Serial,
+        QuickCommandProtocolArg::Tmux => QuickCommandTargetProtocol::Tmux,
+    }
+}
+
+fn core_confirmation(confirmation: QuickCommandConfirmationArg) -> QuickCommandConfirmationPolicy {
+    match confirmation {
+        QuickCommandConfirmationArg::Inherit => QuickCommandConfirmationPolicy::Inherit,
+        QuickCommandConfirmationArg::Always => QuickCommandConfirmationPolicy::Always,
+    }
+}
+
+fn validate_command_template(command: &QuickCommand, json_output: bool) -> CliResult<()> {
+    validate_quick_command_template(&command.command, &command.parameters).map_err(|errors| {
+        CliError::new(
+            "invalid_quick_command_template",
+            errors.first().map_or_else(
+                || "Invalid Quick Command template".to_string(),
+                ToString::to_string,
+            ),
+            json_output,
+        )
+    })
 }
 
 fn delete(args: QuickCommandDeleteArgs) -> CliResult<i32> {
@@ -231,7 +318,7 @@ fn import(args: QuickCommandImportArgs) -> CliResult<i32> {
             args.write.json,
         )
     })?;
-    let snapshot = serde_json::from_str::<QuickCommandsSnapshot>(&contents).map_err(|error| {
+    let snapshot = decode_snapshot_json(&contents).map_err(|error| {
         CliError::new(
             "quick_commands_import_failed",
             format!(

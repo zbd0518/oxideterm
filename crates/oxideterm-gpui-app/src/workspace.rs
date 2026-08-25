@@ -165,7 +165,8 @@ use oxideterm_gpui_platform::{
     window_opacity::{apply_window_opacity, normalized_window_opacity},
 };
 use oxideterm_gpui_terminal::{
-    BackgroundImageRenderCache, PrivilegePromptMatch, SemanticShellDialect, SharedTerminalSession,
+    BackgroundImageRenderCache, PrivilegePromptMatch, SemanticShellDialect,
+    SharedTerminalCommandHistory, SharedTerminalSession, TerminalAutosuggestLabels,
     TerminalBackgroundFit, TerminalBackgroundPreferences, TerminalBroadcastInputKind,
     TerminalCommandSelectionLabels, TerminalContextAction, TerminalHighlightMatchScope,
     TerminalHighlightRenderMode, TerminalHighlightRule as UiHighlightRule,
@@ -249,7 +250,7 @@ use oxideterm_ssh_launch::{
 use oxideterm_terminal::{
     LocalPtyConfig, MoshTerminalConfig, RemoteShellIntegrationStatus, SerialSessionConfig,
     ShellInfo, SshSessionConfig, TelnetSessionConfig, TerminalCommandMarkDetectionSource,
-    TerminalCursorShape, TerminalLifecycle, scan_shells,
+    TerminalCursorShape, TerminalLifecycle, load_local_shell_history_commands, scan_shells,
 };
 use oxideterm_theme::{
     AppUiColors, TerminalTheme, ThemeTokens, UiDensityProfile, UiMotionProfile, UiRadii,
@@ -759,6 +760,9 @@ pub(crate) struct WorkspaceApp {
     terminal_command_context_highlight_section_expanded: bool,
     terminal_command_sender: Entity<terminal_command_sender::TerminalCommandSenderEntity>,
     _terminal_command_sender_observation: Subscription,
+    local_terminal_command_history: SharedTerminalCommandHistory,
+    // Runtime history follows NodeRouter identity without owning or prolonging the transport.
+    ssh_terminal_command_histories: HashMap<NodeId, SharedTerminalCommandHistory>,
     detached_local_terminals: HashMap<TerminalSessionId, DetachedLocalTerminalSession>,
     detached_local_terminal_order: Vec<TerminalSessionId>,
     serial_terminal_configs: HashMap<TerminalSessionId, SerialSessionConfig>,
@@ -997,9 +1001,9 @@ impl WorkspaceApp {
     }
 }
 
-// Completion providers remain data-only while the sender editor owns input.
+// Suggestion values can contain credentials embedded in commands, so diagnostics must not format them.
 #[allow(dead_code)]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct TerminalCommandSuggestion {
     kind: TerminalCommandSuggestionKind,
     label: String,
@@ -1023,7 +1027,6 @@ enum TerminalCommandSuggestionKind {
     Option,
     File,
     Directory,
-    QuickCommand,
 }
 
 #[derive(Clone)]

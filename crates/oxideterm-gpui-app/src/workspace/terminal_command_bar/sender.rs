@@ -11,6 +11,7 @@ use crate::workspace::terminal_command_sender::{
     TerminalCommandSenderTarget, TerminalCommandSenderTargetScope,
 };
 use oxideterm_terminal::{TerminalSenderInputMode, TerminalSenderPacing};
+use zeroize::Zeroizing;
 
 const TERMINAL_SENDER_CONTROL_HEIGHT: f32 = 28.0;
 const TERMINAL_SENDER_COMPACT_HEIGHT: f32 = 32.0;
@@ -131,11 +132,39 @@ impl WorkspaceApp {
     fn render_compact_terminal_command_sender(
         &self,
         snapshot: &TerminalCommandSenderDocumentSnapshot,
-        window: &Window,
+        _window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = self.tokens.ui;
-        let focused = snapshot.editor.read(cx).focus_handle(cx).is_focused(window);
+        let target = WorkspaceImeTarget::TerminalCommandSenderCompact;
+        let sender = self.terminal_command_sender.read(cx);
+        let focused = sender.compact_focused();
+        let draft = Zeroizing::new(
+            sender
+                .active_compact_draft()
+                .unwrap_or_default()
+                .to_string(),
+        );
+        let viewport = sender.active_compact_viewport().unwrap_or_default();
+        let placeholder = sender.compact_placeholder().to_string();
+        let suggestions_open = sender.compact_suggestions_open();
+        let suggestion_highlighted = sender.compact_suggestion_highlighted();
+        let suggestions = if focused
+            && suggestions_open
+            && snapshot.input_mode == TerminalSenderInputMode::Text
+            && snapshot.target_scope == TerminalCommandSenderTargetScope::Current
+            && snapshot.status != TerminalCommandSenderStatus::Running
+        {
+            self.terminal_command_sender_visible_history_suggestions(&draft, cx)
+        } else {
+            Vec::new()
+        };
+        let selected_range = self.ime_selected_range_for_target(target, cx);
+        let marked_text = self.marked_text_for_target(target, cx);
+        let active_offset = self.ime_active_offset_for_target(target, cx);
+        let ghost_text = (focused && !suggestions_open)
+            .then(|| self.terminal_command_sender_compact_ghost_text(snapshot, &draft, cx))
+            .flatten();
         let quick_commands_enabled = self
             .settings_store
             .settings()
@@ -149,16 +178,56 @@ impl WorkspaceApp {
             rgba((theme.bg << 8) | TERMINAL_SENDER_COMPACT_BACKGROUND_ALPHA)
         };
         let terminal_settings = &self.settings_store.settings().terminal;
-        let compact_editor_height =
-            oxideterm_gpui_editor::EditorMetrics::from_theme_with_editor_typography(
+        let workspace = cx.entity();
+        let compact_input = text_input_anchor_probe(
+            target.anchor_id(),
+            text_input_with_viewport_and_ghost_text(
                 &self.tokens,
-                terminal_settings.font_size as f32,
-                terminal_settings.line_height as f32,
+                TextInputView {
+                    value: &draft,
+                    placeholder,
+                    focused,
+                    caret_visible: self.input_caret.visible(),
+                    secret: false,
+                    selected_all: false,
+                    selected_range,
+                    marked_text,
+                },
+                &viewport,
+                active_offset,
+                ghost_text.as_deref(),
             )
-            .line_height
-            .min(TERMINAL_SENDER_COMPACT_EDITOR_HEIGHT);
+            .h(px(TERMINAL_SENDER_COMPACT_EDITOR_HEIGHT))
+            .px_0()
+            .border_0()
+            .rounded_none()
+            .bg(rgba(0x00000000))
+            .font_family(settings_mono_font_family(self.settings_store.settings()))
+            .text_size(px(terminal_settings.font_size as f32))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.terminal_command_sender.update(cx, |sender, cx| {
+                        sender.set_compact_focused(true, cx);
+                    });
+                    window.focus(&this.focus_handle, cx);
+                    this.ime_marked_text = None;
+                    this.begin_ime_selection_from_mouse_down(target, event, window, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                this.update_ime_selection_drag_from_mouse_move(event, window, cx);
+            })),
+            move |anchor, _window, cx| {
+                let _ = workspace.update(cx, |this, cx| {
+                    this.update_text_input_anchor(anchor, cx);
+                });
+            },
+        );
 
         div()
+            .relative()
             .flex_none()
             .h(px(TERMINAL_SENDER_COMPACT_HEIGHT))
             .px(px(TERMINAL_SENDER_COMPACT_HORIZONTAL_PADDING))
@@ -172,6 +241,13 @@ impl WorkspaceApp {
                     | TERMINAL_SENDER_COMPACT_BORDER_ALPHA,
             ))
             .bg(background)
+            .when(!suggestions.is_empty(), |row| {
+                row.child(self.render_terminal_command_sender_suggestions(
+                    &suggestions,
+                    suggestion_highlighted,
+                    cx,
+                ))
+            })
             .child(
                 div()
                     .flex_1()
@@ -182,6 +258,18 @@ impl WorkspaceApp {
                     .gap(px(8.0))
                     .overflow_hidden()
                     .cursor_text()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            this.terminal_command_sender.update(cx, |sender, cx| {
+                                sender.set_compact_focused(true, cx);
+                            });
+                            window.focus(&this.focus_handle, cx);
+                            this.ime_marked_text = None;
+                            this.begin_ime_selection_from_mouse_down(target, event, window, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
                     .child(Self::render_lucide_icon(
                         LucideIcon::ChevronRight,
                         16.0,
@@ -191,11 +279,9 @@ impl WorkspaceApp {
                         div()
                             .flex_1()
                             .min_w(px(0.0))
-                            // Matching the editor box to its line box lets the
-                            // parent center text, caret, and IME geometry as one unit.
-                            .h(px(compact_editor_height))
+                            .h(px(TERMINAL_SENDER_COMPACT_EDITOR_HEIGHT))
                             .overflow_hidden()
-                            .child(snapshot.editor.clone()),
+                            .child(compact_input),
                     ),
             )
             .when(quick_commands_enabled, |row| {
@@ -224,6 +310,9 @@ impl WorkspaceApp {
                                 this.terminal.update(cx, |terminal, _cx| {
                                     terminal.quick_commands.toggle_open()
                                 });
+                                this.terminal_command_sender.update(cx, |sender, cx| {
+                                    sender.set_compact_focused(false, cx);
+                                });
                                 this.dismiss_terminal_broadcast_menu(cx);
                                 this.dismiss_terminal_recording_menu();
                                 this.close_terminal_cwd_picker(cx);
@@ -245,6 +334,79 @@ impl WorkspaceApp {
                 )
             })
             .into_any_element()
+    }
+
+    fn terminal_command_sender_compact_ghost_text(
+        &self,
+        snapshot: &TerminalCommandSenderDocumentSnapshot,
+        draft: &str,
+        cx: &App,
+    ) -> Option<String> {
+        if snapshot.input_mode != TerminalSenderInputMode::Text
+            || snapshot.target_scope != TerminalCommandSenderTargetScope::Current
+            || snapshot.status == TerminalCommandSenderStatus::Running
+            || draft.is_empty()
+            || draft
+                .chars()
+                .any(|character| matches!(character, '\n' | '\r'))
+        {
+            return None;
+        }
+        self.active_pane(cx)
+            .and_then(|pane| pane.read(cx).history_ghost_text_for_input(draft))
+            .filter(|suffix| {
+                !suffix
+                    .chars()
+                    .any(|character| matches!(character, '\n' | '\r'))
+            })
+    }
+
+    fn terminal_command_sender_compact_history_suggestions(
+        &self,
+        snapshot: &TerminalCommandSenderDocumentSnapshot,
+        cx: &mut Context<Self>,
+    ) -> Vec<TerminalCommandSuggestion> {
+        if snapshot.input_mode != TerminalSenderInputMode::Text
+            || snapshot.target_scope != TerminalCommandSenderTargetScope::Current
+            || snapshot.status == TerminalCommandSenderStatus::Running
+        {
+            return Vec::new();
+        }
+        let draft = Zeroizing::new(
+            self.terminal_command_sender
+                .read(cx)
+                .active_compact_draft()
+                .unwrap_or_default()
+                .to_string(),
+        );
+        self.terminal_command_sender_visible_history_suggestions(&draft, cx)
+    }
+
+    pub(in crate::workspace) fn accept_terminal_command_sender_suggestion(
+        &mut self,
+        suggestion: &TerminalCommandSuggestion,
+        cx: &mut Context<Self>,
+    ) -> TerminalCommandSenderId {
+        let mut draft = Zeroizing::new(
+            self.terminal_command_sender
+                .read(cx)
+                .active_compact_draft()
+                .unwrap_or_default()
+                .to_string(),
+        );
+        let start = suggestion.replacement.start.min(draft.len());
+        let end = suggestion.replacement.end.min(draft.len()).max(start);
+        draft.replace_range(start..end, &suggestion.insert_text);
+        let caret = draft.encode_utf16().count();
+        let sender_id = self.terminal_command_sender.update(cx, |sender, cx| {
+            sender.replace_active_compact_text(std::mem::take(&mut *draft), cx)
+        });
+        let target = WorkspaceImeTarget::TerminalCommandSenderCompact;
+        self.set_ime_selection_from_anchor(target, caret, caret);
+        self.ime_marked_text = None;
+        self.show_active_input_caret(cx);
+        cx.notify();
+        sender_id
     }
 
     fn render_terminal_command_sender_tabs(
@@ -1067,15 +1229,37 @@ impl WorkspaceApp {
         }
     }
 
+    pub(in crate::workspace) fn focus_terminal_command_sender_input(
+        &mut self,
+        sender_id: TerminalCommandSenderId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let expanded = self.terminal_command_sender.read(cx).is_expanded();
+        if expanded {
+            self.focus_terminal_command_sender_editor(sender_id, window, cx);
+            return;
+        }
+        self.terminal_command_sender.update(cx, |sender, cx| {
+            if !sender.is_visible() {
+                sender.toggle_visible(cx);
+            }
+            sender.set_compact_focused(true, cx);
+        });
+        self.clear_ime_selection();
+        window.focus(&self.focus_handle, cx);
+    }
+
     pub(in crate::workspace) fn terminal_command_sender_editor_focused(
         &self,
         window: &Window,
         cx: &App,
     ) -> bool {
-        self.terminal_command_sender
-            .read(cx)
-            .active_document_snapshot()
-            .is_some_and(|document| document.editor.read(cx).focus_handle(cx).is_focused(window))
+        let sender = self.terminal_command_sender.read(cx);
+        sender.is_expanded()
+            && sender.active_document_snapshot().is_some_and(|document| {
+                document.editor.read(cx).focus_handle(cx).is_focused(window)
+            })
     }
 
     pub(in crate::workspace) fn handle_compact_terminal_command_sender_key(
@@ -1091,32 +1275,137 @@ impl WorkspaceApp {
         let Some(document) = sender.active_document_snapshot() else {
             return false;
         };
-        if !document.editor.read(cx).focus_handle(cx).is_focused(window) {
+        if !sender.compact_focused() {
             return false;
         }
+        let suggestions_open = sender.compact_suggestions_open();
+        let suggestion_highlighted = sender.compact_suggestion_highlighted();
 
         let modifiers = event.keystroke.modifiers;
         match event.keystroke.key.as_str() {
             "escape" if !modifiers.platform => {
-                // Compact Escape mirrors the former command row and returns
-                // keyboard ownership to the active terminal pane.
+                if suggestions_open {
+                    self.terminal_command_sender.update(cx, |sender, cx| {
+                        if sender.dismiss_compact_suggestions() {
+                            cx.notify();
+                        }
+                    });
+                    return true;
+                }
+                self.terminal_command_sender.update(cx, |sender, cx| {
+                    sender.set_compact_focused(false, cx);
+                });
+                self.clear_ime_selection();
                 self.focus_active_pane(window, cx);
                 true
             }
             "enter" if !modifiers.platform && !modifiers.shift && !modifiers.alt => {
-                // Plain Enter is the compact send gesture. Shift/Alt+Enter
-                // remain available to the shared editor for multiline drafts.
-                if self.start_terminal_command_sender(document.id, cx) {
-                    // The run owns an immutable copy of the command plan, so
-                    // compact input can be reset as soon as startup succeeds.
-                    document.editor.update(cx, |editor, cx| {
-                        editor.replace_text_external(String::new(), cx);
+                let sender_id = if suggestions_open {
+                    let suggestions =
+                        self.terminal_command_sender_compact_history_suggestions(&document, cx);
+                    suggestion_highlighted
+                        .and_then(|index| suggestions.get(index))
+                        .map(|suggestion| {
+                            self.accept_terminal_command_sender_suggestion(suggestion, cx)
+                        })
+                        .unwrap_or(document.id)
+                } else {
+                    document.id
+                };
+                if self.start_terminal_command_sender(sender_id, cx) {
+                    self.terminal_command_sender.update(cx, |sender, cx| {
+                        sender.clear_compact_text(sender_id, cx);
                     });
+                    self.clear_ime_selection();
                 }
                 true
             }
+            "up" | "arrowup" | "down" | "arrowdown"
+                if !modifiers.platform
+                    && !modifiers.control
+                    && !modifiers.alt
+                    && !modifiers.shift
+                    && self
+                        .marked_text_for_target(
+                            WorkspaceImeTarget::TerminalCommandSenderCompact,
+                            cx,
+                        )
+                        .is_none() =>
+            {
+                let suggestions =
+                    self.terminal_command_sender_compact_history_suggestions(&document, cx);
+                if suggestions.is_empty() {
+                    return false;
+                }
+                let move_down = matches!(event.keystroke.key.as_str(), "down" | "arrowdown");
+                self.terminal_command_sender.update(cx, |sender, cx| {
+                    sender.move_compact_suggestion_selection(suggestions.len(), move_down, cx);
+                });
+                true
+            }
+            "tab"
+                if !modifiers.platform
+                    && !modifiers.control
+                    && !modifiers.alt
+                    && !modifiers.shift =>
+            {
+                if suggestions_open {
+                    let suggestions =
+                        self.terminal_command_sender_compact_history_suggestions(&document, cx);
+                    if let Some(suggestion) =
+                        suggestion_highlighted.and_then(|index| suggestions.get(index))
+                    {
+                        self.accept_terminal_command_sender_suggestion(suggestion, cx);
+                        return true;
+                    }
+                }
+                self.accept_terminal_command_sender_ghost_text(&document, cx)
+            }
+            "right" | "arrowright"
+                if !modifiers.platform
+                    && !modifiers.control
+                    && !modifiers.alt
+                    && !modifiers.shift =>
+            {
+                self.accept_terminal_command_sender_ghost_text(&document, cx)
+            }
             _ => false,
         }
+    }
+
+    fn accept_terminal_command_sender_ghost_text(
+        &mut self,
+        document: &TerminalCommandSenderDocumentSnapshot,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let target = WorkspaceImeTarget::TerminalCommandSenderCompact;
+        let mut draft = Zeroizing::new(
+            self.terminal_command_sender
+                .read(cx)
+                .active_compact_draft()
+                .unwrap_or_default()
+                .to_string(),
+        );
+        let draft_len = draft.encode_utf16().count();
+        let caret_is_at_end = self
+            .ime_selection_range_for_target(target, cx)
+            .is_some_and(|range| range.start == draft_len && range.end == draft_len)
+            && self.marked_text_for_target(target, cx).is_none();
+        let Some(ghost_text) = caret_is_at_end
+            .then(|| self.terminal_command_sender_compact_ghost_text(&document, &draft, cx))
+            .flatten()
+        else {
+            return false;
+        };
+        draft.push_str(&ghost_text);
+        let caret = draft.encode_utf16().count();
+        self.terminal_command_sender.update(cx, |sender, cx| {
+            sender.replace_active_compact_text(std::mem::take(&mut *draft), cx);
+        });
+        self.set_ime_selection_from_anchor(target, caret, caret);
+        self.show_active_input_caret(cx);
+        cx.notify();
+        true
     }
 
     pub(in crate::workspace) fn update_terminal_command_sender_resize(
@@ -1178,11 +1467,15 @@ impl WorkspaceApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let target_fields = self.terminal_command_context(cx).target_fields();
+        let protocol = self
+            .active_pane_id(cx)
+            .and_then(|pane_id| self.quick_command_context_for_pane(pane_id, cx))
+            .map(|context| context.protocol);
         let (categories, commands) = self
             .terminal
             .read(cx)
             .quick_commands
-            .quick_bar_snapshot(&target_fields);
+            .quick_bar_snapshot(&target_fields, protocol);
         if commands.is_empty() {
             return div().into_any_element();
         }
@@ -1219,7 +1512,7 @@ impl WorkspaceApp {
                     .child(category.name),
             );
             for command in category_commands {
-                let command_text = command.command;
+                let command_for_run = command.clone();
                 content_row = content_row.child(
                     action_chip(
                         &self.tokens,
@@ -1234,7 +1527,7 @@ impl WorkspaceApp {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _event, window, cx| {
-                            this.run_quick_command(&command_text, window, cx);
+                            this.run_quick_command_model(&command_for_run, window, cx);
                             cx.stop_propagation();
                         }),
                     ),
