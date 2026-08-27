@@ -11,11 +11,11 @@ use std::{
 
 use gpui::{
     Anchor, AnchoredPositionMode, AnyElement, App, AppContext, Bounds, ClipboardItem, Context,
-    Entity, EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
-    Point, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Task, TextRun,
-    UniformListScrollHandle, Window, anchored, deferred, div, font, prelude::*, px, rgb, rgba, svg,
-    uniform_list,
+    Entity, EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoColor,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, Pixels, Point, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
+    Styled, Task, TextRun, UniformListScrollHandle, Window, anchored, deferred, div, font,
+    prelude::*, px, rgb, rgba, svg, uniform_list,
 };
 use oxideterm_editor_syntax::LanguageId;
 use oxideterm_gpui_editor::{EditorContextMenuLabels, TextEditorView};
@@ -200,9 +200,10 @@ impl IdeSurfaceMount {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct IdeRuntimeSettings {
     pub auto_save: bool,
+    pub editor_font_fallback: Option<String>,
     pub editor_font_size: f32,
     pub editor_line_height: f32,
     pub word_wrap: bool,
@@ -214,6 +215,7 @@ impl Default for IdeRuntimeSettings {
     fn default() -> Self {
         Self {
             auto_save: false,
+            editor_font_fallback: None,
             editor_font_size: 14.0,
             editor_line_height: 1.2,
             word_wrap: false,

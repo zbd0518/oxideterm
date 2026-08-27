@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::window::PreparedGlyphBatch;
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
+    AtlasTextureId, AtlasTile, Background, Bounds, ColorExt, ContentMask, Corners, Edges, Pixels,
     Point, Radians, ScaledFilter, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
 use smallvec::SmallVec;
@@ -24,6 +24,26 @@ pub type PathVertex_ScaledPixels = PathVertex<ScaledPixels>;
 
 #[expect(missing_docs)]
 pub type DrawOrder = u32;
+
+/// A boolean stored as a `u32` so that GPU-facing structs contain no
+/// compiler-inserted padding bytes, which would be undefined behavior to
+/// reinterpret as `&[u8]` when writing instance buffers. Guaranteed to be
+/// `0` or `1` by construction; shaders read it as a `u32`/`uint`.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct PaddedBool32(u32);
+
+impl From<bool> for PaddedBool32 {
+    fn from(value: bool) -> Self {
+        PaddedBool32(value as u32)
+    }
+}
+
+impl From<PaddedBool32> for u32 {
+    fn from(value: PaddedBool32) -> Self {
+        value.0
+    }
+}
 
 #[derive(Default)]
 #[expect(missing_docs)]
@@ -176,7 +196,7 @@ impl Scene {
             .push(PaintOperation::Primitive(primitive));
     }
 
-    /// Expand a cached glyph batch into render sprites and retain one replay operation.
+    /// Expands a cached glyph batch into sprites while retaining one replay operation.
     pub(crate) fn insert_prepared_glyph_batch(
         &mut self,
         batch: Arc<PreparedGlyphBatch>,
@@ -191,7 +211,7 @@ impl Scene {
                 pad: 0,
                 bounds: glyph.bounds + origin,
                 content_mask,
-                color: glyph.color.opacity(opacity),
+                color: glyph.color.opacity(opacity).into(),
                 tile: glyph.tile,
                 transformation: TransformationMatrix::unit(),
             };
@@ -209,7 +229,7 @@ impl Scene {
                 pad: 0,
                 bounds: glyph.bounds + origin,
                 content_mask,
-                color: glyph.color.opacity(opacity),
+                color: glyph.color.opacity(opacity).into(),
                 tile: glyph.tile,
                 transformation: TransformationMatrix::unit(),
             };
@@ -225,7 +245,7 @@ impl Scene {
             let mut sprite = PolychromeSprite {
                 order: 0,
                 pad: 0,
-                grayscale: false,
+                grayscale: false.into(),
                 opacity,
                 bounds: glyph.bounds + origin,
                 content_mask,
@@ -320,6 +340,35 @@ impl Scene {
             backdrop_filters_iter: self.backdrop_filters.iter().peekable(),
             filter_boundaries_start: 0,
             filter_boundaries_iter: self.filter_boundaries.iter().peekable(),
+        }
+    }
+}
+
+/// Internal representation of [`palette::Hsla`] which is layout sensitive, as its provided to the renderer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[repr(C)]
+pub struct SceneHsla {
+    /// Hue, in a range from 0 to 1
+    pub(crate) h: f32,
+    /// Saturation, in a range from 0 to 1
+    pub(crate) s: f32,
+    /// Lightness, in a range from 0 to 1
+    pub(crate) l: f32,
+    /// Alpha, in a range from 0 to 1
+    pub(crate) a: f32,
+}
+impl Into<palette::Hsla> for SceneHsla {
+    fn into(self) -> palette::Hsla {
+        palette::Hsla::new(self.h * 360.0, self.s, self.l, self.a)
+    }
+}
+impl From<palette::Hsla> for SceneHsla {
+    fn from(hsla: palette::Hsla) -> Self {
+        Self {
+            h: hsla.hue.into_positive_degrees() / 360.0,
+            s: hsla.saturation,
+            l: hsla.lightness,
+            a: hsla.alpha,
         }
     }
 }
@@ -694,6 +743,42 @@ pub enum PrimitiveBatch {
     FilterBoundary(usize),
 }
 
+impl PrimitiveBatch {
+    #[expect(missing_docs)]
+    pub fn label(&self) -> String {
+        match self {
+            Self::Shadows(range) => format!("shadows ({})", range.len()),
+            Self::Quads(range) => format!("quads ({})", range.len()),
+            Self::Paths(range) => format!("paths ({})", range.len()),
+            Self::Underlines(range) => format!("underlines ({})", range.len()),
+            Self::MonochromeSprites { texture_id, range } => {
+                format!(
+                    "monochrome sprites ({}) on atlas {}",
+                    range.len(),
+                    texture_id.index
+                )
+            }
+            Self::SubpixelSprites { texture_id, range } => {
+                format!(
+                    "subpixel sprites ({}) on atlas {}",
+                    range.len(),
+                    texture_id.index
+                )
+            }
+            Self::PolychromeSprites { texture_id, range } => {
+                format!(
+                    "polychrome sprites ({}) on atlas {}",
+                    range.len(),
+                    texture_id.index
+                )
+            }
+            Self::Surfaces(range) => format!("surfaces ({})", range.len()),
+            Self::BackdropFilters(range) => format!("backdrop filters ({})", range.len()),
+            Self::FilterBoundary(ix) => format!("filter boundary ({ix})"),
+        }
+    }
+}
+
 #[derive(Default, Debug, Copy, Clone)]
 #[repr(C)]
 #[expect(missing_docs)]
@@ -703,7 +788,7 @@ pub struct Quad {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub background: Background,
-    pub border_color: Hsla,
+    pub border_color: SceneHsla,
     pub corner_radii: Corners<ScaledPixels>,
     pub border_widths: Edges<ScaledPixels>,
 }
@@ -722,9 +807,9 @@ pub struct Underline {
     pub pad: u32, // align to 8 bytes
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
-    pub color: Hsla,
+    pub color: SceneHsla,
     pub thickness: ScaledPixels,
-    pub wavy: u32,
+    pub wavy: PaddedBool32,
 }
 
 impl From<Underline> for Primitive {
@@ -742,7 +827,7 @@ pub struct Shadow {
     pub bounds: Bounds<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
-    pub color: Hsla,
+    pub color: SceneHsla,
     pub element_bounds: Bounds<ScaledPixels>,
     pub element_corner_radii: Corners<ScaledPixels>,
     /// 0 = drop shadow (rendered outside the element), 1 = inset shadow (rendered inside).
@@ -931,7 +1016,7 @@ pub struct MonochromeSprite {
     pub pad: u32,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
-    pub color: Hsla,
+    pub color: SceneHsla,
     pub tile: AtlasTile,
     pub transformation: TransformationMatrix,
 }
@@ -950,7 +1035,7 @@ pub struct SubpixelSprite {
     pub pad: u32, // align to 8 bytes
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
-    pub color: Hsla,
+    pub color: SceneHsla,
     pub tile: AtlasTile,
     pub transformation: TransformationMatrix,
 }
@@ -967,7 +1052,7 @@ impl From<SubpixelSprite> for Primitive {
 pub struct PolychromeSprite {
     pub order: DrawOrder,
     pub pad: u32,
-    pub grayscale: bool,
+    pub grayscale: PaddedBool32,
     pub opacity: f32,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
@@ -1255,7 +1340,7 @@ mod tests {
     fn prepared_monochrome_glyph(bounds: Bounds<ScaledPixels>) -> PreparedMonochromeGlyph {
         PreparedMonochromeGlyph {
             bounds,
-            color: Hsla::default(),
+            color: palette::Hsla::default(),
             tile: AtlasTile {
                 texture_id: AtlasTextureId {
                     index: 0,
@@ -1361,7 +1446,7 @@ mod tests {
     }
 
     #[test]
-    fn sprite_batch_preserves_layer_order_and_replay() {
+    fn prepared_glyph_batch_preserves_layer_order_and_replay() {
         let mut scene = Scene::default();
         scene.push_layer(full_bounds());
         let batch = Arc::new(PreparedGlyphBatch {

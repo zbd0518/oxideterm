@@ -1,4 +1,4 @@
-// OxideTerm modification: distinguish completed and deferred WGPU recovery polls.
+// OxideTerm modification: modal parent ownership is registered only after window setup succeeds.
 use anyhow::{Context as _, anyhow};
 use x11rb::connection::RequestConnection;
 
@@ -8,21 +8,18 @@ use gpui::{
     Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
     Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, ScaledPixels, Scene, Size,
     Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowDecorations, WindowKind, WindowParams, px,
+    WindowDecorations, WindowKind, WindowParams, popup::PopupNotSupportedError, px,
 };
-use gpui_wgpu::{
-    CompositorGpuHint, RECOVERY_EXHAUSTED_MESSAGE, WgpuRecoveryStatus, WgpuRenderer,
-    WgpuSurfaceConfig,
-};
+use gpui_wgpu::{CompositorGpuHint, WgpuRecoveryStatus, WgpuRenderer, WgpuSurfaceConfig};
 
 use collections::FxHashSet;
+use gpui_util::{ResultExt, maybe};
 use raw_window_handle as rwh;
-use util::{ResultExt, maybe};
 use x11rb::{
     connection::Connection,
     cookie::{Cookie, VoidCookie},
     errors::ConnectionError,
-    properties::WmSizeHints,
+    properties::{WmHints, WmSizeHints},
     protocol::{
         sync,
         xinput::{self, ConnectionExt as _},
@@ -393,6 +390,39 @@ where
         .with_context(failure_context)
 }
 
+/// Sets or clears the ICCCM WM_HINTS urgency flag, preserving the other hints.
+///
+/// Clearing when the flag isn't set is skipped: writing it back would create a
+/// WM_HINTS property on windows that never requested attention, and would add an
+/// X round trip to every window state change.
+fn set_wm_hints_urgency(xcb: &XCBConnection, x_window: xproto::Window, urgent: bool) {
+    let mut hints = WmHints::new();
+    match WmHints::get(xcb, x_window) {
+        Ok(cookie) => match cookie.reply() {
+            Ok(Some(existing_hints)) => hints = existing_hints,
+            Ok(None) => {}
+            Err(error) => {
+                log::debug!("failed to read X11 WM_HINTS before setting urgency: {error}")
+            }
+        },
+        Err(error) => {
+            log::debug!("failed to request X11 WM_HINTS before setting urgency: {error}")
+        }
+    }
+
+    if !urgent && !hints.urgent {
+        return;
+    }
+
+    hints.urgent = urgent;
+    check_reply(
+        || "X11 ChangeProperty for WM_HINTS urgency failed.",
+        hints.set(xcb, x_window),
+    )
+    .log_err();
+    xcb_flush(xcb);
+}
+
 /// Convert X11 connection errors to `anyhow::Error` and panic for unrecoverable errors.
 pub(crate) fn handle_connection_error(err: ConnectionError) -> anyhow::Error {
     match err {
@@ -433,6 +463,12 @@ impl X11WindowState {
         supports_xinput_gestures: bool,
         is_bgr: bool,
     ) -> anyhow::Result<Self> {
+        // Native popups are not implemented on X11 yet. Rejecting lets callers fall back to
+        // gpui's in-window popovers.
+        if let WindowKind::AnchoredPopup(_) = params.kind {
+            return Err(PopupNotSupportedError.into());
+        }
+
         let x_screen_index = params
             .display_id
             .map_or(x_main_screen_index, |did| u64::from(did) as usize);
@@ -601,8 +637,6 @@ impl X11WindowState {
             let parent = if params.kind == WindowKind::Dialog
                 && let Some(parent) = parent_window
             {
-                parent.add_child(x_window);
-
                 Some(parent)
             } else {
                 None
@@ -825,6 +859,14 @@ impl X11WindowState {
                 xcb.destroy_window(x_window),
             )?;
             xcb_flush(xcb);
+        }
+
+        if let Ok(state) = &setup_result
+            && let Some(parent) = state.parent.as_ref()
+        {
+            // Registration is deliberately last: setup failures must not leave the parent blocked
+            // by a child window that was already destroyed.
+            parent.add_child(x_window);
         }
 
         setup_result
@@ -1087,6 +1129,7 @@ impl X11WindowStatePtr {
             .chunks_exact(4)
             .map(|chunk| u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
 
+        let was_active = state.active;
         state.active = false;
         state.fullscreen = false;
         state.maximized_vertical = false;
@@ -1105,6 +1148,12 @@ impl X11WindowStatePtr {
             } else if atom == state.atoms._NET_WM_STATE_HIDDEN {
                 state.hidden = true;
             }
+        }
+
+        // The urgency hint has no withdrawal signal of its own; ICCCM leaves that to
+        // the client, and focus is the conventional means for the user to zero it.
+        if state.active && !was_active {
+            set_wm_hints_urgency(&self.xcb, self.x_window, false);
         }
 
         Ok(())
@@ -1427,7 +1476,11 @@ impl PlatformWindow for X11Window {
         )
         .log_err()
         .map_or(Point::new(Pixels::ZERO, Pixels::ZERO), |reply| {
-            Point::new((reply.root_x as u32).into(), (reply.root_y as u32).into())
+            let scale_factor = self.0.state.borrow().scale_factor;
+            Point::new(
+                px(reply.win_x as f32 / scale_factor),
+                px(reply.win_y as f32 / scale_factor),
+            )
         })
     }
 
@@ -1488,15 +1541,15 @@ impl PlatformWindow for X11Window {
                 message,
             )
             .log_err();
-        self.0
-            .xcb
-            .set_input_focus(
-                xproto::InputFocus::POINTER_ROOT,
-                self.0.x_window,
-                xproto::Time::CURRENT_TIME,
-            )
-            .log_err();
         xcb_flush(&self.0.xcb);
+    }
+
+    fn request_attention(&self) {
+        if self.is_active() {
+            return;
+        }
+
+        set_wm_hints_urgency(&self.0.xcb, self.0.x_window, true);
     }
 
     fn is_active(&self) -> bool {
@@ -1692,21 +1745,18 @@ impl PlatformWindow for X11Window {
                 window_id: self.0.x_window,
                 visual_id: inner.visual_id,
             };
-            match inner.renderer.recover(&raw_window) {
-                Ok(WgpuRecoveryStatus::Recovered) => {
-                    inner.force_render_after_recovery = true;
-                }
-                Ok(WgpuRecoveryStatus::Deferred) => {
-                    // The periodic refresh loop will poll again after the shared cooldown.
-                }
+            inner.force_render_after_recovery = match inner.renderer.recover(&raw_window) {
+                Ok(WgpuRecoveryStatus::Recovered | WgpuRecoveryStatus::Deferred) => true,
                 Ok(WgpuRecoveryStatus::Failed) => {
-                    log::error!("{RECOVERY_EXHAUSTED_MESSAGE}");
+                    // A terminal recovery result must not keep the X11 frame loop busy.
+                    log::error!("GPU recovery exhausted; restart OxideTerm to restore rendering");
+                    false
                 }
                 Err(err) => {
                     log::warn!("GPU recovery failed, will retry on next frame: {err}");
+                    true
                 }
-            }
-
+            };
             return;
         }
 

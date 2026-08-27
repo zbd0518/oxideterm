@@ -135,11 +135,31 @@ impl Render for TerminalPane {
             // Hidden panes keep their emulator state current without copying the full grid. The
             // first visible render after activation materializes exactly one latest snapshot.
             let snapshot_started = Instant::now();
+            #[cfg(feature = "bench")]
+            let backend_snapshot_started = Instant::now();
             let snapshot = self.terminal.lock().snapshot_incremental(&self.snapshot);
+            #[cfg(feature = "bench")]
+            {
+                self.benchmark_backend_snapshot_micros = backend_snapshot_started
+                    .elapsed()
+                    .as_micros()
+                    .min(u128::from(u64::MAX))
+                    as u64;
+            }
             if snapshot.display_offset == 0 {
                 self.clear_smooth_scroll_remainder();
             }
+            #[cfg(feature = "bench")]
+            let snapshot_state_started = Instant::now();
             self.snapshot = self.stamp_snapshot(snapshot);
+            #[cfg(feature = "bench")]
+            {
+                self.benchmark_snapshot_state_micros = snapshot_state_started
+                    .elapsed()
+                    .as_micros()
+                    .min(u128::from(u64::MAX))
+                    as u64;
+            }
             self.snapshot_dirty = false;
             self.render_stats.snapshot_micros = snapshot_started
                 .elapsed()
@@ -246,7 +266,6 @@ impl Render for TerminalPane {
                     self.theme.bell_background,
                 )))
         });
-        self.drop_retired_images(window, cx);
         let command_mark_ui_visible =
             command_mark_ui_available(self.settings.command_marks_enabled, terminal_mode);
         if self.command_marks_render_cache_dirty {
@@ -263,6 +282,10 @@ impl Render for TerminalPane {
         } else {
             None
         };
+        let performance_metrics_enabled = self.preferences.show_performance_overlay;
+        #[cfg(feature = "bench")]
+        let performance_metrics_enabled =
+            performance_metrics_enabled || self.benchmark_performance_metrics_enabled;
         let autosuggest_overlay = {
             let candidates = self.terminal_autosuggest_candidates();
             (!candidates.is_empty())
@@ -305,18 +328,18 @@ impl Render for TerminalPane {
                 .then(|| self.command_fact_ledger.transient_command_highlight())
                 .flatten(),
         )
-        .semantic_coloring(
+        .semantic_configuration(
             self.semantic_coloring_enabled() && !terminal_mode.contains(TermMode::ALT_SCREEN),
+            self.preferences.semantic_scheme.clone(),
+            self.preferences.semantic_shell,
         )
-        .semantic_scheme(self.preferences.semantic_scheme.clone())
-        .semantic_shell(self.preferences.semantic_shell)
         .row_timestamps(row_timestamps)
         .transparent_background(background.is_some() || self.preferences.transparent_background)
         .ghost_text(self.terminal_ghost_text())
         .viewport_rows(viewport_rows)
         .scrollbar_display_offset(scrollbar_display_offset)
         .scroll_y_offset(smooth_scroll_y_offset)
-        .performance_metrics_enabled(self.preferences.show_performance_overlay)
+        .performance_metrics_enabled(performance_metrics_enabled)
         .command_mark_gutter_width(if command_mark_ui_visible {
             self.command_mark_gutter_width()
         } else {
@@ -1154,21 +1177,6 @@ impl TerminalPane {
                             this.refresh_serial_port_presence(cx);
                         }),
                     ),
-            )
-            .child(
-                self.render_serial_control_button(
-                    labels.reconnect.clone(),
-                    status.can_reconnect,
-                    false,
-                )
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _event: &MouseDownEvent, window, cx| {
-                        window.prevent_default();
-                        cx.stop_propagation();
-                        this.reconnect_serial(cx);
-                    }),
-                ),
             )
             .child(
                 self.render_serial_control_button(labels.send_break.clone(), running, false)

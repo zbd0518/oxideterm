@@ -8,6 +8,24 @@ use oxideterm_remote_desktop::{
 use oxideterm_session_adapter::managed_key_resolver_from_store;
 use oxideterm_ssh_launch::{RemoteDesktopLaunchProtocol, TemporaryRemoteDesktopLaunch};
 
+const SSH_ROOT_NODE_ID_PREFIX: &str = "ssh";
+
+fn next_available_ssh_root_node_id(
+    next_sequence: &mut u64,
+    mut node_exists: impl FnMut(&NodeId) -> bool,
+) -> NodeId {
+    loop {
+        let sequence = *next_sequence;
+        // Restored session trees can already own numeric ids while the workspace counter
+        // starts from one, so allocation must skip every live logical node owner.
+        *next_sequence = sequence.wrapping_add(1).max(1);
+        let node_id = NodeId::new(format!("{SSH_ROOT_NODE_ID_PREFIX}-{sequence}"));
+        if !node_exists(&node_id) {
+            return node_id;
+        }
+    }
+}
+
 fn attach_saved_owner_to_reused_ssh_node(
     node: &mut WorkspaceSshNode,
     saved_connection_id: &str,
@@ -380,9 +398,42 @@ impl WorkspaceApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<TerminalSessionId> {
+        self.create_telnet_terminal_tab_for_connection(
+            config,
+            login,
+            terminal_options,
+            title,
+            None,
+            window,
+            cx,
+        )
+    }
+
+    pub(in crate::workspace) fn create_telnet_terminal_tab_for_connection(
+        &mut self,
+        config: TelnetSessionConfig,
+        login: Option<oxideterm_terminal::TelnetLoginCredentials>,
+        terminal_options: ConnectionTerminalOptions,
+        title: String,
+        connection_attempt_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<TerminalSessionId> {
         let tab_id = self.alloc_tab_id(cx);
         let pane_id = self.alloc_pane_id(cx);
         let session_id = self.alloc_session_id(cx);
+        let reconnect_terminal_options = terminal_options.clone();
+        let reconnect_config = config.clone();
+        let connection_attempt_id = connection_attempt_id.unwrap_or_else(|| {
+            self.standalone_connections.insert_pending(
+                standalone_connections::StandaloneConnectionKind::Telnet,
+                title.clone(),
+                standalone_connections::StandaloneConnectionLaunch::Telnet {
+                    config: reconnect_config,
+                    terminal_options: reconnect_terminal_options,
+                },
+            )
+        });
         let mut preference_overrides = terminal_preference_overrides(
             terminal_options,
             &self.settings_store.settings().terminal,
@@ -417,7 +468,7 @@ impl WorkspaceApp {
             Tab {
                 id: tab_id,
                 kind: TabKind::LocalTerminal,
-                title,
+                title: title.clone(),
                 title_source: TabTitleSource::Static,
                 root_pane: Some(PaneNode::leaf(pane_id, session_id)),
                 active_pane_id: Some(pane_id),
@@ -425,6 +476,9 @@ impl WorkspaceApp {
             cx,
         );
         self.bind_terminal_location(tab_id, pane_id, session_id, cx);
+        let surface = standalone_connections::StandaloneConnectionSurface::Terminal(session_id);
+        self.standalone_connections
+            .bind_surface_for_attempt(&connection_attempt_id, surface);
         self.set_main_window_active_tab(Some(tab_id), cx);
         self.active_surface = ActiveSurface::Terminal;
         self.needs_active_pane_focus = true;
@@ -453,9 +507,40 @@ impl WorkspaceApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<TerminalSessionId> {
+        self.create_serial_terminal_tab_for_connection(
+            config,
+            terminal_options,
+            title,
+            None,
+            window,
+            cx,
+        )
+    }
+
+    pub(in crate::workspace) fn create_serial_terminal_tab_for_connection(
+        &mut self,
+        config: SerialSessionConfig,
+        terminal_options: ConnectionTerminalOptions,
+        title: String,
+        connection_attempt_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<TerminalSessionId> {
         let tab_id = self.alloc_tab_id(cx);
         let pane_id = self.alloc_pane_id(cx);
         let session_id = self.alloc_session_id(cx);
+        let reconnect_config = config.clone();
+        let reconnect_terminal_options = terminal_options.clone();
+        let connection_attempt_id = connection_attempt_id.unwrap_or_else(|| {
+            self.standalone_connections.insert_pending(
+                standalone_connections::StandaloneConnectionKind::Serial,
+                title.clone(),
+                standalone_connections::StandaloneConnectionLaunch::Serial {
+                    config: reconnect_config,
+                    terminal_options: reconnect_terminal_options,
+                },
+            )
+        });
         let mut preferences =
             self.prepare_terminal_preferences_for_tab_kind(&TabKind::LocalTerminal, cx);
         let mut preference_overrides = terminal_preference_overrides(
@@ -470,22 +555,35 @@ impl WorkspaceApp {
         });
         preference_overrides.apply_to(&mut preferences);
         let pane_config = config.clone();
+        let serial_session = match TerminalPane::open_serial_session_with_preferences(
+            config.clone(),
+            &preferences,
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                self.standalone_connections
+                    .mark_attempt_error(&connection_attempt_id);
+                cx.notify();
+                return Err(error);
+            }
+        };
         let pane = cx.new(|cx| {
-            TerminalPane::new_serial_with_preferences(pane_config, preferences, window, cx)
-                .expect("failed to initialize Serial terminal pane")
+            TerminalPane::from_shared_session(serial_session, preferences, window, cx)
+                .expect("failed to initialize pre-opened Serial terminal pane")
+                .with_serial_session_config(pane_config)
                 .with_preference_overrides(preference_overrides)
         });
 
-        // Serial mirrors Tauri local-terminal transport semantics: it is not
-        // an SSH node and must not expose SFTP, forwarding, or ProxyJump.
+        // Serial owns no SSH node and must not expose SFTP, forwarding, or ProxyJump.
         self.register_terminal_pane(pane_id, session_id, pane.clone(), window, cx);
-        self.serial_terminal_configs.insert(session_id, config);
+        self.serial_terminal_configs
+            .insert(session_id, config.clone());
         self.refresh_native_plugin_terminal_hooks(cx);
         self.insert_tab(
             Tab {
                 id: tab_id,
                 kind: TabKind::LocalTerminal,
-                title,
+                title: title.clone(),
                 title_source: TabTitleSource::Static,
                 root_pane: Some(PaneNode::leaf(pane_id, session_id)),
                 active_pane_id: Some(pane_id),
@@ -493,6 +591,9 @@ impl WorkspaceApp {
             cx,
         );
         self.bind_terminal_location(tab_id, pane_id, session_id, cx);
+        let surface = standalone_connections::StandaloneConnectionSurface::Terminal(session_id);
+        self.standalone_connections
+            .bind_surface_for_attempt(&connection_attempt_id, surface);
         self.set_main_window_active_tab(Some(tab_id), cx);
         self.active_surface = ActiveSurface::Terminal;
         self.needs_active_pane_focus = true;
@@ -502,11 +603,12 @@ impl WorkspaceApp {
         Ok(session_id)
     }
 
-    pub(in crate::workspace) fn create_mosh_terminal_tab(
+    pub(in crate::workspace) fn create_mosh_terminal_tab_for_connection(
         &mut self,
         mut config: MoshTerminalConfig,
         terminal_options: ConnectionTerminalOptions,
         title: String,
+        connection_attempt_id: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<TerminalSessionId> {
@@ -541,7 +643,7 @@ impl WorkspaceApp {
             Tab {
                 id: tab_id,
                 kind: TabKind::MoshTerminal,
-                title,
+                title: title.clone(),
                 title_source: TabTitleSource::Static,
                 root_pane: Some(PaneNode::leaf(pane_id, session_id)),
                 active_pane_id: Some(pane_id),
@@ -549,6 +651,9 @@ impl WorkspaceApp {
             cx,
         );
         self.bind_terminal_location(tab_id, pane_id, session_id, cx);
+        let surface = standalone_connections::StandaloneConnectionSurface::Terminal(session_id);
+        self.standalone_connections
+            .bind_surface_for_attempt(&connection_attempt_id, surface);
         self.set_main_window_active_tab(Some(tab_id), cx);
         self.active_surface = ActiveSurface::Terminal;
         self.needs_active_pane_focus = true;
@@ -925,8 +1030,9 @@ impl WorkspaceApp {
             self.saved_ssh_nodes.remove(saved_connection_id);
         }
 
-        let node_id = NodeId::new(format!("ssh-{}", self.next_ssh_node_id));
-        self.next_ssh_node_id += 1;
+        let node_id = next_available_ssh_root_node_id(&mut self.next_ssh_node_id, |node_id| {
+            self.node_router.contains_node(node_id) || self.ssh_nodes.contains_key(node_id)
+        });
         let origin = saved_connection_id
             .as_ref()
             .map(|id| NodeOrigin::Restored {
@@ -1053,6 +1159,7 @@ impl WorkspaceApp {
                 locale: None,
                 terminal: ConnectionTerminalOptions::default(),
                 public_mcp_open_token: None,
+                runtime_connection_attempt_id: None,
             }),
             cx,
         );
@@ -1667,6 +1774,23 @@ fn ssh_config_from_proxy_hop(hop: ProxyHopConfig, connect_timeout_seconds: u64) 
 #[cfg(test)]
 mod create_tests {
     use super::*;
+
+    #[test]
+    fn ssh_root_node_allocator_skips_restored_node_ids() {
+        let occupied_node_ids = HashSet::from([
+            NodeId::new("ssh-1"),
+            NodeId::new("ssh-2"),
+            NodeId::new("direct-restored"),
+        ]);
+        let mut next_sequence = 1;
+
+        let node_id = next_available_ssh_root_node_id(&mut next_sequence, |node_id| {
+            occupied_node_ids.contains(node_id)
+        });
+
+        assert_eq!(node_id, NodeId::new("ssh-3"));
+        assert_eq!(next_sequence, 4);
+    }
 
     fn saved_connection_metadata(id: &str) -> oxideterm_connections::SavedConnection {
         // This fixture deliberately has no runtime credential so reuse can be

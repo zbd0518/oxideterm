@@ -430,6 +430,9 @@ impl WorkspaceApp {
         }
 
         if let Some(session_id) = session_id {
+            self.standalone_connections.release_surface(
+                standalone_connections::StandaloneConnectionSurface::Terminal(session_id),
+            );
             self.release_public_mcp_terminal_for_closed_session(session_id, cx);
             self.serial_terminal_configs.remove(&session_id);
             self.telnet_terminal_profile_ids.remove(&session_id);
@@ -482,6 +485,9 @@ impl WorkspaceApp {
             .into_iter()
             .filter(|session_id| *session_id != active_session_id)
         {
+            self.standalone_connections.release_surface(
+                standalone_connections::StandaloneConnectionSurface::Terminal(session_id),
+            );
             self.release_public_mcp_terminal_for_closed_session(session_id, cx);
             self.serial_terminal_configs.remove(&session_id);
             self.telnet_terminal_profile_ids.remove(&session_id);
@@ -659,7 +665,7 @@ impl WorkspaceApp {
                         let accent = self.tokens.ui.accent;
                         let active_shadow = vec![gpui::BoxShadow {
                             inset: false,
-                            color: gpui::Hsla::from(rgba((accent << 8) | ACTIVE_PANE_SHADOW_ALPHA)),
+                            color: rgba((accent << 8) | ACTIVE_PANE_SHADOW_ALPHA).into_color(),
                             offset: gpui::point(px(0.0), px(0.0)),
                             blur_radius: px(ACTIVE_PANE_SHADOW_BLUR),
                             spread_radius: px(0.0),

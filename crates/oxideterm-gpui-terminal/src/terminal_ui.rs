@@ -1,8 +1,8 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use gpui::{
-    Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, Pixels, SharedString, TextRun,
-    Window, px, rgb,
+    Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, IntoColor, Pixels, SharedString,
+    TextRun, Window, px, rgb,
 };
 use oxideterm_render_policy::EffectiveRenderPolicy;
 use oxideterm_settings::{
@@ -442,7 +442,6 @@ pub struct TerminalSerialControlLabels {
     pub port_missing: String,
     pub port_unknown: String,
     pub refresh: String,
-    pub reconnect: String,
     pub send_break: String,
     pub dtr: String,
     pub rts: String,
@@ -462,7 +461,6 @@ pub struct TerminalSerialControlLabels {
     pub line_ending_crlf: String,
     pub line_ending_cr: String,
     pub line_ending_none: String,
-    pub reconnect_failed: String,
 }
 
 #[derive(Clone, Debug)]
@@ -539,7 +537,6 @@ impl Default for TerminalSerialControlLabels {
             port_missing: "Port missing".to_string(),
             port_unknown: "Port unknown".to_string(),
             refresh: "Refresh".to_string(),
-            reconnect: "Reconnect".to_string(),
             send_break: "Break".to_string(),
             dtr: "DTR".to_string(),
             rts: "RTS".to_string(),
@@ -559,7 +556,6 @@ impl Default for TerminalSerialControlLabels {
             line_ending_crlf: "CRLF".to_string(),
             line_ending_cr: "CR".to_string(),
             line_ending_none: "Raw".to_string(),
-            reconnect_failed: "Serial reconnect failed".to_string(),
         }
     }
 }
@@ -913,10 +909,11 @@ pub(crate) fn fallback_cell_width(window: &mut Window, font: &Font, font_size: P
     let run = TextRun {
         len: sample.len(),
         font: font.clone(),
-        color: rgb(0xe6e8eb).into(),
+        color: rgb(0xe6e8eb).into_color(),
         background_color: None,
         underline: None,
         strikethrough: None,
+        letter_spacing: None,
     };
 
     window

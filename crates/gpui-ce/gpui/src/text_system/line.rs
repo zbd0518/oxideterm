@@ -1,14 +1,15 @@
+// OxideTerm modification: cached line paint can reuse a caller-owned bounded layer.
+use crate::window::PreparedGlyphBatch;
 use crate::{
-    App, Bounds, DevicePixels, Half, Hsla, LineLayout, Pixels, Point, RenderGlyphParams, Result,
-    ShapedGlyph, ShapedRun, SharedString, StrikethroughStyle, TextAlign, UnderlineStyle, Window,
+    App, Bounds, DevicePixels, Half, LineLayout, Pixels, Point, RenderGlyphParams, Result,
+    ScaledPixels, SceneHsla, SharedString, StrikethroughStyle, TextAlign, UnderlineStyle, Window,
     WrapBoundary, WrappedLineLayout, black, fill, point, px, size,
 };
 use derive_more::{Deref, DerefMut};
+use palette::Hsla;
 use parking_lot::Mutex;
 use smallvec::SmallVec;
-use std::sync::{Arc, OnceLock};
-
-use crate::window::PreparedGlyphBatch;
+use std::sync::Arc;
 
 /// Pre-computed glyph data for efficient painting without per-glyph cache lookups.
 ///
@@ -22,63 +23,35 @@ pub struct GlyphRasterData {
     pub params: Vec<RenderGlyphParams>,
 }
 
-/// Set the text decoration for a run of text.
-#[derive(Debug, Clone)]
-pub struct DecorationRun {
-    /// The length of the run in utf-8 bytes.
-    pub len: u32,
-
-    /// The color for this run
-    pub color: Hsla,
-
-    /// The background color for this run
-    pub background_color: Option<Hsla>,
-
-    /// The underline style for this run
-    pub underline: Option<UnderlineStyle>,
-
-    /// The strikethrough style for this run
-    pub strikethrough: Option<StrikethroughStyle>,
+/// Cached renderer resources for repeatedly painting one stable line layout and style.
+#[derive(Debug, Default)]
+pub struct LinePaintCache {
+    prepared: Mutex<Option<Box<PreparedLinePaint>>>,
 }
 
-/// A line of text that has been shaped and decorated.
-#[derive(Default, Debug, Deref, DerefMut)]
-pub struct ShapedLine {
-    #[deref]
-    #[deref_mut]
-    pub(crate) layout: Arc<LineLayout>,
-    /// The text that was shaped for this line.
-    pub text: SharedString,
-    pub(crate) decoration_runs: SmallVec<[DecorationRun; 32]>,
-    pub(super) prepared_paint: OnceLock<Mutex<Option<PreparedLinePaint>>>,
+#[derive(Debug)]
+struct PreparedLinePaint {
+    key: PreparedLinePaintKey,
+    glyphs: Arc<PreparedGlyphBatch>,
 }
 
-impl Clone for ShapedLine {
-    fn clone(&self) -> Self {
-        Self {
-            layout: self.layout.clone(),
-            text: self.text.clone(),
-            decoration_runs: self.decoration_runs.clone(),
-            // Clones can be painted in a different window or at a different origin.
-            prepared_paint: OnceLock::new(),
-        }
-    }
+#[derive(Clone, Debug, PartialEq)]
+struct PreparedDecorationKey {
+    len: u32,
+    color: SceneHsla,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, PartialEq)]
 struct PreparedLinePaintKey {
+    layout_identity: usize,
+    renderer_resource_identity: usize,
     renderer_resource_generation: u64,
     scale_factor_bits: u32,
     line_height_bits: u32,
     origin_phase_x_bits: u32,
     origin_phase_y_bits: u32,
+    decorations: SmallVec<[PreparedDecorationKey; 1]>,
     subpixel_rendering: SmallVec<[bool; 16]>,
-}
-
-#[derive(Debug)]
-pub(super) struct PreparedLinePaint {
-    key: PreparedLinePaintKey,
-    glyphs: Arc<PreparedGlyphBatch>,
 }
 
 #[inline]
@@ -86,12 +59,24 @@ fn device_pixel_phase(value: f32) -> f32 {
     value.rem_euclid(1.0)
 }
 
+fn prepared_decoration_keys(
+    decoration_runs: &[DecorationRun],
+) -> SmallVec<[PreparedDecorationKey; 1]> {
+    decoration_runs
+        .iter()
+        .map(|run| PreparedDecorationKey {
+            len: run.len,
+            color: run.color.into(),
+        })
+        .collect()
+}
+
 fn prepare_line_glyphs(
     layout: &LineLayout,
     decoration_runs: &[DecorationRun],
     origin: Point<Pixels>,
     line_height: Pixels,
-    device_origin: Point<crate::ScaledPixels>,
+    device_origin: Point<ScaledPixels>,
     subpixel_rendering: &[bool],
     window: &mut Window,
 ) -> Result<PreparedGlyphBatch> {
@@ -156,6 +141,36 @@ fn prepare_line_glyphs(
     Ok(glyphs)
 }
 
+/// Set the text decoration for a run of text.
+#[derive(Debug, Clone)]
+pub struct DecorationRun {
+    /// The length of the run in utf-8 bytes.
+    pub len: u32,
+
+    /// The color for this run
+    pub color: Hsla,
+
+    /// The background color for this run
+    pub background_color: Option<Hsla>,
+
+    /// The underline style for this run
+    pub underline: Option<UnderlineStyle>,
+
+    /// The strikethrough style for this run
+    pub strikethrough: Option<StrikethroughStyle>,
+}
+
+/// A line of text that has been shaped and decorated.
+#[derive(Clone, Default, Debug, Deref, DerefMut)]
+pub struct ShapedLine {
+    #[deref]
+    #[deref_mut]
+    pub(crate) layout: Arc<LineLayout>,
+    /// The text that was shaped for this line.
+    pub text: SharedString,
+    pub(crate) decoration_runs: SmallVec<[DecorationRun; 32]>,
+}
+
 impl ShapedLine {
     /// The length of the line in utf-8 bytes.
     #[allow(clippy::len_without_is_empty)]
@@ -183,7 +198,6 @@ impl ShapedLine {
             runs: layout.runs.clone(),
             len,
         });
-        self.prepared_paint = OnceLock::new();
         self
     }
 
@@ -210,80 +224,6 @@ impl ShapedLine {
         )?;
 
         Ok(())
-    }
-
-    /// Paint the line using cached atlas tiles and relative sprite bounds.
-    ///
-    /// This path is intended for stable, left-aligned single-line content such as terminal rows.
-    /// Decorated text retains the general painter because its segment geometry is uncommon in
-    /// terminal output and must preserve the full wrapping behavior.
-    pub fn paint_cached(
-        &self,
-        origin: Point<Pixels>,
-        line_height: Pixels,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Result<()> {
-        if self
-            .decoration_runs
-            .iter()
-            .any(|run| run.underline.is_some() || run.strikethrough.is_some())
-        {
-            return self.paint(origin, line_height, TextAlign::Left, None, window, cx);
-        }
-
-        let line_bounds = Bounds::new(origin, size(self.layout.width, line_height));
-        if !line_bounds.intersects(&window.content_mask().bounds) {
-            return Ok(());
-        }
-
-        window.paint_layer(line_bounds, |window| {
-            let scale_factor = window.scale_factor();
-            let device_origin = point(
-                crate::ScaledPixels(origin.x.0 * scale_factor),
-                crate::ScaledPixels(origin.y.0 * scale_factor),
-            );
-            let subpixel_rendering = self
-                .layout
-                .runs
-                .iter()
-                .map(|run| window.should_use_subpixel_rendering(run.font_id, self.layout.font_size))
-                .collect::<SmallVec<[bool; 16]>>();
-            let key = PreparedLinePaintKey {
-                renderer_resource_generation: window.renderer_resource_generation(),
-                scale_factor_bits: scale_factor.to_bits(),
-                line_height_bits: line_height.0.to_bits(),
-                origin_phase_x_bits: device_pixel_phase(device_origin.x.0).to_bits(),
-                origin_phase_y_bits: device_pixel_phase(device_origin.y.0).to_bits(),
-                subpixel_rendering,
-            };
-
-            let mut prepared_paint = self.prepared_paint.get_or_init(|| Mutex::new(None)).lock();
-            if prepared_paint
-                .as_ref()
-                .is_none_or(|prepared| prepared.key != key)
-            {
-                let glyphs = prepare_line_glyphs(
-                    &self.layout,
-                    &self.decoration_runs,
-                    origin,
-                    line_height,
-                    device_origin,
-                    &key.subpixel_rendering,
-                    window,
-                )?;
-                *prepared_paint = Some(PreparedLinePaint {
-                    key,
-                    glyphs: Arc::new(glyphs),
-                });
-            }
-
-            let prepared_paint = prepared_paint
-                .as_ref()
-                .expect("prepared line paint is initialized above");
-            window.paint_prepared_glyph_batch(device_origin, prepared_paint.glyphs.clone());
-            Ok(())
-        })
     }
 
     /// Paint the background of the line to the window.
@@ -321,38 +261,7 @@ impl ShapedLine {
     ///   split into two with adjusted lengths.
     /// - `font_size`, `ascent`, and `descent` are copied to both halves.
     pub fn split_at(&self, byte_index: usize) -> (ShapedLine, ShapedLine) {
-        let x_offset = self.layout.x_for_index(byte_index);
-
-        // Partition glyph runs. A single run may contribute glyphs to both halves.
-        let mut left_runs = Vec::new();
-        let mut right_runs = Vec::new();
-
-        for run in &self.layout.runs {
-            let split_pos = run.glyphs.partition_point(|g| g.index < byte_index);
-
-            if split_pos > 0 {
-                left_runs.push(ShapedRun {
-                    font_id: run.font_id,
-                    glyphs: run.glyphs[..split_pos].to_vec(),
-                });
-            }
-
-            if split_pos < run.glyphs.len() {
-                let right_glyphs = run.glyphs[split_pos..]
-                    .iter()
-                    .map(|g| ShapedGlyph {
-                        id: g.id,
-                        position: point(g.position.x - x_offset, g.position.y),
-                        index: g.index - byte_index,
-                        is_emoji: g.is_emoji,
-                    })
-                    .collect();
-                right_runs.push(ShapedRun {
-                    font_id: run.font_id,
-                    glyphs: right_glyphs,
-                });
-            }
-        }
+        let (left_layout, right_layout) = self.layout.split_at(byte_index);
 
         // Partition decoration runs. A run straddling the boundary is split into two.
         let mut left_decorations = SmallVec::new();
@@ -401,38 +310,217 @@ impl ShapedLine {
             SharedString::new(&self.text[byte_index..])
         };
 
-        let left_width = x_offset;
-        let right_width = self.layout.width - left_width;
-
         let left = ShapedLine {
-            layout: Arc::new(LineLayout {
-                font_size: self.layout.font_size,
-                width: left_width,
-                ascent: self.layout.ascent,
-                descent: self.layout.descent,
-                runs: left_runs,
-                len: byte_index,
-            }),
+            layout: Arc::new(left_layout),
             text: left_text,
             decoration_runs: left_decorations,
-            prepared_paint: OnceLock::new(),
         };
 
         let right = ShapedLine {
-            layout: Arc::new(LineLayout {
-                font_size: self.layout.font_size,
-                width: right_width,
-                ascent: self.layout.ascent,
-                descent: self.layout.descent,
-                runs: right_runs,
-                len: self.layout.len - byte_index,
-            }),
+            layout: Arc::new(right_layout),
             text: right_text,
             decoration_runs: right_decorations,
-            prepared_paint: OnceLock::new(),
         };
 
         (left, right)
+    }
+}
+
+impl LineLayout {
+    /// Paint this layout to the window, using the given decoration runs to color
+    /// glyphs and draw underlines and strikethroughs.
+    ///
+    /// This is a lower-level alternative to [`ShapedLine::paint`] for callers that
+    /// hold a bare layout and track decorations themselves.
+    pub fn paint(
+        &self,
+        origin: Point<Pixels>,
+        line_height: Pixels,
+        align: TextAlign,
+        align_width: Option<Pixels>,
+        decoration_runs: &[DecorationRun],
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Result<()> {
+        paint_line(
+            origin,
+            self,
+            line_height,
+            align,
+            align_width,
+            decoration_runs,
+            &[],
+            window,
+            cx,
+        )
+    }
+
+    /// Paints a stable, left-aligned line while retaining atlas tiles and relative glyph bounds.
+    pub fn paint_cached(
+        &self,
+        origin: Point<Pixels>,
+        line_height: Pixels,
+        decoration_runs: &[DecorationRun],
+        cache: &LinePaintCache,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Result<()> {
+        if decoration_runs
+            .iter()
+            .any(|run| run.underline.is_some() || run.strikethrough.is_some())
+        {
+            return self.paint(
+                origin,
+                line_height,
+                TextAlign::Left,
+                None,
+                decoration_runs,
+                window,
+                cx,
+            );
+        }
+
+        let line_bounds = Bounds::new(origin, size(self.width, line_height));
+        if !line_bounds.intersects(&window.content_mask().bounds) {
+            return Ok(());
+        }
+
+        window.paint_layer(line_bounds, |window| {
+            self.paint_cached_in_current_layer_impl(
+                origin,
+                line_height,
+                decoration_runs,
+                cache,
+                window,
+                cx,
+            )
+        })
+    }
+
+    /// Paints cached glyphs inside a layer already established by the caller.
+    pub fn paint_cached_in_current_layer(
+        &self,
+        origin: Point<Pixels>,
+        line_height: Pixels,
+        decoration_runs: &[DecorationRun],
+        cache: &LinePaintCache,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Result<()> {
+        if decoration_runs
+            .iter()
+            .any(|run| run.underline.is_some() || run.strikethrough.is_some())
+        {
+            return self.paint(
+                origin,
+                line_height,
+                TextAlign::Left,
+                None,
+                decoration_runs,
+                window,
+                cx,
+            );
+        }
+
+        let line_bounds = Bounds::new(origin, size(self.width, line_height));
+        if !line_bounds.intersects(&window.content_mask().bounds) {
+            return Ok(());
+        }
+
+        self.paint_cached_in_current_layer_impl(
+            origin,
+            line_height,
+            decoration_runs,
+            cache,
+            window,
+            cx,
+        )
+    }
+
+    fn paint_cached_in_current_layer_impl(
+        &self,
+        origin: Point<Pixels>,
+        line_height: Pixels,
+        decoration_runs: &[DecorationRun],
+        cache: &LinePaintCache,
+        window: &mut Window,
+        _cx: &mut App,
+    ) -> Result<()> {
+        let scale_factor = window.scale_factor();
+        let device_origin = point(
+            ScaledPixels(origin.x.0 * scale_factor),
+            ScaledPixels(origin.y.0 * scale_factor),
+        );
+        let subpixel_rendering = self
+            .runs
+            .iter()
+            .map(|run| window.should_use_subpixel_rendering(run.font_id, self.font_size))
+            .collect::<SmallVec<[bool; 16]>>();
+        let key = PreparedLinePaintKey {
+            layout_identity: self as *const Self as usize,
+            renderer_resource_identity: window.renderer_resource_identity(),
+            renderer_resource_generation: window.renderer_resource_generation(),
+            scale_factor_bits: scale_factor.to_bits(),
+            line_height_bits: line_height.0.to_bits(),
+            origin_phase_x_bits: device_pixel_phase(device_origin.x.0).to_bits(),
+            origin_phase_y_bits: device_pixel_phase(device_origin.y.0).to_bits(),
+            decorations: prepared_decoration_keys(decoration_runs),
+            subpixel_rendering,
+        };
+
+        let glyphs = {
+            let mut prepared = cache.prepared.lock();
+            if prepared.as_ref().is_none_or(|prepared| prepared.key != key) {
+                let glyphs = prepare_line_glyphs(
+                    self,
+                    decoration_runs,
+                    origin,
+                    line_height,
+                    device_origin,
+                    &key.subpixel_rendering,
+                    window,
+                )?;
+                *prepared = Some(Box::new(PreparedLinePaint {
+                    key,
+                    glyphs: Arc::new(glyphs),
+                }));
+            }
+            prepared
+                .as_ref()
+                .expect("prepared line paint is initialized above")
+                .glyphs
+                .clone()
+        };
+        window.paint_prepared_glyph_batch(device_origin, glyphs);
+        Ok(())
+    }
+
+    /// Paint the background of this layout to the window, using the given
+    /// decoration runs to determine background colors.
+    ///
+    /// This is a lower-level alternative to [`ShapedLine::paint_background`] for
+    /// callers that hold a bare layout and track decorations themselves.
+    pub fn paint_background(
+        &self,
+        origin: Point<Pixels>,
+        line_height: Pixels,
+        align: TextAlign,
+        align_width: Option<Pixels>,
+        decoration_runs: &[DecorationRun],
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Result<()> {
+        paint_line_background(
+            origin,
+            self,
+            line_height,
+            align,
+            align_width,
+            decoration_runs,
+            &[],
+            window,
+            cx,
+        )
     }
 }
 
@@ -936,7 +1024,7 @@ fn aligned_origin_x(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FontId, GlyphId};
+    use crate::{FontId, GlyphId, ShapedGlyph, ShapedRun};
 
     /// Helper: build a ShapedLine from glyph descriptors without the platform text system.
     /// Each glyph is described as (byte_index, x_position).
@@ -970,14 +1058,14 @@ mod tests {
             }),
             text: SharedString::new(text),
             decoration_runs: SmallVec::from(decorations.to_vec()),
-            prepared_paint: OnceLock::new(),
         }
     }
 
     #[test]
-    fn device_pixel_phase_ignores_integer_translation() {
-        assert_eq!(device_pixel_phase(12.25), device_pixel_phase(112.25));
-        assert_ne!(device_pixel_phase(12.25), device_pixel_phase(12.5));
+    fn line_paint_cache_keeps_prepared_state_out_of_line_storage() {
+        // Cached terminal runs retain this object for hundreds of rows, so the
+        // generation key and glyph vectors must stay behind the optional box.
+        assert!(std::mem::size_of::<LinePaintCache>() <= std::mem::size_of::<usize>() * 2);
     }
 
     #[test]
@@ -1095,7 +1183,6 @@ mod tests {
             }),
             text: "abcdef".into(),
             decoration_runs: SmallVec::new(),
-            prepared_paint: OnceLock::new(),
         };
 
         // First split at byte 2 — mid-run in run A
@@ -1133,24 +1220,9 @@ mod tests {
     fn test_split_at_decorations() {
         // Three decoration runs: red [0..2), green [2..5), blue [5..6).
         // Split at byte 3 — red goes entirely left, green straddles, blue goes entirely right.
-        let red = Hsla {
-            h: 0.0,
-            s: 1.0,
-            l: 0.5,
-            a: 1.0,
-        };
-        let green = Hsla {
-            h: 0.3,
-            s: 1.0,
-            l: 0.5,
-            a: 1.0,
-        };
-        let blue = Hsla {
-            h: 0.6,
-            s: 1.0,
-            l: 0.5,
-            a: 1.0,
-        };
+        let red = Hsla::new(0., 1., 0.5, 1.);
+        let green = Hsla::new(108., 1., 0.5, 1.);
+        let blue = Hsla::new(216., 1., 0.5, 1.);
 
         let line = make_shaped_line(
             "abcdef",

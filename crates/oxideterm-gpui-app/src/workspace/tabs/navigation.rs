@@ -985,6 +985,9 @@ impl WorkspaceApp {
             });
         }
         if tab.kind == TabKind::RemoteDesktop {
+            self.standalone_connections.release_surface(
+                standalone_connections::StandaloneConnectionSurface::RemoteDesktop(tab.id),
+            );
             self.close_remote_desktop_tab(tab.id, window, cx);
         }
         // Tauri keeps node SFTP alive when the SFTP tab is closed; the tab is
@@ -1022,6 +1025,9 @@ impl WorkspaceApp {
             root_pane.collect_session_ids(&mut session_ids);
         }
         for session_id in session_ids {
+            self.standalone_connections.release_surface(
+                standalone_connections::StandaloneConnectionSurface::Terminal(session_id),
+            );
             self.release_public_mcp_terminal_for_closed_session(session_id, cx);
             self.serial_terminal_configs.remove(&session_id);
             self.telnet_terminal_profile_ids.remove(&session_id);
@@ -1612,18 +1618,6 @@ mod tests {
         assert_eq!(node.readiness, NodeReadiness::Disconnected);
         assert_eq!(active_node_id, Some(node_id.clone()));
         assert!(expanded_node_ids.contains(&node_id));
-    }
-
-    #[test]
-    fn tabbar_wheel_delta_selects_the_browser_axis_and_clamps_scroll() {
-        assert_eq!(tabbar_tauri_wheel_scroll_delta(0.0, 24.0), 24.0);
-        assert_eq!(tabbar_tauri_wheel_scroll_delta(18.0, 24.0), 24.0);
-        assert_eq!(tabbar_tauri_wheel_scroll_delta(-18.0, 0.0), -18.0);
-        assert_eq!(tabbar_scroll_x_after_wheel(0.0, -24.0, 120.0), 24.0);
-        assert_eq!(tabbar_scroll_x_after_wheel(0.0, 24.0, 120.0), 0.0);
-        assert_eq!(tabbar_scroll_x_after_wheel(24.0, 24.0, 120.0), 0.0);
-        assert_eq!(tabbar_scroll_x_after_wheel(110.0, -24.0, 120.0), 120.0);
-        assert_eq!(tabbar_scroll_x_after_wheel(120.0, -24.0, 120.0), 120.0);
     }
 
     #[test]

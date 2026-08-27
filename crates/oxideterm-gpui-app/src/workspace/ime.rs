@@ -2,8 +2,8 @@ use std::{cell::RefCell, collections::HashMap, fmt, ops::Range, rc::Rc, time::In
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, Element, ElementId, Entity, FocusHandle, GlobalElementId,
-    InputHandler, InspectorElementId, Keystroke, LayoutId, Pixels, Point, SharedString, Style,
-    TextRun, Timer, UTF16Selection, Window, font, point, px, rgb,
+    InputHandler, InspectorElementId, IntoColor, Keystroke, LayoutId, Pixels, Point, SharedString,
+    Style, TextRun, Timer, UTF16Selection, Window, font, point, px, rgb,
 };
 use oxideterm_editor_core::utf16::{
     byte_index_for_utf16, control_k_delete_end, floor_char_boundary, line_end_for_utf16_offset,
@@ -19,7 +19,6 @@ use super::connection_monitor::HostToolsTextInput;
 use super::file_manager::FileManagerInput;
 use super::forwards::ForwardInput;
 use super::graphics::GraphicsInput;
-use super::launcher::LauncherInput;
 use super::new_connection::{
     CONNECTION_NOTES_LINE_HEIGHT, CONNECTION_NOTES_VERTICAL_PADDING, NewConnectionField,
     refresh_connection_timeout_seconds, refresh_identity_agent_availability,
@@ -137,7 +136,6 @@ pub(super) enum WorkspaceImeTarget {
     SessionManager(SessionManagerInput),
     Forwards(ForwardInput),
     FileManager(FileManagerInput),
-    Launcher(LauncherInput),
     Graphics(GraphicsInput),
     TabRename,
     AiModelSelectorSearch,
@@ -510,7 +508,6 @@ impl WorkspaceImeTarget {
             Self::SessionManager(input) => 1_500 + input.anchor_key(),
             Self::Forwards(input) => 1_700 + input.anchor_key(),
             Self::FileManager(input) => 1_800 + input.anchor_key(),
-            Self::Launcher(input) => 1_850 + input.anchor_key(),
             Self::Graphics(input) => 1_875 + input.anchor_key(),
             Self::TabRename => 1_890,
             Self::AiModelSelectorSearch => 1_895,
@@ -1075,14 +1072,6 @@ impl WorkspaceApp {
             && let Some(input) = self.file_manager.read(cx).focused_input()
         {
             return Some(WorkspaceImeTarget::FileManager(input));
-        }
-
-        if self
-            .active_tab(cx)
-            .is_some_and(|tab| tab.kind == oxideterm_workspace::TabKind::Launcher)
-            && let Some(input) = self.launcher.read(cx).focused_input()
-        {
-            return Some(WorkspaceImeTarget::Launcher(input));
         }
 
         if self
@@ -1794,10 +1783,11 @@ impl WorkspaceApp {
         let run = TextRun {
             len: shared.len(),
             font,
-            color: rgb(self.tokens.ui.text).into(),
+            color: rgb(self.tokens.ui.text).into_color(),
             background_color: None,
             underline: None,
             strikethrough: None,
+            letter_spacing: None,
         };
         window
             .text_system()
@@ -1985,14 +1975,6 @@ impl WorkspaceApp {
                 let file_manager = self.file_manager.read(cx);
                 if file_manager.focused_input() == Some(input) {
                     Some(file_manager.input_value(input).to_string())
-                } else {
-                    None
-                }
-            }
-            WorkspaceImeTarget::Launcher(input) => {
-                let launcher = self.launcher.read(cx);
-                if launcher.focused_input() == Some(input) {
-                    Some(launcher.input_value(input).to_string())
                 } else {
                     None
                 }
@@ -2860,14 +2842,6 @@ impl WorkspaceApp {
                     if input == FileManagerInput::Path {
                         self.refresh_file_manager_path_completion(cx);
                     }
-                    self.show_active_input_caret(cx);
-                    cx.notify();
-                }
-            }
-            WorkspaceImeTarget::Launcher(input) => {
-                if self.launcher.update(cx, |launcher, cx| {
-                    launcher.replace_input(input, replacement_range, text, cx)
-                }) {
                     self.show_active_input_caret(cx);
                     cx.notify();
                 }
