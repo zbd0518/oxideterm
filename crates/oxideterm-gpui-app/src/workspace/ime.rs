@@ -1,9 +1,10 @@
 use std::{cell::RefCell, collections::HashMap, fmt, ops::Range, rc::Rc, time::Instant};
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, Element, ElementId, Entity, FocusHandle, GlobalElementId,
-    InputHandler, InspectorElementId, IntoColor, Keystroke, LayoutId, Pixels, Point, SharedString,
-    Style, TextRun, Timer, UTF16Selection, Window, font, point, px, rgb,
+    App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, Entity, FocusHandle,
+    GlobalElementId, InputHandler, InspectorElementId, InteractiveElement, IntoColor, IntoElement,
+    Keystroke, LayoutId, MouseButton, Pixels, Point, SharedString, Style, Styled, TextRun, Timer,
+    UTF16Selection, Window, font, point, px, rgb,
 };
 use oxideterm_editor_core::utf16::{
     byte_index_for_utf16, control_k_delete_end, floor_char_boundary, line_end_for_utf16_offset,
@@ -31,7 +32,8 @@ use oxideterm_gpui_settings_view::SettingsInput;
 use oxideterm_gpui_ui::{
     tauri_ui_font_family,
     text_input::{
-        TextInputAnchor, TextInputAnchorId, TextInputContentAlign, text_input_secret_mask,
+        TextInputAnchor, TextInputAnchorId, TextInputAnchorProbe, TextInputContentAlign,
+        text_input_anchor_probe, text_input_secret_mask,
     },
 };
 use zeroize::{Zeroize, Zeroizing};
@@ -886,6 +888,48 @@ impl WorkspaceApp {
         self.text_input_anchors.update(anchor);
     }
 
+    /// Applies the shared pointer, focus, selection, and anchor behavior for a
+    /// Workspace-owned single-line input without taking ownership of its text.
+    pub(super) fn text_input_with_workspace_ime<E>(
+        &self,
+        target: WorkspaceImeTarget,
+        input: E,
+        prepare_focus: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+        cx: &Context<Self>,
+    ) -> TextInputAnchorProbe
+    where
+        E: IntoElement + InteractiveElement + Styled,
+    {
+        let anchors = self.text_input_anchors.clone();
+        text_input_anchor_probe(
+            target.anchor_id(),
+            input
+                .cursor(CursorStyle::IBeam)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                        // Domain state must identify the active input before the
+                        // shared IME resolves its text and selection geometry.
+                        prepare_focus(this, cx);
+                        this.ime_marked_text = None;
+                        window.focus(&this.focus_handle, cx);
+                        this.begin_ime_selection_from_mouse_down(target, event, window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .on_mouse_move(
+                    cx.listener(|this, event: &gpui::MouseMoveEvent, window, cx| {
+                        this.update_ime_selection_drag_from_mouse_move(event, window, cx);
+                    }),
+                ),
+            move |anchor, _window, _cx| {
+                // Geometry is frame-local layout state and does not require a
+                // WorkspaceApp update or an additional render notification.
+                anchors.update(anchor);
+            },
+        )
+    }
+
     pub(super) fn host_tools_plain_text_ime_frame(
         &self,
         input: HostToolsTextInput,
@@ -1274,12 +1318,12 @@ impl WorkspaceApp {
         extend: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        let Some(index) = self.ime_index_for_position(target, position, window, cx) else {
+    ) -> bool {
+        let Some(index) = self.ime_index_for_selection_start(target, position, window, cx) else {
             if self.clear_ime_selection() {
                 cx.notify();
             }
-            return;
+            return false;
         };
 
         let anchor = if extend {
@@ -1301,6 +1345,7 @@ impl WorkspaceApp {
         self.set_ime_selection_from_anchor(target, anchor, index);
         self.ime_marked_text = None;
         cx.notify();
+        true
     }
 
     pub(super) fn begin_ime_selection_from_mouse_down(
@@ -1309,25 +1354,31 @@ impl WorkspaceApp {
         event: &gpui::MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         // This helper owns the repaint notification for all mouse-down
         // selection paths, so callers must not issue a second cx.notify().
         if event.click_count <= 1 || event.modifiers.shift {
-            self.begin_ime_selection(target, event.position, event.modifiers.shift, window, cx);
-            return;
+            return self.begin_ime_selection(
+                target,
+                event.position,
+                event.modifiers.shift,
+                window,
+                cx,
+            );
         }
 
-        let Some(index) = self.ime_index_for_position(target, event.position, window, cx) else {
+        let Some(index) = self.ime_index_for_selection_start(target, event.position, window, cx)
+        else {
             if self.clear_ime_selection() {
                 cx.notify();
             }
-            return;
+            return false;
         };
         let Some(text) = self.text_for_ime_target(target, cx) else {
             if self.clear_ime_selection() {
                 cx.notify();
             }
-            return;
+            return false;
         };
         let text_len = text.encode_utf16().count();
         let range = if event.click_count >= 3 {
@@ -1348,6 +1399,7 @@ impl WorkspaceApp {
         self.ime_drag_selection = None;
         self.ime_marked_text = None;
         cx.notify();
+        true
     }
 
     pub(super) fn update_ime_selection_drag(
@@ -1388,7 +1440,7 @@ impl WorkspaceApp {
             };
             utf16_offset_for_byte_index(&text, byte_index)
         } else {
-            self.selectable_text_group_index_for_position(id, position)
+            self.selectable_text_group_closest_index_for_position(id, position)
                 .unwrap_or(text_len)
                 .min(text_len)
         };
@@ -1403,7 +1455,15 @@ impl WorkspaceApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !event.dragging() || self.ime_drag_selection.is_none() {
+        if self.ime_drag_selection.is_none() {
+            return;
+        }
+        if !event.dragging() {
+            // Selectable text can sit inside an occluding virtual list, so its
+            // own move handler must recover a release that never reached the
+            // workspace root instead of retaining global input ownership.
+            self.finish_ime_selection_drag(cx);
+            self.stop_selectable_text_autoscroll();
             return;
         }
         self.update_ime_selection_drag(event.position, window, cx);
@@ -1467,7 +1527,7 @@ impl WorkspaceApp {
         }
 
         if let WorkspaceImeTarget::ReadOnlyText(id) = target
-            && let Some(index) = self.selectable_text_group_index_for_position(id, position)
+            && let Some(index) = self.selectable_text_group_closest_index_for_position(id, position)
         {
             return Some(index.min(text_len));
         }
@@ -1536,6 +1596,32 @@ impl WorkspaceApp {
             ));
         }
         Some(self.ime_index_for_relative_x(target, &text, relative_x, window))
+    }
+
+    fn ime_index_for_selection_start(
+        &self,
+        target: WorkspaceImeTarget,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &App,
+    ) -> Option<usize> {
+        let WorkspaceImeTarget::ReadOnlyText(id) = target else {
+            // Editable controls intentionally map padding and trailing space to
+            // the nearest caret position across their complete input surface.
+            return self.ime_index_for_position(target, position, window, cx);
+        };
+        let text = self.text_for_ime_target(target, cx)?;
+        if text.is_empty() {
+            return None;
+        }
+
+        if let Some(layout) = self.selectable_text_layouts.get(&id) {
+            let byte_index = layout.index_for_position(position).ok()?.min(text.len());
+            return Some(utf16_offset_for_byte_index(&text, byte_index));
+        }
+
+        self.selectable_text_group_exact_index_for_position(id, position)
+            .map(|index| index.min(text.encode_utf16().count()))
     }
 
     fn multiline_ime_index_for_position(

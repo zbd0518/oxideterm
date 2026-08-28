@@ -443,8 +443,10 @@ impl WorkspaceApp {
                         .text_size(px(self.tokens.metrics.sidebar_title_font_size))
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(rgb(theme.text_muted))
+                        // A title inside the native drag region must never start
+                        // read-only text selection or retain pointer ownership.
                         .child(self.render_display_text_with_role(
-                            SelectableTextRole::PlainDocument,
+                            SelectableTextRole::NonSelectable,
                             "sidebar-header-title",
                             title_key,
                             title,
@@ -1461,7 +1463,10 @@ impl WorkspaceApp {
                             .text_center()
                             .text_size(px(self.tokens.metrics.empty_sidebar_title_font_size))
                             .text_color(rgb(theme.text_muted))
-                            .child(self.render_selectable_display_text(
+                            // Empty-state guidance is interface chrome, not
+                            // user data that should start a text selection.
+                            .child(self.render_display_text_with_role(
+                                SelectableTextRole::NonSelectable,
                                 "sessions-sidebar-empty-title",
                                 (),
                                 self.i18n.t("sessions.tree.no_sessions"),
@@ -1476,7 +1481,8 @@ impl WorkspaceApp {
                             .text_center()
                             .text_size(px(self.tokens.metrics.empty_sidebar_subtitle_font_size))
                             .text_color(rgb(theme.text_muted))
-                            .child(self.render_selectable_display_text(
+                            .child(self.render_display_text_with_role(
+                                SelectableTextRole::NonSelectable,
                                 "sessions-sidebar-empty-subtitle",
                                 (),
                                 self.i18n.t("sessions.tree.click_to_add"),
