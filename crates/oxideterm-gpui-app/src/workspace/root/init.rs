@@ -36,12 +36,10 @@ impl WorkspaceApp {
         // process-owned index and never copies the document into credential storage.
         let local_terminal_command_history =
             SharedTerminalCommandHistory::from_commands(load_local_shell_history_commands());
-        let session_log_directory = settings_store
-            .path()
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("logs")
-            .join("terminal");
+        let session_log_directory = settings::terminal_session_log_root_directory(
+            settings_store.path(),
+            settings.terminal.session_log.directory.as_deref(),
+        );
         let session_log_retention_days = settings.terminal.session_log.retention_days.max(0) as u64;
         cx.background_executor()
             .spawn(async move {
@@ -1114,14 +1112,11 @@ impl WorkspaceApp {
         let clear_screen_shortcut = clear_screen_shortcut
             .as_ref()
             .map(crate::keybindings::format_combo);
-        let session_log_directory = self
-            .settings_store
-            .path()
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("logs")
-            .join("terminal");
         let session_log_settings = &terminal.session_log;
+        let session_log_directory = settings::terminal_session_log_root_directory(
+            self.settings_store.path(),
+            session_log_settings.directory.as_deref(),
+        );
         TerminalUiPreferences {
             font_family: terminal
                 .font_family
@@ -1246,6 +1241,7 @@ impl WorkspaceApp {
                 send_mode: self.i18n.t("terminal.serial_control.send_mode"),
                 display_mode: self.i18n.t("terminal.serial_control.display_mode"),
                 line_ending: self.i18n.t("terminal.serial_control.line_ending"),
+                output_line_ending: self.i18n.t("terminal.serial_control.output_line_ending"),
                 local_echo: self.i18n.t("terminal.serial_control.local_echo"),
                 text_mode: self.i18n.t("terminal.serial_control.text_mode"),
                 hex_mode: self.i18n.t("terminal.serial_control.hex_mode"),
@@ -1285,10 +1281,14 @@ impl WorkspaceApp {
             },
             session_log_options: Some(TerminalSessionLogOptions {
                 directory: session_log_directory,
+                directory_template: session_log_settings.directory_template.clone(),
                 include_control_sequences: session_log_settings.include_control_sequences,
                 retention_days: session_log_settings.retention_days.max(0) as u64,
-                max_file_bytes: (session_log_settings.max_file_size_mib.max(1) as u64)
-                    .saturating_mul(1024 * 1024),
+                // Zero is the explicit unlimited setting; positive values keep a byte boundary.
+                max_file_bytes: u64::try_from(session_log_settings.max_file_size_mib)
+                    .ok()
+                    .filter(|size_mib| *size_mib > 0)
+                    .map(|size_mib| size_mib.saturating_mul(1024 * 1024)),
                 file_name_template: session_log_settings.file_name_template.clone(),
                 content_template: session_log_settings.content_template.clone(),
                 file_mode: session_log_settings.file_mode,

@@ -83,6 +83,7 @@ pub(crate) struct TerminalElement {
     viewport_rows: usize,
     scrollbar_display_offset: f32,
     scroll_y_offset: Pixels,
+    scroll_x_offset: Pixels,
     command_mark_gutter_width: f32,
 }
 
@@ -168,6 +169,13 @@ pub(crate) struct TerminalCursor {
 pub(crate) struct TerminalScrollbar {
     pub(crate) top: f32,
     pub(crate) height: f32,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct TerminalHorizontalScrollbar {
+    pub(crate) left: f32,
+    pub(crate) width: f32,
+    pub(crate) max_scroll: f32,
 }
 
 #[derive(Clone)]
@@ -294,6 +302,12 @@ struct RecentCache<K, V> {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct TerminalLayoutPerformance {
+    #[cfg(feature = "bench")]
+    pub(crate) semantic_roles_micros: u64,
+    #[cfg(feature = "bench")]
+    pub(crate) highlights_micros: u64,
+    #[cfg(feature = "bench")]
+    pub(crate) semantic_command_lines: usize,
     pub(crate) layout_micros: u64,
     pub(crate) paint_micros: u64,
     pub(crate) cache_hit_percent: u8,
@@ -538,6 +552,7 @@ impl TerminalElement {
             viewport_rows,
             scrollbar_display_offset,
             scroll_y_offset: px(0.0),
+            scroll_x_offset: px(0.0),
             command_mark_gutter_width: 0.0,
         }
     }
@@ -638,6 +653,11 @@ impl TerminalElement {
         self
     }
 
+    pub(crate) fn scroll_x_offset(mut self, scroll_x_offset: Pixels) -> Self {
+        self.scroll_x_offset = scroll_x_offset.max(px(0.0));
+        self
+    }
+
     pub(crate) fn command_mark_gutter_width(mut self, width: f32) -> Self {
         self.command_mark_gutter_width = width.max(0.0);
         self
@@ -704,13 +724,29 @@ impl TerminalElement {
         mut cache: Option<&mut TerminalLayoutCache>,
     ) -> TerminalElementLayout {
         let mut backgrounds = Vec::new();
-        let semantic_roles = self.semantic_roles_for_rows(visible_rows.clone());
         let logical_lines = self.logical_lines_for_rows(visible_rows.clone());
+        #[cfg(feature = "bench")]
+        let roles_started = Instant::now();
+        let semantic_roles = self.semantic_roles_for_lines(&logical_lines);
+        #[cfg(feature = "bench")]
+        if let Some(cache) = cache.as_deref_mut() {
+            cache.performance.semantic_roles_micros = duration_micros(roles_started.elapsed());
+            cache.performance.semantic_command_lines = semantic_roles
+                .values()
+                .filter(|role| **role == SemanticLineRole::Command)
+                .count();
+        }
+        #[cfg(feature = "bench")]
+        let highlights_started = Instant::now();
         let highlight_layout = if let Some(cache) = cache.as_deref_mut() {
             self.cached_highlight_layout_for_rows(&logical_lines, &semantic_roles, cache)
         } else {
             self.highlight_layout_for_logical_lines(&logical_lines)
         };
+        #[cfg(feature = "bench")]
+        if let Some(cache) = cache.as_deref_mut() {
+            cache.performance.highlights_micros = duration_micros(highlights_started.elapsed());
+        }
         let search_matches = map_rects_to_visual(
             &self.snapshot,
             self.bidi_enabled,
@@ -1300,23 +1336,23 @@ impl TerminalElement {
         }
     }
 
-    fn semantic_roles_for_rows(
+    fn semantic_roles_for_lines(
         &self,
-        visible_rows: Range<usize>,
+        logical_lines: &TerminalLogicalLineIndex,
     ) -> HashMap<Range<usize>, SemanticLineRole> {
         if !self.semantic_coloring {
             return HashMap::new();
         }
         let mut roles = HashMap::new();
-        for row_index in visible_rows {
-            let Some(rows) = logical_line_range_for_row(&self.snapshot, row_index) else {
-                continue;
-            };
-            // Wrapped rows share one semantic role, so the command marks are scanned once per
-            // logical line and the result is reused by highlights and row layout keys.
-            roles.entry(rows.clone()).or_insert_with(|| {
-                semantic_line_role_for_rows(&self.snapshot, &self.command_marks, rows)
-            });
+        // Layout already resolved wrapped ranges; sharing them avoids rescanning
+        // the same logical line for each physical row in the viewport.
+        for line in &logical_lines.lines {
+            let role = semantic_line_role_for_rows(
+                &self.snapshot,
+                &self.command_marks,
+                line.range.clone(),
+            );
+            roles.insert(line.range.clone(), role);
         }
         roles
     }
@@ -2069,7 +2105,8 @@ impl Element for TerminalElement {
         // timestamps remain a paint-only overlay and never affect text runs.
         let grid_gutter_width = timestamp_gutter_width + self.command_mark_gutter_width;
         let viewport_origin = viewport_timestamp_origin + point(px(grid_gutter_width), px(0.0));
-        let origin = timestamp_origin + point(px(grid_gutter_width), px(0.0));
+        let origin =
+            timestamp_origin + point(px(grid_gutter_width) - self.scroll_x_offset, px(0.0));
         let grid_viewport_width = px((f32::from(bounds.size.width) - grid_gutter_width).max(0.0));
         let viewport_mask_bounds = Bounds::new(
             viewport_timestamp_origin,
@@ -2104,6 +2141,20 @@ impl Element for TerminalElement {
                         rgba((self.theme.foreground << 8) | 0x2e),
                     ));
                 }
+            },
+        );
+        let grid_mask_bounds = Bounds::new(
+            viewport_origin,
+            size(
+                (grid_viewport_width - px(SCROLLBAR_RESERVED_WIDTH)).max(px(0.0)),
+                px(self.viewport_rows as f32 * self.metrics.line_height_f32()),
+            ),
+        );
+        window.with_content_mask(
+            Some(ContentMask {
+                bounds: grid_mask_bounds,
+            }),
+            |window| {
                 for rect in &layout.backgrounds {
                     paint_terminal_rect(rect, origin, &self.metrics, window);
                 }
@@ -2196,8 +2247,9 @@ impl Element for TerminalElement {
             },
         );
         if let Some(input) = &self.input {
+            let input_origin = viewport_origin - point(self.scroll_x_offset, px(0.0));
             let content_bounds = terminal_content_bounds_for_rows(
-                viewport_origin,
+                input_origin,
                 self.viewport_rows,
                 self.snapshot.cols,
                 &self.metrics,
@@ -2216,7 +2268,7 @@ impl Element for TerminalElement {
         {
             window.with_content_mask(
                 Some(ContentMask {
-                    bounds: viewport_mask_bounds,
+                    bounds: grid_mask_bounds,
                 }),
                 |window| {
                     paint_cursor(
@@ -2236,6 +2288,19 @@ impl Element for TerminalElement {
                 grid_viewport_width,
                 self.viewport_rows,
                 &self.metrics,
+                window,
+            );
+        }
+        if let Some(horizontal_scrollbar) = terminal_horizontal_scrollbar_for_viewport(
+            f32::from(grid_viewport_width) - SCROLLBAR_RESERVED_WIDTH,
+            timestamp_gutter_width,
+            f32::from(self.scroll_x_offset),
+        ) {
+            paint_horizontal_scrollbar(
+                horizontal_scrollbar,
+                viewport_origin,
+                grid_viewport_width - px(SCROLLBAR_RESERVED_WIDTH),
+                bounds.size.height,
                 window,
             );
         }

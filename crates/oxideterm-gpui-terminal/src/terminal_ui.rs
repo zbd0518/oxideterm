@@ -12,8 +12,8 @@ use oxideterm_terminal::{
     TerminalColor, TerminalCursorShape, TerminalEncoding, TrzszTransferPolicy,
 };
 use oxideterm_terminal_semantic::{
-    CompiledSemanticScheme, SemanticScheme, SemanticSchemeDocument, SemanticShellDialect,
-    compile_scheme_document, compiled_builtin_scheme,
+    CompiledSemanticScheme, SemanticClass, SemanticScheme, SemanticSchemeDocument,
+    SemanticShellDialect, compile_scheme_document, compiled_builtin_scheme,
 };
 use oxideterm_theme::{ThemeTokens, default_tokens};
 
@@ -36,6 +36,9 @@ pub(crate) const TERMINAL_CONTENT_PADDING: f32 = 0.0;
 // Command marks no longer reserve a left gutter; column-zero terminal text must
 // start at the pane edge.
 pub(crate) const TERMINAL_COMMAND_MARK_GUTTER_WIDTH: f32 = 0.0;
+const NESTED_SEMANTIC_COLOR_COUNT: u8 = 6;
+const TERMINAL_SEMANTIC_ERROR_LINE_BAND_OPACITY: f32 = 0.11;
+const TERMINAL_SEMANTIC_WARNING_LINE_BAND_OPACITY: f32 = 0.08;
 pub(crate) const OXIDETERM_TERMINAL_BACKGROUND: u32 = 0x0d0f12;
 pub(crate) const OXIDETERM_TERMINAL_FOREGROUND: u32 = 0xe6e8eb;
 pub(crate) const SCROLLBAR_WIDTH: f32 = 10.0;
@@ -458,6 +461,7 @@ pub struct TerminalSerialControlLabels {
     pub send_mode: String,
     pub display_mode: String,
     pub line_ending: String,
+    pub output_line_ending: String,
     pub local_echo: String,
     pub text_mode: String,
     pub hex_mode: String,
@@ -552,7 +556,8 @@ impl Default for TerminalSerialControlLabels {
             flow_hardware: "RTS/CTS".to_string(),
             send_mode: "Send".to_string(),
             display_mode: "Display".to_string(),
-            line_ending: "Line".to_string(),
+            line_ending: "TX line".to_string(),
+            output_line_ending: "RX line".to_string(),
             local_echo: "Echo".to_string(),
             text_mode: "Text".to_string(),
             hex_mode: "Hex".to_string(),
@@ -853,6 +858,86 @@ pub(crate) fn terminal_color_from_hex(hex: u32) -> TerminalColor {
     )
 }
 
+/// Resolves a semantic class through the custom scheme before falling back to terminal colors.
+pub fn terminal_semantic_color(
+    theme: &TerminalUiTheme,
+    class: SemanticClass,
+    semantic_scheme: &CompiledSemanticScheme,
+) -> u32 {
+    if let Some(color) = semantic_scheme
+        .color(class)
+        .and_then(|color| u32::from_str_radix(color.strip_prefix('#')?, 16).ok())
+    {
+        return color;
+    }
+    let terminal = theme.tokens.terminal;
+    match class {
+        SemanticClass::Command => terminal.green,
+        SemanticClass::Keyword => terminal.bright_magenta,
+        SemanticClass::Option => terminal.cyan,
+        SemanticClass::Operator => terminal.bright_yellow,
+        SemanticClass::String => terminal.yellow,
+        SemanticClass::Variable => terminal.bright_blue,
+        SemanticClass::Link => terminal.bright_cyan,
+        SemanticClass::Path => terminal.blue,
+        SemanticClass::Address => terminal.bright_green,
+        SemanticClass::Weekday => terminal.cyan,
+        SemanticClass::Month => terminal.yellow,
+        SemanticClass::Timestamp => terminal.green,
+        SemanticClass::PermissionRead => terminal.bright_cyan,
+        SemanticClass::PermissionWrite => terminal.bright_yellow,
+        SemanticClass::PermissionExecute => terminal.bright_green,
+        SemanticClass::PermissionSpecial => terminal.bright_magenta,
+        SemanticClass::Number => terminal.magenta,
+        SemanticClass::Comment => terminal.bright_black,
+        SemanticClass::Error => terminal.bright_red,
+        SemanticClass::Warning => terminal.bright_yellow,
+        SemanticClass::Success => terminal.bright_green,
+        SemanticClass::Info => terminal.bright_blue,
+    }
+}
+
+/// Resolves presentation variants while keeping the base semantic palette shared by every view.
+pub fn terminal_semantic_variant_color(
+    theme: &TerminalUiTheme,
+    class: SemanticClass,
+    style_variant: Option<u8>,
+    semantic_scheme: &CompiledSemanticScheme,
+) -> u32 {
+    let Some(depth) = style_variant.filter(|_| class == SemanticClass::Operator) else {
+        return terminal_semantic_color(theme, class, semantic_scheme);
+    };
+    let terminal = theme.tokens.terminal;
+    // Six terminal-theme colors keep nested delimiters distinct without creating a second palette.
+    match depth % NESTED_SEMANTIC_COLOR_COUNT {
+        0 => terminal.yellow,
+        1 => terminal.cyan,
+        2 => terminal.green,
+        3 => terminal.blue,
+        4 => terminal.red,
+        _ => terminal.magenta,
+    }
+}
+
+/// Returns the restrained line treatment used for explicit error and warning envelopes.
+pub fn terminal_semantic_line_band(
+    theme: &TerminalUiTheme,
+    class: SemanticClass,
+) -> Option<(u32, f32)> {
+    // Low-opacity bands retain the original terminal background and keep token text dominant.
+    match class {
+        SemanticClass::Error => Some((
+            theme.tokens.ui.error,
+            TERMINAL_SEMANTIC_ERROR_LINE_BAND_OPACITY,
+        )),
+        SemanticClass::Warning => Some((
+            theme.tokens.ui.warning,
+            TERMINAL_SEMANTIC_WARNING_LINE_BAND_OPACITY,
+        )),
+        _ => None,
+    }
+}
+
 impl TerminalUiTheme {
     pub fn new(background: u32, foreground: u32, cursor: u32) -> Self {
         Self {
@@ -962,8 +1047,16 @@ pub(crate) fn terminal_font_with_family_and_cjk(
     font_ligatures: bool,
     font_weight: f32,
 ) -> Font {
+    let configured_families = oxideterm_gpui_ui::css_font_family_stack(family);
+    let primary_family = configured_families
+        .first()
+        .cloned()
+        .unwrap_or_else(|| SharedString::from(TERMINAL_FONT));
     let mut fallback_families = Vec::new();
-    push_font_fallback(&mut fallback_families, family);
+    // Preserve the user-defined stack before appending built-in recovery fonts.
+    for configured_fallback in configured_families.iter().skip(1) {
+        push_font_fallback(&mut fallback_families, configured_fallback);
+    }
     // A bundled Latin monospace must precede optional CJK and system fallbacks.
     push_font_fallback(
         &mut fallback_families,
@@ -1006,7 +1099,7 @@ pub(crate) fn terminal_font_with_family_and_cjk(
     }
 
     Font {
-        family: SharedString::from(family.to_string()),
+        family: primary_family,
         features: terminal_font_features(font_ligatures),
         fallbacks: Some(FontFallbacks::from_fonts(fallback_families)),
         weight: FontWeight(font_weight.clamp(100.0, 900.0)),
@@ -1034,6 +1127,23 @@ pub(crate) fn terminal_font_features(font_ligatures: bool) -> FontFeatures {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_font_stack_uses_first_family_and_preserves_fallback_order() {
+        let font = terminal_font_with_family_and_cjk(
+            "\"Maple Mono\",\"Maple Mono NF CN\"",
+            None,
+            false,
+            400.0,
+        );
+        let fallbacks = font.fallbacks.expect("terminal font fallbacks");
+
+        assert_eq!(font.family.as_ref(), "Maple Mono");
+        assert_eq!(
+            fallbacks.fallback_list().first().map(String::as_str),
+            Some("Maple Mono NF CN")
+        );
+    }
 
     #[test]
     fn host_overrides_replace_only_terminal_protocol_defaults() {

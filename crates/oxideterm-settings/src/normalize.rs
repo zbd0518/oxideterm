@@ -7,7 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     ParsedTerminalSessionLogTemplate, TerminalSessionLogTemplateError, model::*,
-    parse_terminal_session_log_content_template, parse_terminal_session_log_file_name_template,
+    parse_terminal_session_log_content_template, parse_terminal_session_log_directory_template,
+    parse_terminal_session_log_file_name_template,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -747,7 +748,7 @@ pub fn sanitize_settings_value(raw: Value) -> Result<SanitizedSettings> {
             100 * 1024 * 1024 * 1024,
         ),
         ("terminal.sessionLog.retentionDays", 30, 0, 3650),
-        ("terminal.sessionLog.maxFileSizeMib", 100, 1, 4096),
+        ("terminal.sessionLog.maxFileSizeMib", 100, 0, 4096),
     ] {
         let segments: Vec<_> = path.split('.').collect();
         if let Some(value) = get_path_mut(&mut settings, &segments) {
@@ -788,6 +789,17 @@ pub fn sanitize_settings_value(raw: Value) -> Result<SanitizedSettings> {
             *value = json!(fallback);
             validation_warnings.push(format!("Reset invalid {path}"));
         }
+    }
+
+    if let Some(value) = get_path_mut(
+        &mut settings,
+        &["terminal", "sessionLog", "directoryTemplate"],
+    ) && value
+        .as_str()
+        .is_none_or(|template| parse_terminal_session_log_directory_template(template).is_err())
+    {
+        *value = json!("");
+        validation_warnings.push("Reset invalid terminal.sessionLog.directoryTemplate".to_string());
     }
 
     for (path, fallback, min, max) in [

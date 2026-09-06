@@ -7,6 +7,8 @@
 //! mapping between an input identity, its displayed value, and the validated
 //! mutation applied to `PersistedSettings`.
 
+use std::path::Path;
+
 use oxideterm_ai::{
     model_context_window_info, provider_id as ai_provider_id, provider_string as ai_provider_string,
 };
@@ -16,7 +18,8 @@ use oxideterm_settings::{
     MIN_AI_TOOL_MAX_CALLS_PER_ROUND, MIN_AI_TOOL_MAX_ROUNDS, MIN_TERMINAL_FONT_WEIGHT,
     PersistedSettings, RECOMMENDED_FOCUS_HANDOFF_COMMANDS, SettingsUpstreamProxyAuth,
     UpdateProxyMode, parse_terminal_session_log_content_template,
-    parse_terminal_session_log_file_name_template, reindex_highlight_rules,
+    parse_terminal_session_log_directory_template, parse_terminal_session_log_file_name_template,
+    reindex_highlight_rules,
 };
 use oxideterm_terminal_semantic::SEMANTIC_CLASSES;
 
@@ -126,6 +129,15 @@ pub fn persisted_settings_input_value(
         }
         SettingsInput::TerminalSessionLogMaxFileSizeMib => {
             settings.terminal.session_log.max_file_size_mib.to_string()
+        }
+        SettingsInput::TerminalSessionLogDirectory => settings
+            .terminal
+            .session_log
+            .directory
+            .clone()
+            .unwrap_or_default(),
+        SettingsInput::TerminalSessionLogDirectoryTemplate => {
+            settings.terminal.session_log.directory_template.clone()
         }
         SettingsInput::TerminalSessionLogFileNameTemplate => {
             settings.terminal.session_log.file_name_template.clone()
@@ -446,8 +458,28 @@ pub fn apply_persisted_settings_input_draft(
             .map(|value| settings.terminal.session_log.retention_days = value.clamp(0, 3650))
             .into(),
         SettingsInput::TerminalSessionLogMaxFileSizeMib => parse_i64(draft)
-            .map(|value| settings.terminal.session_log.max_file_size_mib = value.clamp(1, 4096))
+            .map(|value| settings.terminal.session_log.max_file_size_mib = value.clamp(0, 4096))
             .into(),
+        SettingsInput::TerminalSessionLogDirectory => {
+            let directory = draft.trim();
+            if directory.is_empty() {
+                settings.terminal.session_log.directory = None;
+                SettingsInputDraftApply::Applied
+            } else if Path::new(directory).is_absolute() {
+                settings.terminal.session_log.directory = Some(directory.to_string());
+                SettingsInputDraftApply::Applied
+            } else {
+                SettingsInputDraftApply::Invalid
+            }
+        }
+        SettingsInput::TerminalSessionLogDirectoryTemplate => {
+            if parse_terminal_session_log_directory_template(draft).is_err() {
+                SettingsInputDraftApply::Invalid
+            } else {
+                settings.terminal.session_log.directory_template = draft.to_string();
+                SettingsInputDraftApply::Applied
+            }
+        }
         SettingsInput::TerminalSessionLogFileNameTemplate => {
             if parse_terminal_session_log_file_name_template(draft).is_err() {
                 SettingsInputDraftApply::Invalid
@@ -877,7 +909,7 @@ mod tests {
     }
 
     #[test]
-    fn session_log_limits_accept_forever_retention_and_bound_file_size() {
+    fn session_log_limits_accept_unlimited_retention_and_file_size() {
         let mut settings = PersistedSettings::default();
 
         assert_eq!(
@@ -899,6 +931,16 @@ mod tests {
             SettingsInputDraftApply::Applied
         );
         assert_eq!(settings.terminal.session_log.max_file_size_mib, 4096);
+
+        assert_eq!(
+            apply_persisted_settings_input_draft(
+                &mut settings,
+                SettingsInput::TerminalSessionLogMaxFileSizeMib,
+                "0",
+            ),
+            SettingsInputDraftApply::Applied
+        );
+        assert_eq!(settings.terminal.session_log.max_file_size_mib, 0);
     }
 
     #[test]
@@ -1069,9 +1111,32 @@ mod tests {
     #[test]
     fn session_log_template_drafts_validate_before_mutating_settings() {
         let mut settings = PersistedSettings::default();
+        let original_directory = settings.terminal.session_log.directory.clone();
+        let original_directory_template = settings.terminal.session_log.directory_template.clone();
         let original_file_name = settings.terminal.session_log.file_name_template.clone();
         let original_content = settings.terminal.session_log.content_template.clone();
 
+        assert_eq!(
+            apply_persisted_settings_input_draft(
+                &mut settings,
+                SettingsInput::TerminalSessionLogDirectory,
+                "relative/logs",
+            ),
+            SettingsInputDraftApply::Invalid
+        );
+        assert_eq!(
+            apply_persisted_settings_input_draft(
+                &mut settings,
+                SettingsInput::TerminalSessionLogDirectoryTemplate,
+                "../outside",
+            ),
+            SettingsInputDraftApply::Invalid
+        );
+        assert_eq!(settings.terminal.session_log.directory, original_directory);
+        assert_eq!(
+            settings.terminal.session_log.directory_template,
+            original_directory_template
+        );
         assert_eq!(
             apply_persisted_settings_input_draft(
                 &mut settings,

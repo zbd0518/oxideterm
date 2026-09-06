@@ -374,6 +374,7 @@ impl Render for TerminalPane {
         .viewport_rows(viewport_rows)
         .scrollbar_display_offset(scrollbar_display_offset)
         .scroll_y_offset(smooth_scroll_y_offset)
+        .scroll_x_offset(self.horizontal_scroll_offset_px)
         .performance_metrics_enabled(performance_metrics_enabled)
         .command_mark_gutter_width(if command_mark_ui_visible {
             self.command_mark_gutter_width()
@@ -1091,6 +1092,11 @@ impl TerminalPane {
             labels.line_ending,
             serial_line_ending_label(status.runtime_options.line_ending, labels)
         );
+        let output_line_ending_label = format!(
+            "{} {}",
+            labels.output_line_ending,
+            serial_line_ending_label(status.runtime_options.output_line_ending, labels)
+        );
         let local_echo_label = format!(
             "{} {}",
             labels.local_echo,
@@ -1170,6 +1176,24 @@ impl TerminalPane {
                         window.prevent_default();
                         cx.stop_propagation();
                         this.cycle_serial_line_ending(cx);
+                    }),
+                ),
+            )
+            .child(
+                self.render_serial_control_button(
+                    output_line_ending_label,
+                    true,
+                    !matches!(
+                        status.runtime_options.output_line_ending,
+                        SerialLineEnding::None
+                    ),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event: &MouseDownEvent, window, cx| {
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        this.cycle_serial_output_line_ending(cx);
                     }),
                 ),
             )

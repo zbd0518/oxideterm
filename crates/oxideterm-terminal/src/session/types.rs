@@ -84,6 +84,7 @@ impl Default for SerialSendMode {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SerialRuntimeOptions {
     pub line_ending: SerialLineEnding,
+    pub output_line_ending: SerialLineEnding,
     pub display_mode: SerialDisplayMode,
     pub send_mode: SerialSendMode,
     pub local_echo: bool,
@@ -139,6 +140,9 @@ pub trait TerminalSessionBackend: Send {
     }
     fn read_pending(&mut self) -> bool;
     fn read_pending_with_budget(&mut self, budget: TerminalDrainBudget) -> TerminalDrainReport;
+    fn pending_output_flush_delay(&self) -> Option<Duration> {
+        None
+    }
     fn activity_receiver(&self) -> TerminalActivityReceiver;
     fn take_events(&mut self) -> Vec<TerminalEvent>;
     fn write_input(&mut self, bytes: &[u8]) -> Result<()>;

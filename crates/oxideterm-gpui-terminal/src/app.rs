@@ -72,7 +72,9 @@ use crate::trzsz_worker::{
 use image_cache::ImageRenderCache;
 pub(crate) use image_cache::TerminalRenderedImage;
 pub(crate) use ime::TerminalInputHandler;
-use scrollbar::{ScrollbarDrag, ScrollbarGeometry};
+use scrollbar::{
+    HorizontalScrollbarDrag, HorizontalScrollbarGeometry, ScrollbarDrag, ScrollbarGeometry,
+};
 
 #[derive(Clone, Debug)]
 enum TmuxPromptKind {
@@ -115,7 +117,9 @@ const TERMINAL_AUTOSUGGEST_MAX_CANDIDATES: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TerminalPaneEvent {
-    Exited { exit_code: Option<i32> },
+    Exited {
+        exit_code: Option<i32>,
+    },
     // Output contents stay pane-owned; consumers only learn that the visible buffer changed.
     OutputActivity,
     // CWD payloads stay pane-owned; Workspace only recomputes the active metadata key.
@@ -134,6 +138,11 @@ pub enum TerminalPaneEvent {
     TriggerMatchesAvailable,
     // Search completion is asynchronous; Workspace reads the latest pane-owned status.
     SearchStatusChanged,
+    // Persistence stays workspace-owned because panes do not own saved connection profiles.
+    SerialLineEndingsChanged {
+        input: Option<SerialLineEnding>,
+        output: Option<SerialLineEnding>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -263,6 +272,7 @@ pub enum TerminalSerialAction {
     SetRequestToSend(bool),
     SetLocalEcho(bool),
     SetLineEnding(SerialLineEnding),
+    SetOutputLineEnding(SerialLineEnding),
     SetDisplayMode(SerialDisplayMode),
     SetSendMode(SerialSendMode),
 }
@@ -297,6 +307,7 @@ fn terminal_maintenance_interval(
     process_refresh_remaining: Option<Duration>,
     pending_cwd_remaining: Option<Duration>,
     editor_expiry_remaining: Option<Duration>,
+    pending_output_flush_delay: Option<Duration>,
 ) -> Option<Duration> {
     if drain_budget_exhausted {
         return Some(drain_boost_interval);
@@ -308,6 +319,7 @@ fn terminal_maintenance_interval(
         process_refresh_remaining,
         pending_cwd_remaining,
         editor_expiry_remaining,
+        pending_output_flush_delay,
     ]
     .into_iter()
     .flatten()
@@ -479,6 +491,10 @@ pub struct TerminalPane {
     smooth_scroll_animation: Option<SmoothScrollAnimation>,
     smooth_scroll_snapshot_cache: Option<SmoothScrollSnapshotCache>,
     scrollbar_drag: Option<ScrollbarDrag>,
+    // Horizontal panning belongs to the visual timestamp overlay and never
+    // changes the backing PTY grid or remote window size.
+    horizontal_scroll_offset_px: Pixels,
+    horizontal_scrollbar_drag: Option<HorizontalScrollbarDrag>,
     tmux_separator_drag: Option<TmuxSeparatorDrag>,
     selection_autoscroll_position: Option<Point<Pixels>>,
     selection_autoscroll_scheduled: bool,
@@ -1127,6 +1143,8 @@ impl TerminalPane {
             smooth_scroll_animation: None,
             smooth_scroll_snapshot_cache: None,
             scrollbar_drag: None,
+            horizontal_scroll_offset_px: px(0.0),
+            horizontal_scrollbar_drag: None,
             tmux_separator_drag: None,
             selection_autoscroll_position: None,
             selection_autoscroll_scheduled: false,
@@ -1255,6 +1273,8 @@ impl TerminalPane {
 
     pub fn toggle_terminal_timestamps(&mut self, cx: &mut Context<Self>) {
         self.terminal_timestamps_enabled = !self.terminal_timestamps_enabled;
+        self.horizontal_scroll_offset_px = px(0.0);
+        self.horizontal_scrollbar_drag = None;
         // Timestamp visibility is paint-only. Do not restamp or resize here:
         // both would make old scrollback look like it was modified at toggle time.
         cx.notify();
@@ -1825,11 +1845,7 @@ impl TerminalPane {
                     .serial_runtime_options()
                     .ok_or_else(|| "Serial runtime options are unavailable.".to_string())?;
                 options.local_echo = enabled;
-                self.terminal
-                    .lock()
-                    .set_serial_runtime_options(options)
-                    .map_err(|error| error.to_string())?;
-                cx.notify();
+                self.update_serial_runtime_options(options, cx)?;
             }
             TerminalSerialAction::SetLineEnding(line_ending) => {
                 let mut options = self
@@ -1838,11 +1854,16 @@ impl TerminalPane {
                     .serial_runtime_options()
                     .ok_or_else(|| "Serial runtime options are unavailable.".to_string())?;
                 options.line_ending = line_ending;
-                self.terminal
+                self.update_serial_runtime_options(options, cx)?;
+            }
+            TerminalSerialAction::SetOutputLineEnding(line_ending) => {
+                let mut options = self
+                    .terminal
                     .lock()
-                    .set_serial_runtime_options(options)
-                    .map_err(|error| error.to_string())?;
-                cx.notify();
+                    .serial_runtime_options()
+                    .ok_or_else(|| "Serial runtime options are unavailable.".to_string())?;
+                options.output_line_ending = line_ending;
+                self.update_serial_runtime_options(options, cx)?;
             }
             TerminalSerialAction::SetDisplayMode(display_mode) => {
                 let mut options = self
@@ -1851,11 +1872,7 @@ impl TerminalPane {
                     .serial_runtime_options()
                     .ok_or_else(|| "Serial runtime options are unavailable.".to_string())?;
                 options.display_mode = display_mode;
-                self.terminal
-                    .lock()
-                    .set_serial_runtime_options(options)
-                    .map_err(|error| error.to_string())?;
-                cx.notify();
+                self.update_serial_runtime_options(options, cx)?;
             }
             TerminalSerialAction::SetSendMode(send_mode) => {
                 let mut options = self
@@ -1864,11 +1881,7 @@ impl TerminalPane {
                     .serial_runtime_options()
                     .ok_or_else(|| "Serial runtime options are unavailable.".to_string())?;
                 options.send_mode = send_mode;
-                self.terminal
-                    .lock()
-                    .set_serial_runtime_options(options)
-                    .map_err(|error| error.to_string())?;
-                cx.notify();
+                self.update_serial_runtime_options(options, cx)?;
             }
         }
         Ok(())
@@ -1935,14 +1948,36 @@ impl TerminalPane {
         options: SerialRuntimeOptions,
         cx: &mut Context<Self>,
     ) {
-        if self
-            .terminal
-            .lock()
-            .set_serial_runtime_options(options)
-            .is_ok()
-        {
-            cx.notify();
+        let _ = self.update_serial_runtime_options(options, cx);
+    }
+
+    fn update_serial_runtime_options(
+        &mut self,
+        options: SerialRuntimeOptions,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let previous_options = {
+            let mut terminal = self.terminal.lock();
+            let previous_options = terminal.serial_runtime_options();
+            terminal
+                .set_serial_runtime_options(options)
+                .map_err(|error| error.to_string())?;
+            previous_options
+        };
+        let changed_input = previous_options
+            .filter(|previous| previous.line_ending != options.line_ending)
+            .map(|_| options.line_ending);
+        let changed_output = previous_options
+            .filter(|previous| previous.output_line_ending != options.output_line_ending)
+            .map(|_| options.output_line_ending);
+        if changed_input.is_some() || changed_output.is_some() {
+            cx.emit(TerminalPaneEvent::SerialLineEndingsChanged {
+                input: changed_input,
+                output: changed_output,
+            });
         }
+        cx.notify();
+        Ok(())
     }
 
     fn cycle_serial_send_mode(&mut self, cx: &mut Context<Self>) {
@@ -1973,6 +2008,19 @@ impl TerminalPane {
             return;
         };
         options.line_ending = match options.line_ending {
+            SerialLineEnding::None => SerialLineEnding::Lf,
+            SerialLineEnding::Lf => SerialLineEnding::CrLf,
+            SerialLineEnding::CrLf => SerialLineEnding::Cr,
+            SerialLineEnding::Cr => SerialLineEnding::None,
+        };
+        self.set_serial_runtime_options(options, cx);
+    }
+
+    fn cycle_serial_output_line_ending(&mut self, cx: &mut Context<Self>) {
+        let Some(mut options) = self.terminal.lock().serial_runtime_options() else {
+            return;
+        };
+        options.output_line_ending = match options.output_line_ending {
             SerialLineEnding::None => SerialLineEnding::Lf,
             SerialLineEnding::Lf => SerialLineEnding::CrLf,
             SerialLineEnding::CrLf => SerialLineEnding::Cr,
@@ -2633,12 +2681,13 @@ impl TerminalPane {
             CURSOR_BLINK_INTERVAL
                 .saturating_sub(now.saturating_duration_since(self.last_cursor_blink))
         });
-        let (mode, ssh_still_connecting, process_refresh_supported) = {
+        let (mode, ssh_still_connecting, process_refresh_supported, pending_output_flush_delay) = {
             let terminal = self.terminal.lock();
             (
                 terminal.mode(),
                 terminal.kind() == TerminalSessionKind::SshPty && !terminal.is_interactive(),
                 terminal.process_info_probe().is_some(),
+                terminal.pending_output_flush_delay(),
             )
         };
         let needs_process_refresh = (self.settings.free_type_mode
@@ -2674,6 +2723,7 @@ impl TerminalPane {
             process_refresh_remaining,
             pending_cwd_remaining,
             editor_expiry_remaining,
+            pending_output_flush_delay,
         )
     }
 
@@ -3171,6 +3221,11 @@ impl TerminalPane {
                         TerminalCommandMarkEvent::Reset => {
                             self.clear_visual_command_marks();
                         }
+                        TerminalCommandMarkEvent::HistoryTrimmed { lines } => {
+                            self.command_marks
+                                .retain_mut(|mark| mark.trim_history(lines));
+                            self.command_fact_ledger.trim_history(lines);
+                        }
                     }
                     if let Some(selected_id) = &self.selected_command_mark_id
                         && !self
@@ -3656,6 +3711,10 @@ impl TerminalPane {
         TERMINAL_CONTENT_PADDING + self.timestamp_gutter_width() + self.command_mark_gutter_width()
     }
 
+    fn terminal_horizontal_scroll_limit(&self) -> Pixels {
+        px(self.timestamp_gutter_width())
+    }
+
     fn command_mark_gutter_width(&self) -> f32 {
         if self.settings.command_marks_enabled {
             TERMINAL_COMMAND_MARK_GUTTER_WIDTH
@@ -3672,7 +3731,8 @@ impl TerminalPane {
         // cell metrics. Expose pane-local facts rather than making workspace
         // code duplicate terminal layout math.
         Some(TerminalCursorAnchor {
-            x: f32::from(cursor_bounds.origin.x) + self.terminal_content_padding_x(),
+            x: f32::from(cursor_bounds.origin.x) + self.terminal_content_padding_x()
+                - f32::from(self.horizontal_scroll_offset_px),
             y: f32::from(cursor_bounds.origin.y) + TERMINAL_CONTENT_PADDING,
             line_height: self.metrics.line_height_f32(),
             char_width: self.metrics.cell_width_f32(),
@@ -3893,6 +3953,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             ),
             None
         );
@@ -3920,6 +3981,7 @@ mod tests {
             stop_bits: 1,
             parity: oxideterm_terminal::SerialParity::None,
             flow_control: oxideterm_terminal::SerialFlowControl::None,
+            runtime_options: SerialRuntimeOptions::default(),
         };
 
         let result = TerminalPane::open_serial_session_with_preferences(
